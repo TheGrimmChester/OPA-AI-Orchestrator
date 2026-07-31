@@ -377,7 +377,7 @@ func handleSCMJobSub(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not found", 404)
 			return
 		}
-		writeJSON(w, job)
+		writeJSON(w, scmJobAPIView(job))
 		return
 	}
 	if len(parts) >= 2 && parts[1] == "retry" && r.Method == http.MethodPost {
@@ -413,6 +413,15 @@ func handleSCMJobSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		handleSCMAIReviewFromJob(w, r, job)
+		return
+	}
+	if len(parts) >= 2 && (parts[1] == "auto-fix" || parts[1] == "autofix") && r.Method == http.MethodPost {
+		job := getSCMJob(id)
+		if job == nil {
+			http.Error(w, "not found", 404)
+			return
+		}
+		handleSCMJobAutoFix(w, r, job)
 		return
 	}
 	http.Error(w, "not found", 404)
@@ -470,7 +479,7 @@ func handleSCMAIReview(w http.ResponseWriter, r *http.Request) {
 		"cursor_key_set": resolveCursorAPIKey(job.OrganizationID, job.ProjectID) != "",
 		"skip_cursor_ai": envOr("SKIP_CURSOR_AI", "0") == "1",
 		"review_contexts": summarizeAppliedContexts(applied),
-		"honesty":         "Manual OPA Review — Check Runs need GitHub App (PAT often cannot create checks). SKIP_CURSOR_AI=1 still completes with ai.status=skipped. Reviewer contexts: full primary for this repo + linked awareness. Findings post as inline PR comments; global body is a short résumé.",
+		"honesty":         "Manual OPA Review — Check Runs need GitHub App (PAT often cannot create checks). SKIP_CURSOR_AI=1 still completes with ai.status=skipped. Reviewer contexts: full primary for this repo + linked awareness; related repos are shallow-cloned under job/related/. Findings sync as inline PR comments (add/update/resolve on re-run); global body is a short résumé upserted in place.",
 	})
 }
 
@@ -764,6 +773,43 @@ func processSCMJob(jobID string) {
 	job.Summary["checkout_path"] = absRoot
 	job.Summary["checkout_rel"] = relPath
 
+	// Persist analyzed SHA early (checkout revision) for re-review / Auto-fix basing.
+	analyzed := job.CommitSHA
+	if wtMeta != nil {
+		if rs, _ := wtMeta["resolved_sha"].(string); rs != "" {
+			analyzed = rs
+		}
+	}
+	if analyzed != "" && !strings.HasPrefix(analyzed, "manual-") && !strings.HasPrefix(analyzed, "cron-") {
+		recordAnalyzedSHA(job, analyzed)
+	}
+
+	// Sibling clones for linked / mentioned related repos (cross-repo context).
+	appliedEarly := resolveReviewContextsForRepo(job.OrganizationID, job.ProjectID, job.RepoFullName)
+	prBody := job.Body
+	if job.PRNumber > 0 && !githubUseMockAPI(conn) {
+		if pull, perr := githubGetPull(conn, owner, repoName, job.PRNumber); perr == nil && pull != nil {
+			prBody = pull.Body
+			if job.Title == "" {
+				job.Title = pull.Title
+			}
+		}
+	}
+	relatedNames := resolveRelatedReposForJob(job, appliedEarly, prBody, nil, nil)
+	if len(relatedNames) > 0 {
+		related := prepareRelatedCheckouts(conn, job.ID, relatedNames, nil)
+		job.Summary["related_checkouts"] = related
+		job.Summary["related_repos"] = relatedRepoNames(related)
+		clonedOK := 0
+		for _, r := range related {
+			if r.Error == "" {
+				clonedOK++
+			}
+		}
+		job.Summary["related_honesty"] = fmt.Sprintf("cloned %d/%d related repo(s) under %s/related/ (cap OPA_REVIEW_RELATED_MAX=%d)",
+			clonedOK, len(related), scmJobContainerAbs(job.ID), opaReviewRelatedMax())
+	}
+
 	runID := securityRunID(job.OrganizationID, job.ProjectID, job.ID)
 	job.SecurityRunID = runID
 	persistSCMJob(job)
@@ -890,11 +936,9 @@ func processSCMJob(jobID string) {
 			}
 		}
 		_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", aiConclusion, checkTitle, checkSum, ann)
-		if aiResult.Comment != "" && inline.Mode != "review" {
-			// Review mode already posted the résumé as the review body.
-			_ = githubPRComment(conn, owner, repoName, job.PRNumber, aiResult.Comment)
-		} else if aiResult.Comment != "" && inline.Mode == "review" && inline.Posted == 0 && len(aiResult.Findings) == 0 {
-			// Clean review with no inline findings — ensure résumé still lands if review create failed partially.
+		// Résumé is upserted inside postOPAReviewFindings (issue comment with <!-- opa-review:resume -->).
+		// Only fall back here when inline sync could not touch GitHub at all.
+		if aiResult.Comment != "" && inline.Mode == "annotations_only" && !inline.ResumeOK {
 			_ = githubPRComment(conn, owner, repoName, job.PRNumber, aiResult.Comment)
 		}
 	} else if wantAI {

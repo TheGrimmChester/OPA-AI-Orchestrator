@@ -199,6 +199,35 @@ func runCursorAIReview(job *scmJob, conn *opaConnector, wr *opaWatchedRepo, chec
 		res.Summary = truncateStr(res.Narrative, 400)
 	}
 
+	// needs_context: optionally clone additional related repos discovered mid-review, then re-synthesize once.
+	if strings.EqualFold(res.Verdict, "needs_context") && conn != nil {
+		texts := []string{res.Narrative, res.Summary, res.ConfidenceRationale}
+		for _, u := range res.Understanding {
+			texts = append(texts, u)
+		}
+		extra := extractRelatedReposFromText(texts...)
+		already := relatedRepoNames(relatedCheckoutsFromJobSummary(job))
+		more := resolveRelatedReposForJob(job, appliedAll, "", extra, already)
+		if len(more) > 0 {
+			srcMap := map[string]string{}
+			for _, n := range more {
+				srcMap[strings.ToLower(n)] = "mid_review"
+			}
+			added := prepareRelatedCheckouts(conn, job.ID, more, srcMap)
+			if job.Summary == nil {
+				job.Summary = map[string]interface{}{}
+			}
+			prev := relatedCheckoutsFromJobSummary(job)
+			prev = append(prev, added...)
+			job.Summary["related_checkouts"] = prev
+			job.Summary["related_repos"] = relatedRepoNames(prev)
+			job.Summary["related_mid_review"] = true
+			usageParts = append(usageParts, fmt.Sprintf("needs_context: cloned %d additional related repo(s)", len(added)))
+			synth2 := runOPAReviewSynthesis(job, key, agentBin, baseArgs, checkoutRoot, res, understandingBullets, gateStatus, ctxTitles)
+			applyOPAReviewSynthesis(&res, synth2)
+		}
+	}
+
 	res.Findings = sortFindingsBySeverity(res.Findings)
 	res.Usage = truncateStr(strings.Join(usageParts, "\n"), 4000)
 	res.Annotations = findingsToAnnotations(res.Findings)
@@ -928,7 +957,8 @@ func packAIUnitContext(job *scmJob, securityRunID, service, checkoutRoot string,
 	writeOPAReviewVisualSection(&b, mcpPlan, unit.IsUI)
 	fmt.Fprintf(&b, "## Unit diff\n```\n%s\n```\n\n", unit.Diff)
 	fmt.Fprintf(&b, "## Security run\n- security_run_id: `%s`\n- service: `%s`\n\n", securityRunID, service)
-	fmt.Fprintf(&b, "## Worktree isolation\n- Absolute path: `%s`\n- This is the full PR branch tree under OPA_REVIEW_TMP. Only analyze files inside this checkout.\n- **Surrounding-code requirement:** open changed files, read callers/callees/interfaces/neighbors, and search for related tests/invariants — do not judge the hunk alone.\n\n", checkoutRoot)
+	fmt.Fprintf(&b, "## Worktree isolation\n- Absolute path: `%s`\n- This is the full PR branch tree under OPA_REVIEW_TMP. Only cite findings for files inside this primary checkout.\n- **Surrounding-code requirement:** open changed files, read callers/callees/interfaces/neighbors, and search for related tests/invariants — do not judge the hunk alone.\n\n", checkoutRoot)
+	b.WriteString(formatRelatedCheckoutsForPrompt(relatedCheckoutsFromJobSummary(job)))
 	b.WriteString(opaReviewOutputSchema)
 	return b.String()
 }
@@ -995,6 +1025,7 @@ func packAIContext(job *scmJob, wr *opaWatchedRepo, securityRunID, diff, checkou
 		}
 	}
 	fmt.Fprintf(&b, "## Worktree isolation\n- Absolute path: `%s`\n- Full PR tree under OPA_REVIEW_TMP. Read surrounding code, callers, and related tests — not the hunk alone.\n\n", checkoutRoot)
+	b.WriteString(formatRelatedCheckoutsForPrompt(relatedCheckoutsFromJobSummary(job)))
 	b.WriteString(opaReviewOutputSchema)
 	return b.String()
 }
@@ -1293,28 +1324,56 @@ func publishAIReviewComment(job *scmJob, res aiReviewResult, meta aiReviewPublis
 	var b strings.Builder
 	b.WriteString("## OPA Review\n\n")
 	if res.Fallback {
-		b.WriteString("**Structured review output unavailable; applied rule-based fallback.**\n\n")
+		b.WriteString("⚠️ **Structured review output unavailable; applied rule-based fallback.**\n\n")
 	}
 	b.WriteString(narrative)
 	b.WriteString("\n\n")
-	fmt.Fprintf(&b, "**Auto-merge confidence:** %d/100 (%s) — %s\n\n", conf, label, rationale)
+	fmt.Fprintf(&b, "%s **Auto-merge confidence:** %d/100 (**%s**) — %s\n\n",
+		confidenceEmoji(label, conf), conf, label, rationale)
 	b.WriteString("### Priority for human review\n")
 	if len(priorities) == 0 {
-		b.WriteString("- _None flagged as merge blockers._\n")
+		b.WriteString("- ✅ _None flagged as merge blockers._\n")
 	} else {
 		for _, p := range priorities {
 			file := nz(p.File, "(unknown)")
 			concern := nz(p.Concern, "Review carefully")
+			prioEmoji := "⚠️"
+			// Prefer matching finding severity when the priority file appears in findings.
+			for _, f := range res.Findings {
+				fp, _ := f["file"].(string)
+				if normalizeFindingPath(fp) == normalizeFindingPath(file) {
+					if sev, _ := f["severity"].(string); sev != "" {
+						prioEmoji = severityEmoji(sev)
+						break
+					}
+				}
+			}
 			if p.Line > 0 {
-				fmt.Fprintf(&b, "- `%s:%d` — %s\n", file, p.Line, concern)
+				fmt.Fprintf(&b, "- %s `%s:%d` — %s\n", prioEmoji, file, p.Line, concern)
 			} else {
-				fmt.Fprintf(&b, "- `%s` — %s\n", file, concern)
+				fmt.Fprintf(&b, "- %s `%s` — %s\n", prioEmoji, file, concern)
 			}
 		}
 	}
 	fmt.Fprintf(&b, "\n_Inline comments cover line-level findings. AppSec gate: `%s`. security_run_id: `%s`._\n",
 		gateStatus, nz(meta.SecurityRunID, job.SecurityRunID))
-	comment = strings.TrimSpace(b.String()) + "\n"
+	if job != nil && job.Summary != nil {
+		analyzed := strFromAny(job.Summary["analyzed_sha"])
+		prev := strFromAny(job.Summary["previous_analyzed_sha"])
+		if analyzed == "" {
+			analyzed = job.CommitSHA
+		}
+		if analyzed != "" {
+			fmt.Fprintf(&b, "\n_Analyzed commit: `%s`", truncateStr(analyzed, 12))
+			if prev != "" && !strings.EqualFold(prev, analyzed) {
+				fmt.Fprintf(&b, " · previous review: `%s` (new commits since last OPA Review)", truncateStr(prev, 12))
+			} else if prev != "" {
+				b.WriteString(" · same commit as previous OPA Review")
+			}
+			b.WriteString("_\n")
+		}
+	}
+	comment = embedOPAReviewResumeMarker(strings.TrimSpace(b.String()))
 
 	var cs strings.Builder
 	fmt.Fprintf(&cs, "OPA Review · %s · conf %d/100 (%s) · %d finding(s) (%s)",
@@ -1328,10 +1387,14 @@ func publishAIReviewComment(job *scmJob, res aiReviewResult, meta aiReviewPublis
 }
 
 type opaReviewInlineResult struct {
-	Posted  int
-	Failed  int
-	Mode    string // review | comments | annotations_only | mock | none
-	Honesty string
+	Posted   int
+	Failed   int
+	Updated  int
+	Resolved int
+	Created  int
+	Mode     string // review | comments | annotations_only | mock | none | sync
+	Honesty  string
+	ResumeOK bool
 }
 
 func formatInlineFindingBody(f map[string]interface{}) string {
@@ -1362,45 +1425,76 @@ func findingFileLine(f map[string]interface{}) (path string, line int, ok bool) 
 	return path, line, true
 }
 
-// postOPAReviewFindings posts line-level PR review comments; falls back to annotations honesty.
+// upsertOPAReviewResumeComment edits the existing résumé issue comment in place, or creates one.
+func upsertOPAReviewResumeComment(conn *opaConnector, owner, repo string, pr int, body string) (updated bool, err error) {
+	body = embedOPAReviewResumeMarker(body)
+	if githubUseMockAPI(conn) {
+		return true, nil
+	}
+	comments, lerr := githubListIssueComments(conn, owner, repo, pr)
+	if lerr != nil {
+		return false, lerr
+	}
+	for _, c := range comments {
+		if isOPAReviewResumeBody(c.Body) {
+			if bodiesMeaningfullyEqual(c.Body, body) {
+				return true, nil
+			}
+			return true, githubUpdateIssueComment(conn, owner, repo, c.ID, body)
+		}
+	}
+	_, err = githubPRCommentCreate(conn, owner, repo, pr, body)
+	return err == nil, err
+}
+
+func collectPriorOPAReviewComments(conn *opaConnector, owner, repo string, pr int) []opaReviewPriorComment {
+	raw, err := githubListPRReviewComments(conn, owner, repo, pr)
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	out := []opaReviewPriorComment{}
+	for _, c := range raw {
+		if c.InReplyTo != 0 {
+			continue
+		}
+		if !isOPAReviewInlineBody(c.Body) {
+			continue
+		}
+		key := extractOPAReviewFindingID(c.Body)
+		if key == "" {
+			// Legacy: approximate key from path + body text so re-runs can still close/update.
+			key = opaReviewFindingKey(map[string]interface{}{
+				"file": c.Path, "message": stripOPAReviewMarkers(c.Body),
+			})
+		}
+		out = append(out, opaReviewPriorComment{
+			ID: c.ID, Key: key, Path: c.Path, Line: c.Line, Body: c.Body,
+		})
+	}
+	return out
+}
+
+func closeOPAReviewComment(conn *opaConnector, owner, repo string, pr int, commitSHA string, prior opaReviewPriorComment) error {
+	superseded := formatSupersededFindingBody(prior.Body, commitSHA)
+	if err := githubUpdatePRReviewComment(conn, owner, repo, prior.ID, superseded); err != nil {
+		// Fall through to reply-only.
+		_ = err
+	} else {
+		_ = githubReplyPRReviewComment(conn, owner, repo, pr, commitSHA, prior.ID, formatFixedReplyBody(commitSHA))
+		return nil
+	}
+	return githubReplyPRReviewComment(conn, owner, repo, pr, commitSHA, prior.ID, formatFixedReplyBody(commitSHA))
+}
+
+// postOPAReviewFindings syncs line-level PR review comments (add/update/close) and
+// upserts the global résumé issue comment. Falls back to annotations honesty.
 func postOPAReviewFindings(conn *opaConnector, owner, repo string, job *scmJob, res aiReviewResult, meta aiReviewPublishMeta) opaReviewInlineResult {
 	out := opaReviewInlineResult{Mode: "none"}
 	if job == nil || job.PRNumber <= 0 {
 		return out
 	}
-	if githubUseMockAPI(conn) {
-		out.Mode = "mock"
-		out.Honesty = "mock GitHub — inline comments skipped (Check Run annotations retained when available)"
-		n := 0
-		for _, f := range res.Findings {
-			if _, _, ok := findingFileLine(f); ok {
-				n++
-			}
-		}
-		out.Posted = n // counted as would-be posts for résumé honesty in mock
-		return out
-	}
-
-	specs := []githubPRReviewCommentSpec{}
-	for _, f := range res.Findings {
-		path, line, ok := findingFileLine(f)
-		if !ok {
-			continue
-		}
-		specs = append(specs, githubPRReviewCommentSpec{
-			Path: path, Line: line, Body: formatInlineFindingBody(f),
-		})
-	}
-	if len(specs) == 0 {
-		out.Mode = "none"
-		out.Honesty = "no line-level findings to inline"
-		return out
-	}
 
 	pubMeta := meta
-	pubMeta.InlineMode = "review"
-	pubMeta.InlinePosted = len(specs)
-	pubMeta.InlineHonesty = "posting…"
 	if pubMeta.DesignEnforcement == false {
 		pubMeta.DesignEnforcement = res.DesignEnforced
 	}
@@ -1411,37 +1505,119 @@ func postOPAReviewFindings(conn *opaConnector, owner, repo string, job *scmJob, 
 		pubMeta.MCP = *res.MCP
 	}
 	resume, _ := publishAIReviewComment(job, res, pubMeta)
-	// Prefer a single PR review (résumé body + inline comments).
-	if err := githubCreatePRReview(conn, owner, repo, job.PRNumber, job.CommitSHA, resume, "COMMENT", specs); err == nil {
-		out.Mode = "review"
-		out.Posted = len(specs)
-		out.Honesty = fmt.Sprintf("%d inline comment(s) via PR review", out.Posted)
+
+	if githubUseMockAPI(conn) {
+		out.Mode = "mock"
+		n := 0
+		for _, f := range res.Findings {
+			if _, _, ok := findingFileLine(f); ok {
+				n++
+			}
+		}
+		out.Posted = n
+		out.Created = n
+		out.ResumeOK = true
+		out.Honesty = "mock GitHub — inline sync skipped (Check Run annotations retained when available); résumé would upsert in place"
 		return out
 	}
 
-	// Fall back to individual inline comments + separate issue résumé.
-	posted := 0
-	failed := 0
-	for _, spec := range specs {
-		if err := githubPRInlineComment(conn, owner, repo, job.PRNumber, job.CommitSHA, spec.Path, spec.Line, spec.Body); err != nil {
-			failed++
+	if _, err := upsertOPAReviewResumeComment(conn, owner, repo, job.PRNumber, resume); err == nil {
+		out.ResumeOK = true
+	}
+
+	prior := collectPriorOPAReviewComments(conn, owner, repo, job.PRNumber)
+	plan := planOPAReviewCommentActions(res.Findings, prior)
+
+	// Close findings that disappeared.
+	for _, old := range plan.Close {
+		if err := closeOPAReviewComment(conn, owner, repo, job.PRNumber, job.CommitSHA, old); err != nil {
+			out.Failed++
 			continue
 		}
-		posted++
+		out.Resolved++
 	}
-	if posted > 0 {
-		out.Mode = "comments"
-		out.Posted = posted
-		out.Failed = failed
-		out.Honesty = fmt.Sprintf("%d inline comment(s) posted", posted)
-		if failed > 0 {
-			out.Honesty += fmt.Sprintf("; %d failed (Check Run annotations retained)", failed)
+
+	// Updates (same line) or retarget closes.
+	for _, u := range plan.Update {
+		if u.Retarget {
+			if err := closeOPAReviewComment(conn, owner, repo, job.PRNumber, job.CommitSHA, u.Prior); err != nil {
+				out.Failed++
+			} else {
+				out.Resolved++
+			}
+			continue
 		}
+		if err := githubUpdatePRReviewComment(conn, owner, repo, u.Prior.ID, u.Body); err != nil {
+			out.Failed++
+			continue
+		}
+		out.Updated++
+	}
+
+	// New findings (including retargets).
+	createSpecs := []githubPRReviewCommentSpec{}
+	for _, c := range plan.Create {
+		createSpecs = append(createSpecs, githubPRReviewCommentSpec{Path: c.Path, Line: c.Line, Body: c.Body})
+	}
+
+	if len(createSpecs) == 0 && out.Updated == 0 && out.Resolved == 0 {
+		if len(res.Findings) == 0 {
+			out.Mode = "sync"
+			out.Honesty = "résumé upserted; no line-level findings"
+			return out
+		}
+		out.Mode = "sync"
+		out.Honesty = "résumé upserted; inline comments unchanged"
 		return out
 	}
-	out.Mode = "annotations_only"
-	out.Failed = len(specs)
-	out.Honesty = "inline PR comments unavailable (token/App permissions or line not in diff) — using Check Run annotations"
+
+	if len(createSpecs) > 0 {
+		// Prefer a single PR review for new inline comments (empty/minimal body — résumé is issue comment).
+		reviewBody := "OPA Review — inline findings updated."
+		if err := githubCreatePRReview(conn, owner, repo, job.PRNumber, job.CommitSHA, reviewBody, "COMMENT", createSpecs); err != nil {
+			posted := 0
+			for _, spec := range createSpecs {
+				if err := githubPRInlineComment(conn, owner, repo, job.PRNumber, job.CommitSHA, spec.Path, spec.Line, spec.Body); err != nil {
+					out.Failed++
+					continue
+				}
+				posted++
+			}
+			out.Created = posted
+			out.Posted = posted + out.Updated
+			if posted == 0 && out.Updated == 0 && out.Resolved == 0 {
+				out.Mode = "annotations_only"
+				out.Honesty = "inline PR comments unavailable (token/App permissions or line not in diff) — using Check Run annotations"
+				return out
+			}
+			out.Mode = "comments"
+		} else {
+			out.Created = len(createSpecs)
+			out.Posted = len(createSpecs) + out.Updated
+			out.Mode = "sync"
+		}
+	} else {
+		out.Posted = out.Updated
+		out.Mode = "sync"
+	}
+
+	parts := []string{}
+	if out.ResumeOK {
+		parts = append(parts, "résumé upserted")
+	}
+	if out.Created > 0 {
+		parts = append(parts, fmt.Sprintf("%d created", out.Created))
+	}
+	if out.Updated > 0 {
+		parts = append(parts, fmt.Sprintf("%d updated", out.Updated))
+	}
+	if out.Resolved > 0 {
+		parts = append(parts, fmt.Sprintf("%d resolved/superseded", out.Resolved))
+	}
+	if out.Failed > 0 {
+		parts = append(parts, fmt.Sprintf("%d failed", out.Failed))
+	}
+	out.Honesty = strings.Join(parts, "; ")
 	return out
 }
 
