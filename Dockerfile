@@ -22,10 +22,11 @@ RUN apt-get update \
       "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${gl_arch}.tar.gz" \
  && tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks \
  && rm -f /tmp/gitleaks.tgz \
- && NO_COLOR=1 curl -fsS https://cursor.com/install | bash \
- && test -x /root/.local/bin/agent \
- && ln -sf /root/.local/bin/agent /usr/local/bin/agent \
- && ln -sf /root/.local/bin/cursor-agent /usr/local/bin/cursor-agent
+ && (NO_COLOR=1 curl -fsS https://cursor.com/install | bash \
+      && test -x /root/.local/bin/agent \
+      && ln -sf /root/.local/bin/agent /usr/local/bin/agent \
+      && ln -sf /root/.local/bin/cursor-agent /usr/local/bin/cursor-agent) \
+    || echo "WARN: Cursor Agent CLI install skipped (OPA Review AI unavailable until installed)"
 
 WORKDIR /root/
 COPY --from=builder /app/opa-orchestrator .
