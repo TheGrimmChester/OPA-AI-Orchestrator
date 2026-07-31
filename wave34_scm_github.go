@@ -327,16 +327,184 @@ func githubUpdateCheckRun(c *opaConnector, owner, repo string, checkID int64, st
 }
 
 func githubPRComment(c *opaConnector, owner, repo string, pr int, body string) error {
+	_, err := githubPRCommentCreate(c, owner, repo, pr, body)
+	return err
+}
+
+// githubPRCommentCreate posts an issue comment and returns its id.
+func githubPRCommentCreate(c *opaConnector, owner, repo string, pr int, body string) (int64, error) {
 	if c == nil || pr <= 0 || githubUseMockAPI(c) {
+		return 0, nil
+	}
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	raw, code, err := githubAPI(c, http.MethodPost, fmt.Sprintf("/repos/%s/%s/issues/%d/comments", owner, repo, pr), strings.NewReader(string(payload)))
+	if err != nil {
+		return 0, err
+	}
+	if code >= 300 {
+		return 0, fmt.Errorf("comment %d", code)
+	}
+	var out struct {
+		ID int64 `json:"id"`
+	}
+	_ = json.Unmarshal(raw, &out)
+	return out.ID, nil
+}
+
+func githubUpdateIssueComment(c *opaConnector, owner, repo string, commentID int64, body string) error {
+	if c == nil || commentID == 0 || githubUseMockAPI(c) {
 		return nil
 	}
 	payload, _ := json.Marshal(map[string]string{"body": body})
-	_, code, err := githubAPI(c, http.MethodPost, fmt.Sprintf("/repos/%s/%s/issues/%d/comments", owner, repo, pr), strings.NewReader(string(payload)))
+	raw, code, err := githubAPI(c, http.MethodPatch, fmt.Sprintf("/repos/%s/%s/issues/comments/%d", owner, repo, commentID), strings.NewReader(string(payload)))
 	if err != nil {
 		return err
 	}
 	if code >= 300 {
-		return fmt.Errorf("comment %d", code)
+		return fmt.Errorf("update issue comment %d: %s", code, truncateStr(string(raw), 200))
+	}
+	return nil
+}
+
+type githubIssueComment struct {
+	ID   int64
+	Body string
+	User string
+}
+
+func githubListIssueComments(c *opaConnector, owner, repo string, pr int) ([]githubIssueComment, error) {
+	if c == nil || pr <= 0 {
+		return nil, nil
+	}
+	if githubUseMockAPI(c) {
+		return nil, nil
+	}
+	out := []githubIssueComment{}
+	page := 1
+	for page <= 5 {
+		raw, code, err := githubAPI(c, http.MethodGet, fmt.Sprintf("/repos/%s/%s/issues/%d/comments?per_page=100&page=%d", owner, repo, pr, page), nil)
+		if err != nil {
+			return out, err
+		}
+		if code >= 300 {
+			return out, fmt.Errorf("list issue comments %d", code)
+		}
+		var batch []struct {
+			ID   int64  `json:"id"`
+			Body string `json:"body"`
+			User struct {
+				Login string `json:"login"`
+			} `json:"user"`
+		}
+		if json.Unmarshal(raw, &batch) != nil || len(batch) == 0 {
+			break
+		}
+		for _, row := range batch {
+			out = append(out, githubIssueComment{ID: row.ID, Body: row.Body, User: row.User.Login})
+		}
+		if len(batch) < 100 {
+			break
+		}
+		page++
+	}
+	return out, nil
+}
+
+type githubReviewComment struct {
+	ID        int64
+	Body      string
+	Path      string
+	Line      int
+	Original  int
+	CommitID  string
+	User      string
+	InReplyTo int64
+}
+
+func githubListPRReviewComments(c *opaConnector, owner, repo string, pr int) ([]githubReviewComment, error) {
+	if c == nil || pr <= 0 {
+		return nil, nil
+	}
+	if githubUseMockAPI(c) {
+		return nil, nil
+	}
+	out := []githubReviewComment{}
+	page := 1
+	for page <= 10 {
+		raw, code, err := githubAPI(c, http.MethodGet, fmt.Sprintf("/repos/%s/%s/pulls/%d/comments?per_page=100&page=%d", owner, repo, pr, page), nil)
+		if err != nil {
+			return out, err
+		}
+		if code >= 300 {
+			return out, fmt.Errorf("list review comments %d", code)
+		}
+		var batch []struct {
+			ID               int64  `json:"id"`
+			Body             string `json:"body"`
+			Path             string `json:"path"`
+			Line             int    `json:"line"`
+			OriginalLine     int    `json:"original_line"`
+			CommitID         string `json:"commit_id"`
+			InReplyTo        int64  `json:"in_reply_to_id"`
+			User             struct {
+				Login string `json:"login"`
+			} `json:"user"`
+		}
+		if json.Unmarshal(raw, &batch) != nil || len(batch) == 0 {
+			break
+		}
+		for _, row := range batch {
+			line := row.Line
+			if line < 1 {
+				line = row.OriginalLine
+			}
+			out = append(out, githubReviewComment{
+				ID: row.ID, Body: row.Body, Path: row.Path, Line: line,
+				Original: row.OriginalLine, CommitID: row.CommitID,
+				User: row.User.Login, InReplyTo: row.InReplyTo,
+			})
+		}
+		if len(batch) < 100 {
+			break
+		}
+		page++
+	}
+	return out, nil
+}
+
+func githubUpdatePRReviewComment(c *opaConnector, owner, repo string, commentID int64, body string) error {
+	if c == nil || commentID == 0 || githubUseMockAPI(c) {
+		return nil
+	}
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	raw, code, err := githubAPI(c, http.MethodPatch, fmt.Sprintf("/repos/%s/%s/pulls/comments/%d", owner, repo, commentID), strings.NewReader(string(payload)))
+	if err != nil {
+		return err
+	}
+	if code >= 300 {
+		return fmt.Errorf("update review comment %d: %s", code, truncateStr(string(raw), 200))
+	}
+	return nil
+}
+
+func githubReplyPRReviewComment(c *opaConnector, owner, repo string, pr int, commitSHA string, inReplyTo int64, body string) error {
+	if c == nil || pr <= 0 || inReplyTo == 0 || githubUseMockAPI(c) {
+		return nil
+	}
+	payload := map[string]interface{}{
+		"body":        body,
+		"in_reply_to": inReplyTo,
+	}
+	if commitSHA != "" {
+		payload["commit_id"] = commitSHA
+	}
+	raw, _ := json.Marshal(payload)
+	resp, code, err := githubAPI(c, http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/comments", owner, repo, pr), strings.NewReader(string(raw)))
+	if err != nil {
+		return err
+	}
+	if code >= 300 {
+		return fmt.Errorf("reply review comment %d: %s", code, truncateStr(string(resp), 200))
 	}
 	return nil
 }
@@ -442,6 +610,8 @@ type githubPullMeta struct {
 	Body    string
 	Draft   bool
 	HeadSHA string
+	HeadRef string
+	BaseRef string
 	State   string
 }
 
@@ -452,7 +622,7 @@ func githubGetPull(c *opaConnector, owner, repo string, pr int) (*githubPullMeta
 	if githubUseMockAPI(c) {
 		return &githubPullMeta{
 			Number: pr, Title: fmt.Sprintf("Mock PR #%d", pr), Body: "mock body",
-			Draft: false, HeadSHA: "mocksha" + newRandomHex(6), State: "open",
+			Draft: false, HeadSHA: "mocksha" + newRandomHex(6), HeadRef: "feature/mock", BaseRef: "main", State: "open",
 		}, nil
 	}
 	raw, code, err := githubAPI(c, http.MethodGet, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, pr), nil)
@@ -470,14 +640,19 @@ func githubGetPull(c *opaConnector, owner, repo string, pr int) (*githubPullMeta
 		State  string `json:"state"`
 		Head   struct {
 			SHA string `json:"sha"`
+			Ref string `json:"ref"`
 		} `json:"head"`
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
 	}
 	if json.Unmarshal(raw, &body) != nil {
 		return nil, fmt.Errorf("bad pull json")
 	}
 	return &githubPullMeta{
 		Number: body.Number, Title: body.Title, Body: body.Body,
-		Draft: body.Draft, HeadSHA: body.Head.SHA, State: body.State,
+		Draft: body.Draft, HeadSHA: body.Head.SHA, HeadRef: body.Head.Ref,
+		BaseRef: body.Base.Ref, State: body.State,
 	}, nil
 }
 
@@ -584,6 +759,29 @@ func handleConnectorPulls(w http.ResponseWriter, r *http.Request, id string) {
 		out["mock"] = true
 	}
 	writeJSON(w, out)
+}
+
+// githubCreatePullRequest opens a PR. Returns number, html_url.
+func githubCreatePullRequest(c *opaConnector, owner, repo, title, body, head, base string, draft bool) (int, string, error) {
+	if githubUseMockAPI(c) {
+		return 0, fmt.Sprintf("https://github.com/%s/%s/pull/0", owner, repo), nil
+	}
+	payload, _ := json.Marshal(map[string]interface{}{
+		"title": title, "body": body, "head": head, "base": base, "draft": draft,
+	})
+	raw, code, err := githubAPI(c, http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls", owner, repo), strings.NewReader(string(payload)))
+	if err != nil {
+		return 0, "", err
+	}
+	if code >= 300 {
+		return 0, "", fmt.Errorf("create pull %d: %s", code, truncateStr(string(raw), 240))
+	}
+	var out struct {
+		HTMLURL string `json:"html_url"`
+		Number  int    `json:"number"`
+	}
+	_ = json.Unmarshal(raw, &out)
+	return out.Number, out.HTMLURL, nil
 }
 
 func splitOwnerRepo(full string) (string, string) {

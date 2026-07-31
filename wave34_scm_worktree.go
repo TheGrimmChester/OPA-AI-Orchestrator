@@ -12,9 +12,11 @@ import (
 // Isolated git worktrees for SCM / OPA Review / security scans.
 //
 //	$OPA_SECURITY_WORKSPACE/cache/github/{owner}__{repo}.git  — bare mirror
-//	$OPA_REVIEW_TMP/{job_or_run_id}/                          — PR checkout (default /tmp/opa-review)
+//	$OPA_REVIEW_TMP/{job_or_run_id}/
+//	  primary/              — PR checkout (default /tmp/opa-review)
+//	  related/{owner-repo}/ — sibling clones for cross-repo context
 //
-// Legacy layout (still cleaned): $OPA_SECURITY_WORKSPACE/worktrees|jobs/{id}
+// Legacy layout (still cleaned): flat $OPA_REVIEW_TMP/{id} and workspace worktrees|jobs/{id}
 //
 // OPA_SCAN_WORKTREE_ENFORCE default 1: scanners + AI agent must use the
 // isolated checkout, never the shared workspace fixture root for SCM jobs.
@@ -30,8 +32,9 @@ func opaReviewTmpRoot() string {
 	return filepath.Clean(envOr("OPA_REVIEW_TMP", "/tmp/opa-review"))
 }
 
+// scmReviewWorktreeAbs returns the primary PR checkout path under the job container.
 func scmReviewWorktreeAbs(id string) string {
-	return filepath.Join(opaReviewTmpRoot(), sanitizeWorktreeID(id))
+	return scmPrimaryCheckoutAbs(id)
 }
 
 // underOPAReviewTmp reports whether abs is inside OPA_REVIEW_TMP (or is the root).
@@ -103,24 +106,28 @@ func writeMockWorktreeFixture(root string) error {
 }
 
 // prepareSCMWorktree checks out an isolated tree for a job/run/context-gen.
-// Layout: $OPA_REVIEW_TMP/{id} (default /tmp/opa-review/{id}). Bare cache stays
-// under OPA_SECURITY_WORKSPACE. Mock / missing credentials → fixture in that path.
-// Real credentials → bare cache + git worktree add at SHA, pull/{n}/head, or default
-// HEAD; errors are returned (no silent shared-fixture scan).
+// Layout: $OPA_REVIEW_TMP/{id}/primary (related siblings under {id}/related/).
+// Bare cache stays under OPA_SECURITY_WORKSPACE. Mock / missing credentials →
+// fixture in primary/. Real credentials → bare cache + git worktree add at SHA,
+// pull/{n}/head, or default HEAD; errors are returned (no silent shared-fixture scan).
 func prepareSCMWorktree(c *opaConnector, fullName, sha string, pr int, worktreeID string) (absRoot, relPath string, meta map[string]interface{}, err error) {
-	absRoot = scmReviewWorktreeAbs(worktreeID)
-	relPath = absRoot // scanners + AI use the absolute /tmp checkout
+	container := scmJobContainerAbs(worktreeID)
+	absRoot = scmPrimaryCheckoutAbs(worktreeID)
+	relPath = absRoot // scanners + AI use the absolute primary checkout
 	if err := os.MkdirAll(opaReviewTmpRoot(), 0o755); err != nil {
 		return "", "", nil, fmt.Errorf("OPA_REVIEW_TMP: %w", err)
 	}
 	meta = map[string]interface{}{
 		"worktree_rel": relPath, "worktree_abs": absRoot,
-		"review_tmp": opaReviewTmpRoot(),
+		"job_container": container, "review_tmp": opaReviewTmpRoot(),
 		"repo_full_name": fullName, "commit_sha": sha, "pr_number": pr,
-		"enforce": scanWorktreeEnforce(),
+		"enforce": scanWorktreeEnforce(), "layout": "primary_related",
 	}
 
-	removeSCMWorktree(absRoot, fullName)
+	removeSCMJobCheckout(worktreeID, fullName)
+	if err := os.MkdirAll(container, 0o755); err != nil {
+		return "", "", nil, fmt.Errorf("job container: %w", err)
+	}
 
 	useMock := githubUseMockAPI(c) || c == nil || (c.TokenRef == "" && c.InstallationID == "")
 	if useMock {
@@ -297,6 +304,30 @@ func removeSCMWorktree(absRoot, fullName string) {
 		}
 	}
 	_ = os.RemoveAll(absRoot)
+}
+
+// removeSCMJobCheckout removes the job container (primary + related siblings).
+func removeSCMJobCheckout(worktreeID, primaryFullName string) {
+	container := scmJobContainerAbs(worktreeID)
+	primary := scmPrimaryCheckoutAbs(worktreeID)
+	removeSCMWorktree(primary, primaryFullName)
+	// Unlink any related worktrees we may have attached from bare caches.
+	relatedRoot := scmRelatedDirAbs(worktreeID)
+	if entries, err := os.ReadDir(relatedRoot); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			p := filepath.Join(relatedRoot, e.Name())
+			removeSCMWorktree(p, "")
+		}
+	}
+	// Legacy flat layout (pre primary/related).
+	legacy := filepath.Join(opaReviewTmpRoot(), sanitizeWorktreeID(worktreeID))
+	if legacy != container {
+		removeSCMWorktree(legacy, primaryFullName)
+	}
+	_ = os.RemoveAll(container)
 }
 
 func cleanupOldSCMWorktrees(workspace string, maxAge time.Duration) {

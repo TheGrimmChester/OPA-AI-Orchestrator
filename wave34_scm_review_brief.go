@@ -322,15 +322,19 @@ func normalizeOPAReviewFindings(findings []map[string]interface{}) []map[string]
 func enrichInlineFindingBody(f map[string]interface{}) string {
 	sev, _ := f["severity"].(string)
 	rule, _ := f["rule"].(string)
+	if rule == "" {
+		rule, _ = f["rule_id"].(string)
+	}
 	problem, _ := f["problem"].(string)
 	why, _ := f["why"].(string)
 	fix, _ := f["fix"].(string)
 	msg, _ := f["message"].(string)
 
+	emoji := severityEmoji(sev)
 	var b strings.Builder
-	b.WriteString("**OPA Review**")
+	fmt.Fprintf(&b, "%s **OPA Review**", emoji)
 	if sev != "" {
-		fmt.Fprintf(&b, " · `%s`", sev)
+		fmt.Fprintf(&b, " · **%s**", strings.ToLower(strings.TrimSpace(sev)))
 	}
 	if rule != "" {
 		fmt.Fprintf(&b, " · `%s`", rule)
