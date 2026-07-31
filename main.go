@@ -1,0 +1,76 @@
+package main
+
+import (
+	"log"
+	"net/http"
+	"time"
+)
+
+var (
+	queryClient *ClickHouseQuery
+	writer      *ClickHouseWriter
+	buildVersion = "orchestrator-dev"
+)
+
+func main() {
+	addr := envOr("HTTP_ADDR", ":8091")
+	chURL := envOr("CLICKHOUSE_URL", "http://127.0.0.1:8123")
+
+	writer = NewClickHouseWriter(chURL, 100)
+	queryClient = NewClickHouseQuery(chURL)
+
+	authRequired := authRequiredEnv()
+	authEnforced = authRequired
+	if authRequired {
+		log.Printf("auth: ENABLED (OPA_AUTH_REQUIRED)")
+	} else {
+		log.Printf("auth: disabled — endpoints open")
+	}
+
+	mux := http.NewServeMux()
+	authView := func(pattern string, h http.HandlerFunc) {
+		if authRequired {
+			mux.HandleFunc(pattern, AuthMiddleware(h, "viewer"))
+		} else {
+			mux.HandleFunc(pattern, h)
+		}
+	}
+	authAdmin := func(pattern string, h http.HandlerFunc) {
+		if authRequired {
+			mux.HandleFunc(pattern, AuthMiddleware(h, "admin"))
+		} else {
+			mux.HandleFunc(pattern, h)
+		}
+	}
+
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]interface{}{
+			"status":  "ok",
+			"service": "opa-ai-orchestrator",
+			"version": buildVersion,
+		})
+	})
+
+	registerWave33Mux(mux, authView, authAdmin)
+	registerWave34Mux(mux, authView, authAdmin)
+
+	go func() {
+		// Give CH a moment, then hydrate SCM state (PATs, jobs, stacks).
+		time.Sleep(2 * time.Second)
+		hydrateSCMOnBoot()
+	}()
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           corsMiddleware(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	log.Printf("OPA AI Orchestrator listening on %s (CH=%s)", addr, chURL)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("listen: %v", err)
+	}
+}
