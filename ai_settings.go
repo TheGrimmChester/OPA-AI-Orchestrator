@@ -703,6 +703,13 @@ func setCLICursorKeyFromAlias(org, proj, key string, clear bool) error {
 	doc.ProjectID = proj
 	if clear {
 		doc.CLICursor.APIKey = ""
+		cursorKeyMu.Lock()
+		cursorKeyMem = ""
+		cursorKeyOrg, cursorKeyProj = "", ""
+		cursorKeyMu.Unlock()
+		// Must tombstone CH — persistAISettings skips empty keys and would leave the prior
+		// ciphertext live (smoke was clearing via this path, then rehydrating the fake key).
+		_ = persistSCMSecret(org, proj, aiSecretCLICursor, "", true)
 	} else {
 		doc.CLICursor.APIKey = key
 		doc.CLICursor.Enabled = true
