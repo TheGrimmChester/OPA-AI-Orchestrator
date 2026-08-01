@@ -97,11 +97,11 @@ func runCursorAIReview(job *scmJob, conn *opaConnector, wr *opaWatchedRepo, chec
 		persistAIReview(job, res)
 		return res
 	}
-	key, agentBin, model, force := resolveCLICursorConfig(job.OrganizationID, job.ProjectID)
+	key, agentBin, model, force := resolveCLICursorConfig(job.OrganizationID, job.ProjectID, job.ActorUserID)
 	res.Model = model
 	if key == "" {
 		res.Status = "skipped"
-		res.Summary = "OPA Review API key not set — configure CLI agent in AI settings"
+		res.Summary = "OPA Review API key not set — save a CLI agent key under Account (personal or org)"
 		persistAIReview(job, res)
 		return res
 	}
@@ -647,6 +647,66 @@ func confidenceLabelFromScore(n int) string {
 	}
 }
 
+// decideOPAReviewEvent chooses the GitHub PR review event from confidence score
+// and findings. minScore <= 0 keeps legacy COMMENT-only behavior.
+func decideOPAReviewEvent(res aiReviewResult, minScore int) string {
+	if minScore <= 0 {
+		return "COMMENT"
+	}
+	status := strings.ToLower(strings.TrimSpace(res.Status))
+	verdict := strings.ToLower(strings.TrimSpace(res.Verdict))
+	if status == "skipped" || status == "error" {
+		return "COMMENT"
+	}
+	if hasBlockerOrHighFinding(res) || verdict == "request_changes" {
+		return "REQUEST_CHANGES"
+	}
+	if status == "findings" {
+		// Non-blocking findings still fail the score gate when auto-approve is on.
+		return "REQUEST_CHANGES"
+	}
+	if res.AutoMergeConfidence >= minScore && (verdict == "" || verdict == "approve" || verdict == "needs_context") {
+		return "APPROVE"
+	}
+	return "REQUEST_CHANGES"
+}
+
+func hasBlockerOrHighFinding(res aiReviewResult) bool {
+	for _, f := range res.Findings {
+		sev := strings.ToLower(strings.TrimSpace(fmt.Sprint(f["severity"])))
+		if sev == "" {
+			sev = strings.ToLower(strings.TrimSpace(fmt.Sprint(f["Severity"])))
+		}
+		if sev == "blocker" || sev == "critical" || sev == "high" {
+			return true
+		}
+	}
+	return false
+}
+
+func formatOPAReviewDecisionBody(res aiReviewResult, event string, minScore int) string {
+	conf := res.AutoMergeConfidence
+	label := confidenceLabelFromScore(conf)
+	var b strings.Builder
+	switch event {
+	case "APPROVE":
+		fmt.Fprintf(&b, "**OPA Review — approved**\n\n")
+		fmt.Fprintf(&b, "Auto-merge confidence **%d/100** (%s) meets threshold **%d**.\n", conf, label, minScore)
+	case "REQUEST_CHANGES":
+		fmt.Fprintf(&b, "**OPA Review — changes requested**\n\n")
+		fmt.Fprintf(&b, "Auto-merge confidence **%d/100** (%s); threshold **%d**.\n", conf, label, minScore)
+		if res.ConfidenceRationale != "" {
+			fmt.Fprintf(&b, "\n%s\n", res.ConfidenceRationale)
+		}
+	default:
+		fmt.Fprintf(&b, "**OPA Review**\n\nConfidence **%d/100** (%s).\n", conf, label)
+	}
+	if res.Verdict != "" {
+		fmt.Fprintf(&b, "\nVerdict: `%s`\n", res.Verdict)
+	}
+	return strings.TrimSpace(b.String())
+}
+
 func capPriorities(in []aiReviewPriority, max int) []aiReviewPriority {
 	if max <= 0 || len(in) <= max {
 		return in
@@ -948,6 +1008,7 @@ func packAIUnitContext(job *scmJob, securityRunID, service, checkoutRoot string,
 	filtered := filterContextsForUI(applied, unit.IsUI)
 	writeOPAReviewContextFields(&b, job, filtered, opaReviewScopeFromUnit(unit), true)
 	b.WriteString(opaReviewInstructions)
+	b.WriteString(opaReviewPerformanceRules)
 	if unit.IsUI {
 		b.WriteString(packDesignEnforcementFromWorktree(checkoutRoot))
 		b.WriteString(designEnforcementPromptExtra(true))
@@ -980,6 +1041,7 @@ func packAIContext(job *scmJob, wr *opaWatchedRepo, securityRunID, diff, checkou
 		job.RepoFullName, job.PRNumber, job.CommitSHA, job.Title, uiTouched)
 	writeOPAReviewContextFields(&b, job, applied, opaReviewScopeFromDiff(diff), false)
 	b.WriteString(opaReviewInstructions)
+	b.WriteString(opaReviewPerformanceRules)
 	if uiTouched {
 		b.WriteString(packDesignEnforcementFromWorktree(checkoutRoot))
 		b.WriteString(designEnforcementPromptExtra(true))
@@ -1486,7 +1548,8 @@ func closeOPAReviewComment(conn *opaConnector, owner, repo string, pr int, commi
 
 // postOPAReviewFindings syncs line-level PR review comments (add/update/close) and
 // upserts the global résumé issue comment. Falls back to annotations honesty.
-func postOPAReviewFindings(conn *opaConnector, owner, repo string, job *scmJob, res aiReviewResult, meta aiReviewPublishMeta) opaReviewInlineResult {
+// When autoApproveMinScore > 0, also submits APPROVE / REQUEST_CHANGES based on score.
+func postOPAReviewFindings(conn *opaConnector, owner, repo string, job *scmJob, res aiReviewResult, meta aiReviewPublishMeta, autoApproveMinScore int) opaReviewInlineResult {
 	out := opaReviewInlineResult{Mode: "none"}
 	if job == nil || job.PRNumber <= 0 {
 		return out
@@ -1504,6 +1567,8 @@ func postOPAReviewFindings(conn *opaConnector, owner, repo string, job *scmJob, 
 	}
 	resume, _ := publishAIReviewComment(job, res, pubMeta)
 
+	decisionEvent := decideOPAReviewEvent(res, autoApproveMinScore)
+
 	if githubUseMockAPI(conn) {
 		out.Mode = "mock"
 		n := 0
@@ -1515,7 +1580,7 @@ func postOPAReviewFindings(conn *opaConnector, owner, repo string, job *scmJob, 
 		out.Posted = n
 		out.Created = n
 		out.ResumeOK = true
-		out.Honesty = "mock GitHub — inline sync skipped (Check Run annotations retained when available); résumé would upsert in place"
+		out.Honesty = fmt.Sprintf("mock GitHub — inline sync skipped; decision event=%s", decisionEvent)
 		return out
 	}
 
@@ -1558,21 +1623,19 @@ func postOPAReviewFindings(conn *opaConnector, owner, repo string, job *scmJob, 
 		createSpecs = append(createSpecs, githubPRReviewCommentSpec{Path: c.Path, Line: c.Line, Body: c.Body})
 	}
 
-	if len(createSpecs) == 0 && out.Updated == 0 && out.Resolved == 0 {
-		if len(res.Findings) == 0 {
-			out.Mode = "sync"
-			out.Honesty = "résumé upserted; no line-level findings"
-			return out
-		}
-		out.Mode = "sync"
-		out.Honesty = "résumé upserted; inline comments unchanged"
-		return out
+	inlineEvent := "COMMENT"
+	// When deciding APPROVE/REQUEST_CHANGES and we have new inline comments, attach
+	// them to that decision review when possible (GitHub allows comments on both).
+	if len(createSpecs) > 0 && (decisionEvent == "APPROVE" || decisionEvent == "REQUEST_CHANGES") {
+		inlineEvent = decisionEvent
 	}
 
 	if len(createSpecs) > 0 {
-		// Prefer a single PR review for new inline comments (empty/minimal body — résumé is issue comment).
 		reviewBody := "OPA Review — inline findings updated."
-		if err := githubCreatePRReview(conn, owner, repo, job.PRNumber, job.CommitSHA, reviewBody, "COMMENT", createSpecs); err != nil {
+		if inlineEvent != "COMMENT" {
+			reviewBody = formatOPAReviewDecisionBody(res, inlineEvent, autoApproveMinScore)
+		}
+		if err := githubCreatePRReview(conn, owner, repo, job.PRNumber, job.CommitSHA, reviewBody, inlineEvent, createSpecs); err != nil {
 			posted := 0
 			for _, spec := range createSpecs {
 				if err := githubPRInlineComment(conn, owner, repo, job.PRNumber, job.CommitSHA, spec.Path, spec.Line, spec.Body); err != nil {
@@ -1586,17 +1649,30 @@ func postOPAReviewFindings(conn *opaConnector, owner, repo string, job *scmJob, 
 			if posted == 0 && out.Updated == 0 && out.Resolved == 0 {
 				out.Mode = "annotations_only"
 				out.Honesty = "inline PR comments unavailable (token/App permissions or line not in diff) — using Check Run annotations"
+				// Still try to post the score decision without inline comments.
+				_ = submitOPAReviewDecision(conn, owner, repo, job, res, decisionEvent, autoApproveMinScore)
 				return out
 			}
 			out.Mode = "comments"
+			// Inline fell back to individual comments — post decision separately.
+			if decisionEvent != "COMMENT" {
+				_ = submitOPAReviewDecision(conn, owner, repo, job, res, decisionEvent, autoApproveMinScore)
+			}
 		} else {
 			out.Created = len(createSpecs)
 			out.Posted = len(createSpecs) + out.Updated
 			out.Mode = "sync"
+			// Decision already included when inlineEvent != COMMENT.
+			if decisionEvent != "COMMENT" && inlineEvent == "COMMENT" {
+				_ = submitOPAReviewDecision(conn, owner, repo, job, res, decisionEvent, autoApproveMinScore)
+			}
 		}
 	} else {
 		out.Posted = out.Updated
 		out.Mode = "sync"
+		if decisionEvent != "COMMENT" {
+			_ = submitOPAReviewDecision(conn, owner, repo, job, res, decisionEvent, autoApproveMinScore)
+		}
 	}
 
 	parts := []string{}
@@ -1615,8 +1691,19 @@ func postOPAReviewFindings(conn *opaConnector, owner, repo string, job *scmJob, 
 	if out.Failed > 0 {
 		parts = append(parts, fmt.Sprintf("%d failed", out.Failed))
 	}
+	if decisionEvent != "COMMENT" {
+		parts = append(parts, "decision="+decisionEvent)
+	}
 	out.Honesty = strings.Join(parts, "; ")
 	return out
+}
+
+func submitOPAReviewDecision(conn *opaConnector, owner, repo string, job *scmJob, res aiReviewResult, event string, minScore int) error {
+	if job == nil || event == "" || event == "COMMENT" {
+		return nil
+	}
+	body := formatOPAReviewDecisionBody(res, event, minScore)
+	return githubCreatePRReview(conn, owner, repo, job.PRNumber, job.CommitSHA, body, event, nil)
 }
 
 func findingsToAnnotations(findings []map[string]interface{}) []map[string]interface{} {

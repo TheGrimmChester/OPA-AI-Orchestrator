@@ -290,18 +290,28 @@ func handleReviewContextGenerate(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	a := actorFromRequest(r)
 	ctxTenant, _ := ExtractTenantContext(r, queryClient)
-	orgKey, projKey := ctxTenant.WriteTenant()
-	key := resolveCursorAPIKey(orgKey, projKey)
+	if ctxTenant == nil {
+		ctxTenant = &TenantContext{}
+	}
+	orgKey, projKey := a.OrganizationID, a.ProjectID
+	if orgKey == "" {
+		orgKey, projKey = ctxTenant.WriteTenant()
+	} else if projKey == "" || projKey == tenantAll {
+		_, projKey = ctxTenant.WriteTenant()
+	}
+	userID := strings.TrimSpace(a.Username)
+	key := resolveCursorAPIKey(orgKey, projKey, userID)
 	if key == "" {
 		writeJSON(w, map[string]interface{}{
-			"ok": true, "status": "skipped", "reason": "OPA Review API key not set",
+			"ok": true, "status": "skipped", "reason": "cli_agent_api_key_not_set",
 			"draft": map[string]interface{}{
 				"title":         nz(body.Title, "Generated reviewer context"),
 				"body_markdown": "",
 				"source":        "skipped",
 			},
-			"honesty": "Configure OPA Review API key in Repo Watch settings (or CURSOR_API_KEY env).",
+			"honesty": "No CLI agent API key for this user/org — save one under Account (personal or org). Resolution is user → org → fail closed (never admin/env).",
 		})
 		return
 	}
@@ -470,7 +480,7 @@ Modules/directories that matter for this repo.
 Rules that must not break (authz, tenancy, data integrity, API contracts).
 
 ## Risk areas
-Auth, secrets, migrations, CI/CD, API compatibility, performance, rollout, common footguns.
+Auth, secrets, migrations, CI/CD, API compatibility, performance, hot-path complexity (nested loops, N+1), rollout, common footguns.
 
 ## Testing context
 What tests must prove; known gaps; where tests live.

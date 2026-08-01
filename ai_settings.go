@@ -15,7 +15,10 @@ import (
 
 // Unified AI provider settings (OpenAI-compatible, Anthropic-compatible, CLI Cursor).
 // Secrets are AES-GCM encrypted in opa.scm_secrets (+ file mirror under scm-state).
-// Env overrides (CURSOR_API_KEY, OPA_OPENAI_*, OPA_ANTHROPIC_*) win for single-tenant smoke.
+//
+// Credential scopes: admin (isolated) | org | user. Job resolution: user → org → fail closed.
+// Process env API keys (CURSOR_API_KEY / OPA_OPENAI_API_KEY / OPA_ANTHROPIC_API_KEY) are NOT
+// used as tenant fallbacks — they formerly acted as a shared admin pool.
 
 const (
 	aiSecretOpenAI     = "ai_openai_api_key"
@@ -45,11 +48,15 @@ type aiCLIProvider struct {
 type aiSettingsDoc struct {
 	OrganizationID  string         `json:"organization_id"`
 	ProjectID       string         `json:"project_id"`
+	Scope           string         `json:"scope"`   // admin|org|user (write target / effective)
+	UserID          string         `json:"user_id"` // set for user scope
 	DefaultProvider string         `json:"default_provider"` // openai|anthropic|cli_cursor|auto
 	OpenAI          aiHTTPProvider `json:"openai"`
 	Anthropic       aiHTTPProvider `json:"anthropic"`
 	CLICursor       aiCLIProvider  `json:"cli_cursor"`
 	UpdatedAt       string         `json:"updated_at"`
+	// KeySources records which scope supplied each API key (user|org|admin|"").
+	KeySources map[string]string `json:"-"`
 }
 
 var (
@@ -60,10 +67,22 @@ var (
 
 func registerAIMux(mux *http.ServeMux, authView, authAdmin func(string, http.HandlerFunc)) {
 	_ = authView
-	// Method-aware: GET viewer, PUT/POST admin
-	registerSCMAuthFlexible(mux, "/api/ai/settings", handleAISettings)
-	authAdmin("/api/ai/settings/test", handleAISettingsTest)
-	authAdmin("/api/ai/tasks", handleAITasks)
+	_ = authAdmin
+	registerAISettingsAuth(mux, "/api/ai/settings", handleAISettings)
+	registerAISettingsAuth(mux, "/api/ai/settings/test", handleAISettingsTest)
+	registerAISettingsAuth(mux, "/api/ai/tasks", handleAITasks)
+}
+
+// registerAISettingsAuth: GET/HEAD viewer; mutating methods require at least viewer
+// when auth is on (write-scope gates live in the handler).
+func registerAISettingsAuth(mux *http.ServeMux, pattern string, h http.HandlerFunc) {
+	mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+		if !authEnforced {
+			h(w, r)
+			return
+		}
+		AuthMiddleware(h, "viewer")(w, r)
+	})
 }
 
 func handleAISettings(w http.ResponseWriter, r *http.Request) {
@@ -199,26 +218,13 @@ type aiSettingsFileDoc struct {
 }
 
 func applyAIEnvOverrides(doc *aiSettingsDoc) {
-	if k := strings.TrimSpace(os.Getenv("CURSOR_API_KEY")); k != "" {
-		doc.CLICursor.APIKey = k
-	}
-	if k := strings.TrimSpace(os.Getenv("OPA_OPENAI_API_KEY")); k != "" {
-		doc.OpenAI.APIKey = k
-		if !doc.OpenAI.Enabled {
-			doc.OpenAI.Enabled = true
-		}
-	}
+	// Non-secret defaults only. Process-wide API key env vars are intentionally
+	// ignored — they used to act as a shared admin pool for every tenant job.
 	if u := strings.TrimSpace(os.Getenv("OPA_OPENAI_BASE_URL")); u != "" {
 		doc.OpenAI.BaseURL = u
 	}
 	if m := strings.TrimSpace(os.Getenv("OPA_OPENAI_MODEL")); m != "" {
 		doc.OpenAI.Model = m
-	}
-	if k := strings.TrimSpace(os.Getenv("OPA_ANTHROPIC_API_KEY")); k != "" {
-		doc.Anthropic.APIKey = k
-		if !doc.Anthropic.Enabled {
-			doc.Anthropic.Enabled = true
-		}
 	}
 	if u := strings.TrimSpace(os.Getenv("OPA_ANTHROPIC_BASE_URL")); u != "" {
 		doc.Anthropic.BaseURL = u
@@ -237,44 +243,63 @@ func applyAIEnvOverrides(doc *aiSettingsDoc) {
 	}
 }
 
+// getAISettings loads non-secret defaults then overlays scoped secrets.
+// Legacy signature: org-only inheritance (no user layer). Prefer getAISettingsFor.
 func getAISettings(org, proj string) aiSettingsDoc {
+	return getAISettingsFor(credResolveQuery{OrganizationID: org, ProjectID: proj})
+}
+
+func getAISettingsFor(q credResolveQuery) aiSettingsDoc {
 	aiSettingsMu.Lock()
 	defer aiSettingsMu.Unlock()
 	doc := loadAISettingsLocked()
-	if org != "" {
-		doc.OrganizationID = nz(doc.OrganizationID, org)
+	// Strip any keys that came from the legacy file mirror — secrets must come
+	// from scoped CH resolution so admin file keys never leak to org/user jobs.
+	doc.OpenAI.APIKey = ""
+	doc.Anthropic.APIKey = ""
+	doc.CLICursor.APIKey = ""
+	doc.KeySources = map[string]string{}
+	if q.WantAdminOnly {
+		doc.Scope = credScopeAdmin
+		doc.OrganizationID, doc.ProjectID, doc.UserID = "", "", ""
+	} else {
+		doc.OrganizationID = q.OrganizationID
+		doc.ProjectID = q.ProjectID
+		doc.UserID = q.UserID
+		doc.Scope = credScopeOrg
+		if q.UserID != "" {
+			doc.Scope = credScopeUser
+		}
 	}
-	if proj != "" {
-		doc.ProjectID = nz(doc.ProjectID, proj)
-	}
-	hydrateAISecretsFromCHLocked(org, proj, &doc)
+	hydrateAISecretsFromCHLocked(q, &doc)
 	return doc
 }
 
-func hydrateAISecretsFromCHLocked(org, proj string, doc *aiSettingsDoc) {
+func hydrateAISecretsFromCHLocked(q credResolveQuery, doc *aiSettingsDoc) {
 	if queryClient == nil {
+		applyAIEnvOverrides(doc)
 		return
 	}
-	for _, key := range []string{aiSecretOpenAI, aiSecretAnthropic, aiSecretCLICursor} {
-		if plain := loadSCMSecretPlain(org, proj, key); plain != "" {
-			switch key {
-			case aiSecretOpenAI:
-				if doc.OpenAI.APIKey == "" {
-					doc.OpenAI.APIKey = plain
-				}
-			case aiSecretAnthropic:
-				if doc.Anthropic.APIKey == "" {
-					doc.Anthropic.APIKey = plain
-				}
-			case aiSecretCLICursor:
-				if doc.CLICursor.APIKey == "" {
-					doc.CLICursor.APIKey = plain
-				}
-			}
+	applySecret := func(logicalKey string, set func(plain, scope string)) {
+		h := resolveSCMSecret(q, logicalKey)
+		if h.Plain != "" {
+			set(h.Plain, h.Scope)
 		}
 	}
-	// Meta (enabled/urls/models) from CH when file missing pieces
-	if meta := loadSCMSecretPlain(org, proj, aiSettingsMetaKey); meta != "" {
+	applySecret(aiSecretOpenAI, func(plain, scope string) {
+		doc.OpenAI.APIKey = plain
+		doc.KeySources["openai"] = scope
+	})
+	applySecret(aiSecretAnthropic, func(plain, scope string) {
+		doc.Anthropic.APIKey = plain
+		doc.KeySources["anthropic"] = scope
+	})
+	applySecret(aiSecretCLICursor, func(plain, scope string) {
+		doc.CLICursor.APIKey = plain
+		doc.KeySources["cli_cursor"] = scope
+	})
+	// Meta: prefer same inheritance (user → org); admin-only when WantAdminOnly.
+	if meta := resolveSCMSecret(q, aiSettingsMetaKey).Plain; meta != "" {
 		var m aiSettingsFileDoc
 		if json.Unmarshal([]byte(meta), &m) == nil {
 			if m.DefaultProvider != "" {
@@ -304,100 +329,44 @@ func hydrateAISecretsFromCHLocked(org, proj string, doc *aiSettingsDoc) {
 			}
 		}
 	}
-	aiSettingsMem = *doc
 	applyAIEnvOverrides(doc)
-}
-
-func loadSCMSecretPlain(org, proj, key string) string {
-	if queryClient == nil {
-		return ""
-	}
-	q := fmt.Sprintf(`
-		SELECT organization_id, project_id, ciphertext, deleted FROM opa.scm_secrets
-		WHERE key = '%s'
-		ORDER BY updated_at DESC LIMIT 20`, escapeSQL(key))
-	rows, err := queryClient.Query(q)
-	if err != nil || len(rows) == 0 {
-		return ""
-	}
-	pick := func(wantOrg, wantProj string, allowAny bool) string {
-		for _, row := range rows {
-			deleted := false
-			switch v := row["deleted"].(type) {
-			case uint8:
-				deleted = v != 0
-			case int64:
-				deleted = v != 0
-			case float64:
-				deleted = v != 0
-			case bool:
-				deleted = v
-			}
-			if deleted {
-				continue
-			}
-			rowOrg, _ := row["organization_id"].(string)
-			rowProj, _ := row["project_id"].(string)
-			if !allowAny {
-				if wantOrg != "" && rowOrg != wantOrg {
-					continue
-				}
-				if wantProj != "" && rowProj != wantProj && rowProj != "" {
-					continue
-				}
-			}
-			ct, _ := row["ciphertext"].(string)
-			if !isEncryptedSecret(ct) {
-				continue
-			}
-			plain, err := decryptSecret(ct)
-			if err != nil || plain == "" {
-				continue
-			}
-			return plain
-		}
-		return ""
-	}
-	if org != "" {
-		if p := pick(org, proj, false); p != "" {
-			return p
-		}
-		if p := pick(org, "", false); p != "" {
-			return p
-		}
-	}
-	return pick("", "", true)
 }
 
 func persistAISettings(doc aiSettingsDoc) error {
 	doc.UpdatedAt = time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	scope := inferLegacyScope(doc.OrganizationID, doc.Scope)
+	org, proj, userID := doc.OrganizationID, doc.ProjectID, doc.UserID
+	if scope == credScopeAdmin {
+		org, proj, userID = "", "", ""
+	}
+
 	aiSettingsMu.Lock()
 	aiSettingsMem = doc
 	aiSettingsHydrated = true
-	// Keep legacy cursor memory in sync for OPA Review callers
-	if doc.CLICursor.APIKey != "" {
+	if scope == credScopeAdmin && doc.CLICursor.APIKey != "" {
 		cursorKeyMem = doc.CLICursor.APIKey
-		cursorKeyOrg, cursorKeyProj = doc.OrganizationID, doc.ProjectID
+		cursorKeyOrg, cursorKeyProj = org, proj
 	}
 	aiSettingsMu.Unlock()
 
-	if err := persistAISettingsFile(doc); err != nil {
-		log.Printf("[WARN] ai-settings file: %v", err)
+	// File mirror is admin-bootstrap only — never write org/user keys to a global file.
+	if scope == credScopeAdmin {
+		if err := persistAISettingsFile(doc); err != nil {
+			log.Printf("[WARN] ai-settings file: %v", err)
+		}
 	}
-	org, proj := doc.OrganizationID, doc.ProjectID
 	if doc.OpenAI.APIKey != "" {
-		_ = persistSCMSecret(org, proj, aiSecretOpenAI, doc.OpenAI.APIKey, false)
+		_ = persistSCMSecretScoped(org, proj, scope, userID, aiSecretOpenAI, doc.OpenAI.APIKey, false)
 	}
 	if doc.Anthropic.APIKey != "" {
-		_ = persistSCMSecret(org, proj, aiSecretAnthropic, doc.Anthropic.APIKey, false)
+		_ = persistSCMSecretScoped(org, proj, scope, userID, aiSecretAnthropic, doc.Anthropic.APIKey, false)
 	}
 	if doc.CLICursor.APIKey != "" {
-		_ = persistSCMSecret(org, proj, aiSecretCLICursor, doc.CLICursor.APIKey, false)
+		_ = persistSCMSecretScoped(org, proj, scope, userID, aiSecretCLICursor, doc.CLICursor.APIKey, false)
 	}
-	// Meta JSON (non-secret) stored as plaintext-looking ciphertext encrypt of JSON
 	meta := aiSettingsFileDoc{
-		OrganizationID:  doc.OrganizationID,
-		ProjectID:       doc.ProjectID,
+		OrganizationID:  org,
+		ProjectID:       proj,
 		DefaultProvider: doc.DefaultProvider,
 		OpenAI:          aiHTTPProviderFile{Enabled: doc.OpenAI.Enabled, BaseURL: doc.OpenAI.BaseURL, Model: doc.OpenAI.Model},
 		Anthropic:       aiHTTPProviderFile{Enabled: doc.Anthropic.Enabled, BaseURL: doc.Anthropic.BaseURL, Model: doc.Anthropic.Model},
@@ -405,7 +374,7 @@ func persistAISettings(doc aiSettingsDoc) error {
 		UpdatedAt:       doc.UpdatedAt,
 	}
 	metaRaw, _ := json.Marshal(meta)
-	_ = persistSCMSecret(org, proj, aiSettingsMetaKey, string(metaRaw), false)
+	_ = persistSCMSecretScoped(org, proj, scope, userID, aiSettingsMetaKey, string(metaRaw), false)
 	return nil
 }
 
@@ -454,43 +423,126 @@ func persistAISettingsFile(doc aiSettingsDoc) error {
 }
 
 func redactAISettings(doc aiSettingsDoc) map[string]interface{} {
-	envOpenAI := strings.TrimSpace(os.Getenv("OPA_OPENAI_API_KEY")) != ""
-	envAnthropic := strings.TrimSpace(os.Getenv("OPA_ANTHROPIC_API_KEY")) != ""
-	envCursor := strings.TrimSpace(os.Getenv("CURSOR_API_KEY")) != ""
+	src := doc.KeySources
+	if src == nil {
+		src = map[string]string{}
+	}
+	keyInfo := func(set bool, source string) map[string]interface{} {
+		inherited := source == credScopeOrg && doc.Scope == credScopeUser
+		return map[string]interface{}{
+			"api_key_set": set,
+			"key_scope":   source,
+			"inherited":   inherited,
+			"env_override": false, // process env API keys are no longer used
+		}
+	}
+	openSet := doc.OpenAI.APIKey != ""
+	anthSet := doc.Anthropic.APIKey != ""
+	cliSet := doc.CLICursor.APIKey != ""
 	return map[string]interface{}{
 		"organization_id":  doc.OrganizationID,
 		"project_id":       doc.ProjectID,
+		"scope":            nz(doc.Scope, credScopeOrg),
+		"user_id":          doc.UserID,
 		"default_provider": nz(doc.DefaultProvider, "auto"),
-		"openai": map[string]interface{}{
-			"enabled":    doc.OpenAI.Enabled,
-			"base_url":   doc.OpenAI.BaseURL,
-			"model":      doc.OpenAI.Model,
-			"api_key_set": doc.OpenAI.APIKey != "" || envOpenAI,
-			"env_override": envOpenAI,
-		},
-		"anthropic": map[string]interface{}{
-			"enabled":     doc.Anthropic.Enabled,
-			"base_url":    doc.Anthropic.BaseURL,
-			"model":       doc.Anthropic.Model,
-			"api_key_set": doc.Anthropic.APIKey != "" || envAnthropic,
-			"env_override": envAnthropic,
-		},
-		"cli_cursor": map[string]interface{}{
-			"enabled":     doc.CLICursor.Enabled,
-			"model":       doc.CLICursor.Model,
-			"bin":         doc.CLICursor.Bin,
-			"force":       doc.CLICursor.Force,
-			"api_key_set": doc.CLICursor.APIKey != "" || envCursor,
-			"env_override": envCursor,
-			"label":       "CLI agent (Cursor)",
-		},
+		"openai": mergeMaps(map[string]interface{}{
+			"enabled":  doc.OpenAI.Enabled,
+			"base_url": doc.OpenAI.BaseURL,
+			"model":    doc.OpenAI.Model,
+		}, keyInfo(openSet, src["openai"])),
+		"anthropic": mergeMaps(map[string]interface{}{
+			"enabled":  doc.Anthropic.Enabled,
+			"base_url": doc.Anthropic.BaseURL,
+			"model":    doc.Anthropic.Model,
+		}, keyInfo(anthSet, src["anthropic"])),
+		"cli_cursor": mergeMaps(map[string]interface{}{
+			"enabled": doc.CLICursor.Enabled,
+			"model":   doc.CLICursor.Model,
+			"bin":     doc.CLICursor.Bin,
+			"force":   doc.CLICursor.Force,
+			"label":   "CLI agent (Cursor)",
+		}, keyInfo(cliSet, src["cli_cursor"])),
 		"updated_at": doc.UpdatedAt,
-		"routing": map[string]interface{}{
-			"dashboard_tasks": "openai then anthropic (or default_provider)",
-			"opa_review":      "cli_cursor first, HTTP fallback if CLI unavailable",
+		"inheritance": map[string]interface{}{
+			"order":           []string{credScopeUser, credScopeOrg},
+			"admin_isolated":  true,
+			"env_keys_unused": true,
 		},
-		"honesty": "API keys are AES-GCM encrypted (never returned). Env CURSOR_API_KEY / OPA_OPENAI_API_KEY / OPA_ANTHROPIC_API_KEY override stored keys for single-tenant smoke.",
+		"routing": map[string]interface{}{
+			"dashboard_tasks":  "auto: CLI agent (if key) → OpenAI → Anthropic; or explicit default_provider",
+			"opa_review":       "cli_cursor first, HTTP fallback if CLI unavailable",
+			"context_generate": "always CLI agent (user → org key); ignores default_provider",
+		},
+		"honesty": "API keys are AES-GCM encrypted (never returned). Resolution: user → org → fail closed. Admin keys are never inherited. Process env API keys are not used as tenant fallbacks.",
 	}
+}
+
+func mergeMaps(a, b map[string]interface{}) map[string]interface{} {
+	out := map[string]interface{}{}
+	for k, v := range a {
+		out[k] = v
+	}
+	for k, v := range b {
+		out[k] = v
+	}
+	return out
+}
+
+func aiResolveQueryFromRequest(r *http.Request, writeScope string) (credResolveQuery, credActor, string, error) {
+	a := actorFromRequest(r)
+	scope, err := normalizeCredScope(writeScope, a)
+	if err != nil {
+		return credResolveQuery{}, a, "", err
+	}
+	// Explicit ?scope= on GET selects the view; empty → effective inheritance for actor.
+	if writeScope == "" && r.Method != http.MethodPut && r.Method != http.MethodPost {
+		q := r.URL.Query().Get("scope")
+		if q != "" {
+			scope, err = normalizeCredScope(q, a)
+			if err != nil {
+				return credResolveQuery{}, a, "", err
+			}
+		} else {
+			// Default GET: show effective settings (user override → org), never admin.
+			if a.isAdmin() && a.OrganizationID == "" && r.URL.Query().Get("admin") == "1" {
+				scope = credScopeAdmin
+			} else if a.Username != "" {
+				scope = credScopeUser // resolve still inherits org when user has no key
+			} else {
+				scope = credScopeOrg
+			}
+		}
+	}
+	if err := canWriteCredScope(a, scope); err != nil && (r.Method == http.MethodPut || r.Method == http.MethodPost) {
+		return credResolveQuery{}, a, scope, err
+	}
+	// Visibility: non-admins must not read admin scope.
+	if scope == credScopeAdmin && !a.isAdmin() {
+		return credResolveQuery{}, a, scope, fmt.Errorf("forbidden")
+	}
+	// Org scope requires a selected org — never fall through to default-org for strangers.
+	if scope == credScopeOrg && a.OrganizationID == "" {
+		return credResolveQuery{}, a, scope, fmt.Errorf("org scope requires X-Organization-ID")
+	}
+	// User secrets are owner-only; resolveCredTarget already binds to a.Username.
+	if scope == credScopeUser && a.Username == "" && authEnforced {
+		return credResolveQuery{}, a, scope, fmt.Errorf("user scope requires authenticated username")
+	}
+	org, proj, userID := resolveCredTarget(a, scope)
+	q := credResolveQuery{
+		OrganizationID: org,
+		ProjectID:      proj,
+		UserID:         userID,
+		WantAdminOnly:  scope == credScopeAdmin,
+	}
+	// For effective user view, keep UserID so inheritance can prefer personal keys.
+	if scope == credScopeUser {
+		q.UserID = nz(userID, a.Username)
+	}
+	if scope == credScopeOrg {
+		q.UserID = "" // org view/edit: do not mix in personal overrides
+	}
+	return q, a, scope, nil
 }
 
 func handleAISettingsGet(w http.ResponseWriter, r *http.Request) {
@@ -498,10 +550,23 @@ func handleAISettingsGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
-	ctx, _ := ExtractTenantContext(r, queryClient)
-	org, proj := ctx.WriteTenant()
-	doc := getAISettings(org, proj)
-	writeJSON(w, redactAISettings(doc))
+	q, a, scope, err := aiResolveQueryFromRequest(r, r.URL.Query().Get("scope"))
+	if err != nil {
+		http.Error(w, err.Error(), 403)
+		return
+	}
+	_ = a
+	doc := getAISettingsFor(q)
+	doc.Scope = scope
+	if scope == credScopeUser {
+		doc.UserID = q.UserID
+	}
+	// Also report whether a personal override exists vs pure org inheritance.
+	out := redactAISettings(doc)
+	out["can_edit_org"] = a.isAdmin() && a.OrganizationID != ""
+	out["can_edit_admin"] = a.isAdmin()
+	out["can_edit_user"] = a.Username != "" || !authEnforced
+	writeJSON(w, out)
 }
 
 func handleAISettingsPut(w http.ResponseWriter, r *http.Request) {
@@ -511,13 +576,14 @@ func handleAISettingsPut(w http.ResponseWriter, r *http.Request) {
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	var body struct {
+		Scope           string `json:"scope"`
 		DefaultProvider string `json:"default_provider"`
 		OpenAI          *struct {
-			Enabled    *bool  `json:"enabled"`
-			BaseURL    string `json:"base_url"`
-			Model      string `json:"model"`
-			APIKey     string `json:"api_key"`
-			ClearKey   bool   `json:"clear_key"`
+			Enabled  *bool  `json:"enabled"`
+			BaseURL  string `json:"base_url"`
+			Model    string `json:"model"`
+			APIKey   string `json:"api_key"`
+			ClearKey bool   `json:"clear_key"`
 		} `json:"openai"`
 		Anthropic *struct {
 			Enabled  *bool  `json:"enabled"`
@@ -539,11 +605,20 @@ func handleAISettingsPut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", 400)
 		return
 	}
-	ctx, _ := ExtractTenantContext(r, queryClient)
-	org, proj := ctx.WriteTenant()
-	doc := getAISettings(org, proj)
-	doc.OrganizationID = org
-	doc.ProjectID = proj
+	q, a, scope, err := aiResolveQueryFromRequest(r, body.Scope)
+	if err != nil {
+		code := 403
+		if strings.Contains(err.Error(), "invalid scope") || strings.Contains(err.Error(), "requires") {
+			code = 400
+		}
+		http.Error(w, err.Error(), code)
+		return
+	}
+	doc := getAISettingsFor(q)
+	doc.Scope = scope
+	doc.OrganizationID = q.OrganizationID
+	doc.ProjectID = q.ProjectID
+	doc.UserID = q.UserID
 	if body.DefaultProvider != "" {
 		switch body.DefaultProvider {
 		case "auto", aiProviderOpenAI, aiProviderAnthropic, aiProviderCLICursor:
@@ -552,6 +627,9 @@ func handleAISettingsPut(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid default_provider", 400)
 			return
 		}
+	}
+	clearAt := func(logical string) {
+		_ = persistSCMSecretScoped(q.OrganizationID, q.ProjectID, scope, q.UserID, logical, "", true)
 	}
 	if body.OpenAI != nil {
 		if body.OpenAI.Enabled != nil {
@@ -565,7 +643,7 @@ func handleAISettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.OpenAI.ClearKey {
 			doc.OpenAI.APIKey = ""
-			_ = persistSCMSecret(org, proj, aiSecretOpenAI, "", true)
+			clearAt(aiSecretOpenAI)
 		} else if strings.TrimSpace(body.OpenAI.APIKey) != "" {
 			doc.OpenAI.APIKey = strings.TrimSpace(body.OpenAI.APIKey)
 		}
@@ -582,7 +660,7 @@ func handleAISettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.Anthropic.ClearKey {
 			doc.Anthropic.APIKey = ""
-			_ = persistSCMSecret(org, proj, aiSecretAnthropic, "", true)
+			clearAt(aiSecretAnthropic)
 		} else if strings.TrimSpace(body.Anthropic.APIKey) != "" {
 			doc.Anthropic.APIKey = strings.TrimSpace(body.Anthropic.APIKey)
 		}
@@ -602,20 +680,26 @@ func handleAISettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.CLICursor.ClearKey {
 			doc.CLICursor.APIKey = ""
-			cursorKeyMu.Lock()
-			cursorKeyMem = ""
-			cursorKeyOrg, cursorKeyProj = "", ""
-			cursorKeyMu.Unlock()
-			_ = persistSCMSecret(org, proj, aiSecretCLICursor, "", true)
+			if scope == credScopeAdmin {
+				cursorKeyMu.Lock()
+				cursorKeyMem = ""
+				cursorKeyOrg, cursorKeyProj = "", ""
+				cursorKeyMu.Unlock()
+			}
+			clearAt(aiSecretCLICursor)
 		} else if strings.TrimSpace(body.CLICursor.APIKey) != "" {
 			doc.CLICursor.APIKey = strings.TrimSpace(body.CLICursor.APIKey)
 		}
 	}
+	_ = a
 	if err := persistAISettings(doc); err != nil {
 		http.Error(w, "failed to persist AI settings", 500)
 		return
 	}
-	writeJSON(w, map[string]interface{}{"ok": true, "settings": redactAISettings(getAISettings(org, proj))})
+	fresh := getAISettingsFor(q)
+	fresh.Scope = scope
+	fresh.UserID = q.UserID
+	writeJSON(w, map[string]interface{}{"ok": true, "settings": redactAISettings(fresh)})
 }
 
 func handleAISettingsTest(w http.ResponseWriter, r *http.Request) {
@@ -626,23 +710,47 @@ func handleAISettingsTest(w http.ResponseWriter, r *http.Request) {
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	var body struct {
 		Provider string `json:"provider"` // openai|anthropic|cli_cursor
+		Scope    string `json:"scope"`
+		// Optional draft key from the settings form — used for Test without Save.
+		// Never persisted by this endpoint.
+		APIKey string `json:"api_key"`
 	}
 	_ = json.Unmarshal(raw, &body)
 	provider := strings.TrimSpace(body.Provider)
 	if provider == "" {
 		provider = aiProviderOpenAI
 	}
-	ctx, _ := ExtractTenantContext(r, queryClient)
-	org, proj := ctx.WriteTenant()
-	doc := getAISettings(org, proj)
+	draftKey := strings.TrimSpace(body.APIKey)
+	q, _, scope, err := aiResolveQueryFromRequest(r, body.Scope)
+	if err != nil {
+		http.Error(w, err.Error(), 403)
+		return
+	}
+	doc := getAISettingsFor(q)
+	doc.Scope = scope
+	// Overlay draft key onto the provider under test (same resolution as jobs
+	// once saved; draft lets the UI Test before Save).
+	if draftKey != "" {
+		switch provider {
+		case aiProviderOpenAI:
+			doc.OpenAI.APIKey = draftKey
+		case aiProviderAnthropic:
+			doc.Anthropic.APIKey = draftKey
+		case aiProviderCLICursor:
+			doc.CLICursor.APIKey = draftKey
+		}
+	}
+
+	missingKeyMsg := func(label string) string {
+		return label + " api key not configured for this scope — save a key first, or paste one in the form and Test"
+	}
 
 	reqCtx := r.Context()
-	var err error
 	var text, model string
 	switch provider {
 	case aiProviderOpenAI:
 		if doc.OpenAI.APIKey == "" {
-			http.Error(w, "openai api key not configured", 400)
+			http.Error(w, missingKeyMsg("openai"), 400)
 			return
 		}
 		res, e := completeOpenAI(reqCtx, doc, aiCompleteRequest{
@@ -656,7 +764,7 @@ func handleAISettingsTest(w http.ResponseWriter, r *http.Request) {
 		}
 	case aiProviderAnthropic:
 		if doc.Anthropic.APIKey == "" {
-			http.Error(w, "anthropic api key not configured", 400)
+			http.Error(w, missingKeyMsg("anthropic"), 400)
 			return
 		}
 		res, e := completeAnthropic(reqCtx, doc, aiCompleteRequest{
@@ -670,7 +778,7 @@ func handleAISettingsTest(w http.ResponseWriter, r *http.Request) {
 		}
 	case aiProviderCLICursor:
 		if doc.CLICursor.APIKey == "" {
-			http.Error(w, "cli agent api key not configured", 400)
+			http.Error(w, missingKeyMsg("cli agent"), 400)
 			return
 		}
 		res, e := completeCLI(reqCtx, doc, aiCompleteRequest{
@@ -687,29 +795,25 @@ func handleAISettingsTest(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeJSON(w, map[string]interface{}{
-			"ok": false, "provider": provider, "model": model, "error": err.Error(),
+			"ok": false, "provider": provider, "scope": scope, "model": model, "error": err.Error(),
 		})
 		return
 	}
 	writeJSON(w, map[string]interface{}{
-		"ok": true, "provider": provider, "model": model, "text": truncateStr(text, 200),
+		"ok": true, "provider": provider, "scope": scope, "model": model, "text": truncateStr(text, 200),
 	})
 }
 
-// setCLICursorKeyFromAlias updates unified settings from legacy cursor-key endpoint.
+// setCLICursorKeyFromAlias updates unified settings from legacy cursor-key endpoint (org scope).
 func setCLICursorKeyFromAlias(org, proj, key string, clear bool) error {
-	doc := getAISettings(org, proj)
+	doc := getAISettingsFor(credResolveQuery{OrganizationID: org, ProjectID: proj})
 	doc.OrganizationID = org
 	doc.ProjectID = proj
+	doc.Scope = credScopeOrg
+	doc.UserID = ""
 	if clear {
 		doc.CLICursor.APIKey = ""
-		cursorKeyMu.Lock()
-		cursorKeyMem = ""
-		cursorKeyOrg, cursorKeyProj = "", ""
-		cursorKeyMu.Unlock()
-		// Must tombstone CH — persistAISettings skips empty keys and would leave the prior
-		// ciphertext live (smoke was clearing via this path, then rehydrating the fake key).
-		_ = persistSCMSecret(org, proj, aiSecretCLICursor, "", true)
+		_ = persistSCMSecretScoped(org, proj, credScopeOrg, "", aiSecretCLICursor, "", true)
 	} else {
 		doc.CLICursor.APIKey = key
 		doc.CLICursor.Enabled = true

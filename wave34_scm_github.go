@@ -542,7 +542,7 @@ type githubPRReviewCommentSpec struct {
 }
 
 // githubCreatePRReview creates a PR review with a short résumé body and optional
-// inline comments. event is typically "COMMENT" (non-blocking).
+// inline comments. event is COMMENT, APPROVE, or REQUEST_CHANGES.
 func githubCreatePRReview(c *opaConnector, owner, repo string, pr int, commitSHA, body, event string, comments []githubPRReviewCommentSpec) error {
 	if c == nil || pr <= 0 || githubUseMockAPI(c) {
 		return nil
@@ -578,6 +578,53 @@ func githubCreatePRReview(c *opaConnector, owner, repo string, pr int, commitSHA
 		return fmt.Errorf("pr review %d: %s", code, truncateStr(string(resp), 240))
 	}
 	return nil
+}
+
+// githubRequestPRReviewers asks GitHub to request reviewers on a PR.
+// For GitHub Apps, pass the app slug (OPA_GITHUB_APP_SLUG) as a reviewer login.
+func githubRequestPRReviewers(c *opaConnector, owner, repo string, pr int, reviewers []string) error {
+	if c == nil || pr <= 0 || len(reviewers) == 0 || githubUseMockAPI(c) {
+		return nil
+	}
+	cleaned := make([]string, 0, len(reviewers))
+	seen := map[string]struct{}{}
+	for _, r := range reviewers {
+		r = strings.TrimSpace(r)
+		r = strings.TrimSuffix(r, "[bot]")
+		if r == "" {
+			continue
+		}
+		key := strings.ToLower(r)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		cleaned = append(cleaned, r)
+	}
+	if len(cleaned) == 0 {
+		return nil
+	}
+	payload, _ := json.Marshal(map[string]interface{}{"reviewers": cleaned})
+	resp, code, err := githubAPI(c, http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/requested_reviewers", owner, repo, pr), strings.NewReader(string(payload)))
+	if err != nil {
+		return err
+	}
+	// 422 often means already requested — treat as soft success.
+	if code == 422 {
+		return nil
+	}
+	if code >= 300 {
+		return fmt.Errorf("request reviewers %d: %s", code, truncateStr(string(resp), 240))
+	}
+	return nil
+}
+
+func githubAppReviewerLogin() string {
+	slug := strings.TrimSpace(os.Getenv("OPA_GITHUB_APP_SLUG"))
+	if slug == "" {
+		slug = "opa-ai-orchestrator"
+	}
+	return slug
 }
 
 func githubPRDiff(c *opaConnector, owner, repo string, pr int) (string, error) {
@@ -744,8 +791,7 @@ func handleConnectorPulls(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	c := getOrHydrateConnector(id)
-	if c == nil {
-		writeJSON(w, map[string]interface{}{"pulls": []interface{}{}, "error": "connector_not_found"})
+	if denyConnectorIfInvisible(w, r, c) {
 		return
 	}
 	owner, name := splitOwnerRepo(repo)

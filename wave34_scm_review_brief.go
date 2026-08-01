@@ -10,7 +10,7 @@ import (
 
 const opaReviewRolePreamble = `You are a **senior engineer** performing an **OPA Review** of a pull request.
 
-**Goal:** find real defects — logic bugs, regressions, security issues, performance risks, and missing test coverage that would matter in production.
+**Goal:** find real defects — logic bugs, regressions, security issues, performance risks (including method complexity / nested loops / N+1), and missing test coverage that would matter in production.
 
 **Rules:**
 - Be skeptical, precise, and production-oriented.
@@ -29,7 +29,7 @@ const opaReviewInstructions = `## Review instructions (two-step)
 Summarize data flow, control flow, and assumptions in 3–5 bullets ("understanding" / "summary"). Identify what the PR changes and what must not break.
 
 ### Step 2 — Review aggressively
-Challenge assumptions. Hunt for: logic bugs, edge cases, regressions, security, performance, incomplete/missing tests, API/contract breakage. Open surrounding code (callers, callees, interfaces, neighbors, related tests) — **do not review the hunk in isolation.**
+Challenge assumptions. Hunt for: logic bugs, edge cases, regressions, security, performance (method complexity, nested loops, N+1), incomplete/missing tests, API/contract breakage. Open surrounding code (callers, callees, interfaces, neighbors, related tests) — **do not review the hunk in isolation.**
 
 ### Hard rules
 1. Ignore pure style / linter noise unless it conceals a real defect.
@@ -38,6 +38,25 @@ Challenge assumptions. Hunt for: logic bugs, edge cases, regressions, security, 
 4. Require that tests prove the intended behavior.
 5. Résumé fields ("narrative", confidence, "human_review_priorities"): merge blockers only — not every finding. Optionally note the strongest aspect of the PR in one sentence inside "narrative".
 6. Sort findings by severity (blocker/high first). If no real issues: findings=[] and say why it looks safe.
+`
+
+// Always-on method-optimization guidance; findings use rule "performance".
+const opaReviewPerformanceRules = `## Method optimization / complexity
+
+Actively check changed methods for algorithmic and I/O complexity that will hurt production as input grows. Flag real issues with rule ` + "`performance`" + ` and file:line.
+
+**Hunt for:**
+- Nested loops over collections (` + "`foreach`" + `/` + "`for`" + `/` + "`forEach`" + `/` + "`range`" + `) that become O(n²+) as sizes grow
+- Linear search inside a loop when a map/set/index would be O(1) (e.g. ` + "`in_array`" + `/` + "`array_search`" + `/` + "`.includes`" + `/` + "`.indexOf`" + ` over growing lists)
+- Repeated full-collection scans or filter/map passes on hot paths when a single pass would do
+- N+1 DB/API/network calls inside loops
+- Building large intermediate structures when a single pass, index, or generator would suffice
+
+**Guardrails:**
+- Only flag when scale matters (request path, batch jobs, collections that grow with user/data size) — not tiny fixed-size loops.
+- State the complexity (e.g. O(n²)) and why it matters under expected load; suggest a concrete rewrite (index first, join/batch query, single pass).
+- Severity: typically medium or high on hot paths; use blocker only when clearly pathological under expected load.
+- Do not nitpick micro-optimizations or style-only rewrites.
 `
 
 const opaReviewOutputSchema = `## Required JSON output
@@ -73,7 +92,7 @@ Severity mapping: blocker = must-fix before merge (treated as critical for gates
 `
 
 // Compact scaffold when token budget is tight (unit prompts still attach context packet when available).
-const opaReviewCompactScaffold = `OPA Review — senior engineer. Find real defects (bugs, regressions, security, performance, missing tests). No style nitpicks. If unsure, state missing context. If clean, say why it looks safe. Output only the required JSON.
+const opaReviewCompactScaffold = `OPA Review — senior engineer. Find real defects (bugs, regressions, security, performance including method complexity / nested loops / N+1, missing tests). No style nitpicks. If unsure, state missing context. If clean, say why it looks safe. Output only the required JSON.
 `
 
 // extractContextSection pulls a markdown ##/### section body by heading keywords.
@@ -205,7 +224,7 @@ func writeOPAReviewContextFields(b *strings.Builder, job *scmJob, applied applie
 	invariants := extractContextSection(primaryMD, "invariant", "invariants", "must not", "must not break", "constraints")
 	risks := extractContextSection(primaryMD, "risk", "risks", "risk profile", "auth", "footgun", "sensitive", "tricky")
 	if risks == "" {
-		risks = "Consider: auth, secrets, data migration, CI/CD, API compatibility, performance, rollout."
+		risks = "Consider: auth, secrets, data migration, CI/CD, API compatibility, performance, hot-path complexity (nested loops, N+1), rollout."
 	}
 	testing := extractContextSection(primaryMD, "testing", "tests", "existing tests", "test quality", "coverage")
 	if testing == "" {
@@ -370,7 +389,7 @@ Modules/directories that matter for this repo.
 Rules that must not break (authz, tenancy, data integrity, API contracts).
 
 ## Risk areas
-Auth, secrets, migrations, CI/CD, API compatibility, performance, rollout, known tricky areas.
+Auth, secrets, migrations, CI/CD, API compatibility, performance, hot-path complexity (nested loops, N+1), rollout, known tricky areas.
 
 ## Testing context
 Existing tests that must continue to pass; what new tests must prove; known gaps.
