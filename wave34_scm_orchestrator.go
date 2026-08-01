@@ -362,6 +362,21 @@ func handleSCMJobsList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleSCMJobsResume POST /api/scm/jobs/resume — one-shot kick after recreate/stall:
+// resumes incomplete stack drains and re-dispatches orphaned non-stack queued jobs.
+func handleSCMJobsResume(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	stacks, queued := resumeSCMProcessing()
+	writeJSON(w, map[string]interface{}{
+		"ok": true, "stacks_resumed": stacks, "queued_dispatched": queued,
+		"concurrency": scmProcessConcurrency(),
+		"honesty":     "Re-dispatches non-stack queued jobs and incomplete stack drains. processSCMJob is concurrency-bounded and dedupes in-flight IDs.",
+	})
+}
+
 func handleSCMJobSub(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/scm/jobs/")
 	path = strings.Trim(path, "/")
@@ -617,14 +632,25 @@ func handleSCMSimulate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"ok": true, "job_id": job.ID, "repo": repo, "sha": sha})
 }
 
+// scmProcessing tracks job IDs with an active processSCMJob goroutine so boot/admin
+// resume and enqueue cannot run the same job twice concurrently.
+var scmProcessing sync.Map // jobID -> struct{}
+
 func processSCMJob(jobID string) {
+	if _, loaded := scmProcessing.LoadOrStore(jobID, struct{}{}); loaded {
+		return
+	}
+	defer scmProcessing.Delete(jobID)
+
 	acquireSCMProcessSlot()
 	defer releaseSCMProcessSlot()
 	job := getSCMJob(jobID)
 	if job == nil {
 		return
 	}
-	if job.Status == "cancelled" {
+	switch job.Status {
+	case "cancelled", "completed", "failed", "error", "running":
+		// Terminal, or another path already marked running (should be rare with scmProcessing).
 		return
 	}
 	cancel := registerSCMJobCancel(jobID)
