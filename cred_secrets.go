@@ -158,8 +158,13 @@ func loadSCMSecretAtScope(org, proj, scope, userID, logicalKey string) scmSecret
 			if org != "" && rowOrg != "" && rowOrg != org {
 				continue
 			}
-			if proj != "" && rowProj != "" && rowProj != proj {
-				// Prefer exact project; allow org-wide (empty project) via second pass.
+			if proj != "" {
+				if rowProj != "" && rowProj != proj {
+					// Prefer exact project; allow org-wide (empty project) via second pass.
+					continue
+				}
+			} else if rowProj != "" {
+				// Org-wide lookup: ignore project-specific rows (including their tombstones).
 				continue
 			}
 		case credScopeUser:
@@ -171,8 +176,8 @@ func loadSCMSecretAtScope(org, proj, scope, userID, logicalKey string) scmSecret
 			}
 		}
 		if rowDeletedFlag(row) {
-			// Authoritative clear for this org/proj(/user) identity.
-			if scope == credScopeOrg && proj != "" && rowProj != "" {
+			// Authoritative clear for this identity — do not resurrect older ciphertext.
+			if scope == credScopeOrg && proj != "" && rowProj == proj {
 				// Exact-project tombstone: still allow org-wide (empty project) fallback.
 				return loadSCMSecretAtScope(org, "", scope, userID, logicalKey)
 			}
