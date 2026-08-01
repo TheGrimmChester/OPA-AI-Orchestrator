@@ -808,15 +808,17 @@ func handleSCMSettings(w http.ResponseWriter, r *http.Request) {
 		hydrateCursorKeyFromCH(org, proj)
 	}
 	hasKey := resolveCursorAPIKey(org, proj) != ""
+	_, _, cursorModel, _ := resolveCLICursorConfig(org, proj)
 	writeJSON(w, map[string]interface{}{
 		"github_app_configured": githubAppConfigured(),
 		"cursor_key_set":        hasKey,
-		"cursor_model":          envOr("OPA_CURSOR_MODEL", "auto"),
+		"cursor_model":          cursorModel,
 		"webhook_url":           strings.TrimRight(envOr("OPA_PUBLIC_URL", "http://127.0.0.1:8080"), "/") + "/v1/scm/github/webhook",
 		"skip_cursor_ai":        envOr("SKIP_CURSOR_AI", "0") == "1",
 		"workspace":             securityWorkspaceRoot(),
-		"cursor_key_scope":      "organization_id+project_id in opa.scm_secrets; env CURSOR_API_KEY is a process-wide override (single-tenant)",
-		"honesty":               "OPA Review API key is AES-GCM encrypted in opa.scm_secrets (never returned). Prefer tenant-scoped rows; CURSOR_API_KEY env is a global override for single-tenant deploys. Set SKIP_CURSOR_AI=0 (default) to run OPA Review when a key is present.",
+		"cursor_key_scope":      "cli_cursor in unified AI settings (opa.scm_secrets); env CURSOR_API_KEY is a process-wide override (single-tenant)",
+		"ai_settings_path":      "/api/ai/settings",
+		"honesty":               "OPA Review CLI key is AES-GCM encrypted via AI settings / scm_secrets (never returned). Manage under /settings/ai. CURSOR_API_KEY env is a global override for single-tenant deploys.",
 	})
 }
 
@@ -836,12 +838,12 @@ func handleCursorKeySet(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, _ := ExtractTenantContext(r, queryClient)
 	org, proj := ctx.WriteTenant()
-	cursorKeyMu.Lock()
-	defer cursorKeyMu.Unlock()
 	if body.Clear {
-		cursorKeyMem = ""
-		cursorKeyOrg, cursorKeyProj = "", ""
-		persistSCMSecret(org, proj, scmCursorSecretKey, "", true)
+		if err := setCLICursorKeyFromAlias(org, proj, "", true); err != nil {
+			log.Printf("[WARN] clear cli_cursor via cursor-key alias: %v", err)
+			http.Error(w, "failed to clear cursor key", 500)
+			return
+		}
 		writeJSON(w, map[string]interface{}{"ok": true, "cursor_key_set": false})
 		return
 	}
@@ -850,19 +852,16 @@ func handleCursorKeySet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := strings.TrimSpace(body.APIKey)
-	if err := persistSCMSecret(org, proj, scmCursorSecretKey, key, false); err != nil {
-		log.Printf("[WARN] persist cursor key: %v", err)
+	if err := setCLICursorKeyFromAlias(org, proj, key, false); err != nil {
+		log.Printf("[WARN] persist cursor key via AI settings: %v", err)
 		http.Error(w, "failed to encrypt/persist cursor key — set OPA_CONNECTOR_SECRET or stable JWT_SECRET", 500)
 		return
 	}
-	cursorKeyMem = key
-	cursorKeyOrg, cursorKeyProj = org, proj
-	writeJSON(w, map[string]interface{}{"ok": true, "cursor_key_set": true, "organization_id": org, "project_id": proj})
+	writeJSON(w, map[string]interface{}{"ok": true, "cursor_key_set": true, "organization_id": org, "project_id": proj, "alias_of": "cli_cursor"})
 }
 
-// resolveCursorAPIKey returns the Cursor API key for an optional org/project.
-// Precedence: CURSOR_API_KEY env (process-wide single-tenant override) →
-// in-memory key matching org/proj (or any if org empty) → CH hydrate.
+// resolveCursorAPIKey returns the CLI agent (Cursor) API key for an optional org/project.
+// Precedence: CURSOR_API_KEY env → unified AI settings (cli_cursor) → legacy memory/CH.
 func resolveCursorAPIKey(orgProj ...string) string {
 	org, proj := "", ""
 	if len(orgProj) >= 1 {
@@ -873,6 +872,10 @@ func resolveCursorAPIKey(orgProj ...string) string {
 	}
 	if env := strings.TrimSpace(os.Getenv("CURSOR_API_KEY")); env != "" {
 		return env
+	}
+	key, _, _, _ := resolveCLICursorConfig(org, proj)
+	if key != "" {
+		return key
 	}
 	cursorKeyMu.Lock()
 	if cursorKeyMem != "" {
@@ -892,8 +895,6 @@ func resolveCursorAPIKey(orgProj ...string) string {
 	if org == "" || (cursorKeyOrg == org && (proj == "" || cursorKeyProj == proj || cursorKeyProj == "")) {
 		return cursorKeyMem
 	}
-	// Single-tenant honesty: if only one key is loaded and caller asked for a
-	// different empty-default tenant, still return it (smoke / default tenant).
 	if cursorKeyOrg != "" && org != "" && cursorKeyOrg != org {
 		return ""
 	}

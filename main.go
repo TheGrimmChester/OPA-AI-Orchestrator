@@ -53,11 +53,14 @@ func main() {
 
 	registerWave33Mux(mux, authView, authAdmin)
 	registerWave34Mux(mux, authView, authAdmin)
+	registerAIMux(mux, authView, authAdmin)
+	loadAISettingsFromFileOnBoot()
 
 	go func() {
 		// Give CH a moment, then hydrate SCM state (PATs, jobs, stacks).
 		time.Sleep(2 * time.Second)
 		hydrateSCMOnBoot()
+		loadAISettingsFromFileOnBoot()
 	}()
 
 	srv := &http.Server{

@@ -477,12 +477,10 @@ func buildAutoFixPRBody(parent *scmJob, fix *opaAutoFixJob) string {
 }
 
 func runAutoFixAgent(parent *scmJob, checkoutRoot string, fix *opaAutoFixJob) error {
-	key := resolveCursorAPIKey(parent.OrganizationID, parent.ProjectID)
+	key, agentBin, model, force := resolveCLICursorConfig(parent.OrganizationID, parent.ProjectID)
 	if key == "" {
 		return fmt.Errorf("OPA Review API key not set")
 	}
-	agentBin := envOr("OPA_CURSOR_AGENT_BIN", "agent")
-	model := envOr("OPA_CURSOR_MODEL", "auto")
 	brief := packAutoFixBrief(parent, checkoutRoot, fix)
 	promptPath := filepath.Join(os.TempDir(), fmt.Sprintf("opa-autofix-%s.md", fix.ID))
 	_ = os.WriteFile(promptPath, []byte(brief), 0o600)
@@ -493,7 +491,7 @@ func runAutoFixAgent(parent *scmJob, checkoutRoot string, fix *opaAutoFixJob) er
 		checkoutRoot, promptPath,
 	)
 	args := []string{"-p", "--trust", "--output-format", "text", "--model", model}
-	if envOr("OPA_CURSOR_AGENT_FORCE", "0") == "1" {
+	if force {
 		args = append(args, "--force")
 	}
 	args = append(args, prompt)

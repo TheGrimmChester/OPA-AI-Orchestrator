@@ -97,10 +97,11 @@ func runCursorAIReview(job *scmJob, conn *opaConnector, wr *opaWatchedRepo, chec
 		persistAIReview(job, res)
 		return res
 	}
-	key := resolveCursorAPIKey(job.OrganizationID, job.ProjectID)
+	key, agentBin, model, force := resolveCLICursorConfig(job.OrganizationID, job.ProjectID)
+	res.Model = model
 	if key == "" {
 		res.Status = "skipped"
-		res.Summary = "OPA Review API key not set — configure in Repo Watch settings or Agent env"
+		res.Summary = "OPA Review API key not set — configure CLI agent in AI settings"
 		persistAIReview(job, res)
 		return res
 	}
@@ -118,10 +119,8 @@ func runCursorAIReview(job *scmJob, conn *opaConnector, wr *opaWatchedRepo, chec
 	mcpPlan := prepareOPAReviewMCP(checkoutRoot, res.DesignEnforced, opaReviewPreviewURL(job))
 	res.MCP = &mcpPlan
 
-	agentBin := envOr("OPA_CURSOR_AGENT_BIN", "agent")
-	model := envOr("OPA_CURSOR_MODEL", "auto")
 	baseArgs := []string{"-p", "--trust", "--approve-mcps", "--output-format", "text", "--model", model}
-	if envOr("OPA_CURSOR_AGENT_FORCE", "0") == "1" {
+	if force {
 		baseArgs = append(baseArgs, "--force")
 	}
 
@@ -624,7 +623,8 @@ func applyOPAReviewSynthesis(res *aiReviewResult, synth opaReviewSynthesis) {
 	}
 	res.Narrative = truncateStr(strings.TrimSpace(synth.Narrative), opaReviewNarrativeCap)
 	res.AutoMergeConfidence = clampInt(synth.AutoMergeConfidence, 0, 100)
-	res.ConfidenceLabel = nz(synth.ConfidenceLabel, confidenceLabelFromScore(res.AutoMergeConfidence))
+	// Always derive the band from the score so emoji/label cannot disagree.
+	res.ConfidenceLabel = confidenceLabelFromScore(res.AutoMergeConfidence)
 	res.ConfidenceRationale = truncateStr(strings.TrimSpace(synth.ConfidenceRationale), 280)
 	res.HumanReviewPriorities = capPriorities(synth.HumanReviewPriorities, opaReviewPrioritiesMax)
 	res.Verdict = strings.TrimSpace(synth.Verdict)
@@ -839,14 +839,11 @@ func parseOPAReviewSynthesisJSON(out string) (opaReviewSynthesis, bool) {
 	if narr == "" && body.AutoMergeConfidence == 0 && body.ConfidenceLabel == "" && len(body.HumanReviewPriorities) == 0 {
 		return opaReviewSynthesis{}, false
 	}
-	label := strings.ToLower(strings.TrimSpace(body.ConfidenceLabel))
-	if label != "low" && label != "medium" && label != "high" {
-		label = confidenceLabelFromScore(body.AutoMergeConfidence)
-	}
+	conf := clampInt(body.AutoMergeConfidence, 0, 100)
 	return opaReviewSynthesis{
 		Narrative:             truncateStr(narr, opaReviewNarrativeCap),
-		AutoMergeConfidence:   clampInt(body.AutoMergeConfidence, 0, 100),
-		ConfidenceLabel:       label,
+		AutoMergeConfidence:   conf,
+		ConfidenceLabel:       confidenceLabelFromScore(conf),
 		ConfidenceRationale:   truncateStr(strings.TrimSpace(body.ConfidenceRationale), 280),
 		HumanReviewPriorities: capPriorities(body.HumanReviewPriorities, opaReviewPrioritiesMax),
 		Verdict:               strings.TrimSpace(body.Verdict),
@@ -895,6 +892,7 @@ func packOPAReviewSynthesisBrief(job *scmJob, res aiReviewResult, understanding 
   "verdict": "approve|request_changes|needs_context",
   "understanding": ["…"]
 }
+confidence_label MUST match auto_merge_confidence bands: low = 0–39, medium = 40–69, high = 70–100.
 `)
 	return b.String()
 }
@@ -1062,7 +1060,7 @@ func parseAIReviewJSON(out string) aiReviewResult {
 	if body.AutoMergeConfidence > 0 {
 		res.AutoMergeConfidence = clampInt(body.AutoMergeConfidence, 0, 100)
 	}
-	res.ConfidenceLabel = body.ConfidenceLabel
+	res.ConfidenceLabel = confidenceLabelFromScore(res.AutoMergeConfidence)
 	res.ConfidenceRationale = body.ConfidenceRationale
 	res.HumanReviewPriorities = body.HumanReviewPriorities
 	if len(body.Understanding) > 0 && res.Summary == "" {
@@ -1311,7 +1309,7 @@ func publishAIReviewComment(job *scmJob, res aiReviewResult, meta aiReviewPublis
 	narrative = truncateStr(narrative, opaReviewNarrativeCap)
 
 	conf := res.AutoMergeConfidence
-	label := nz(res.ConfidenceLabel, confidenceLabelFromScore(conf))
+	label := confidenceLabelFromScore(conf)
 	rationale := strings.TrimSpace(res.ConfidenceRationale)
 	if rationale == "" {
 		rationale = "See inline findings and priorities below."
@@ -1329,7 +1327,7 @@ func publishAIReviewComment(job *scmJob, res aiReviewResult, meta aiReviewPublis
 	b.WriteString(narrative)
 	b.WriteString("\n\n")
 	fmt.Fprintf(&b, "%s **Auto-merge confidence:** %d/100 (**%s**) — %s\n\n",
-		confidenceEmoji(label, conf), conf, label, rationale)
+		confidenceEmoji(conf), conf, label, rationale)
 	b.WriteString("### Priority for human review\n")
 	if len(priorities) == 0 {
 		b.WriteString("- ✅ _None flagged as merge blockers._\n")
