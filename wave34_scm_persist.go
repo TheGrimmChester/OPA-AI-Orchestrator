@@ -363,7 +363,7 @@ func hydrateSCMJobsAndStacksOnBoot() {
 	sc := hydrateSCMStacksFromCH()
 	log.Printf("[INFO] SCM job/stack hydrate: jobs file=%d ch=%d; stacks file=%d ch=%d; state_dir=%s",
 		nf, nc, sf, sc, scmStateDir())
-	nRun, resumeIDs := recoverStuckRunningSCMJobs()
+	nRun, _ := recoverStuckRunningSCMJobs()
 	if nRun > 0 {
 		log.Printf("[INFO] SCM recovered %d stuck running job(s) after restart", nRun)
 	}
@@ -376,16 +376,81 @@ func hydrateSCMJobsAndStacksOnBoot() {
 		log.Printf("[INFO] SCM normalized %d stack job status(es) to waiting/queued slots", nNorm)
 	}
 	resumeIncompleteOPAReviewStacks()
-	for _, id := range resumeIDs {
-		jobID := id
+	// Non-stack queued jobs previously only got processSCMJob at enqueue time; after
+	// recreate those goroutines are gone and status=queued stalls forever. Re-dispatch
+	// all of them (bounded by scmProcessSem). Stack members are owned by drain above.
+	nQueued := dispatchQueuedNonStackSCMJobs()
+	if nQueued > 0 {
+		log.Printf("[INFO] SCM re-dispatched %d queued non-stack job(s) after restart", nQueued)
+	}
+}
+
+// dispatchQueuedNonStackSCMJobs starts processSCMJob for every non-stack job still
+// in queued (or empty) status. Returns how many goroutines were spawned. Safe to call
+// from boot or the admin resume endpoint; processSCMJob dedupes in-flight IDs.
+func dispatchQueuedNonStackSCMJobs() int {
+	type item struct {
+		id        string
+		startedAt string
+	}
+	var list []item
+	scmJobLive.Range(func(_, v interface{}) bool {
+		job, ok := v.(*scmJob)
+		if !ok || job == nil {
+			return true
+		}
+		switch job.Status {
+		case "queued", "":
+		default:
+			return true
+		}
+		if scmJobBelongsToStack(job.ID) {
+			return true
+		}
+		list = append(list, item{id: job.ID, startedAt: job.StartedAt})
+		return true
+	})
+	sort.SliceStable(list, func(i, j int) bool {
+		return list[i].startedAt < list[j].startedAt
+	})
+	for _, it := range list {
+		jobID := it.id
 		go processSCMJob(jobID)
 	}
+	return len(list)
+}
+
+// resumeSCMProcessing kicks incomplete stack drains and re-dispatches orphaned
+// non-stack queued jobs. Used by POST /api/scm/jobs/resume after recreates or stalls.
+func resumeSCMProcessing() (stacks int, queued int) {
+	reviewStackLive.Range(func(_, v interface{}) bool {
+		stack, ok := v.(*opaReviewStack)
+		if !ok || stack == nil {
+			return true
+		}
+		if !stackNeedsResume(stack) {
+			return true
+		}
+		prepareStackForResume(stack)
+		persistOPAReviewStack(stack)
+		id := stack.ID
+		log.Printf("[INFO] admin resume: OPA Review stack drain %s (%s)", id, stack.Status)
+		go drainOPAReviewStack(id)
+		stacks++
+		return true
+	})
+	queued = dispatchQueuedNonStackSCMJobs()
+	if queued > 0 {
+		log.Printf("[INFO] admin resume: re-dispatched %d queued non-stack job(s)", queued)
+	}
+	return stacks, queued
 }
 
 // recoverStuckRunningSCMJobs resets orphaned running jobs after Agent restart.
 // Nothing is actually processing yet, so leaving status=running would stall forever.
 // Stack members become waiting (slot assignment happens in prepareStackForResume);
-// non-stack jobs become queued; caller should re-dispatch the returned IDs.
+// non-stack jobs become queued. Re-dispatch of queued non-stack jobs is handled by
+// dispatchQueuedNonStackSCMJobs after stack drains are resumed.
 func recoverStuckRunningSCMJobs() (int, []string) {
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
 	var resume []string

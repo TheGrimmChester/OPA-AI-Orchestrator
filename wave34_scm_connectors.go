@@ -25,6 +25,7 @@ func registerWave34Mux(mux *http.ServeMux, authView, authAdmin func(string, http
 	// Method-aware auth: GET viewer, mutating admin when OPA_AUTH_REQUIRED=1.
 	registerSCMAuthFlexible(mux, "/api/connectors/", handleConnectorSub)
 	authView("/api/scm/jobs", handleSCMJobsList)
+	authAdmin("/api/scm/jobs/resume", handleSCMJobsResume)
 	registerSCMAuthFlexible(mux, "/api/scm/jobs/", handleSCMJobSub)
 	authView("/api/scm/settings", handleSCMSettings)
 	authAdmin("/api/scm/settings/cursor-key", handleCursorKeySet)
