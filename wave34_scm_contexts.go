@@ -491,10 +491,11 @@ Do not commit or push. Do not invent vendor product names.
 	_ = os.WriteFile(promptPath, []byte(brief), 0o600)
 	defer os.Remove(promptPath)
 
-	agentBin := envOr("OPA_CURSOR_AGENT_BIN", "agent")
-	model := envOr("OPA_CURSOR_MODEL", "auto")
+	agentBin, model := "", ""
+	force := false
+	_, agentBin, model, force = resolveCLICursorConfig("", "")
 	args := []string{"-p", "--trust", "--output-format", "text", "--model", model}
-	if envOr("OPA_CURSOR_AGENT_FORCE", "0") == "1" {
+	if force {
 		args = append(args, "--force")
 	}
 	args = append(args, fmt.Sprintf(
