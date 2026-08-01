@@ -38,6 +38,9 @@ type scmJob struct {
 	ForceAI bool `json:"force_ai,omitempty"`
 	// AIOnly skips AppSec scanners / gate; still checkouts + runs OPA Review.
 	AIOnly bool `json:"ai_only,omitempty"`
+	// ActorUserID is the Dashboard user who triggered a manual run (empty for
+	// webhooks). Used for CLI key resolution: user → org → fail closed.
+	ActorUserID string `json:"actor_user_id,omitempty"`
 }
 
 func handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
@@ -197,6 +200,9 @@ func persistSCMJob(job *scmJob) {
 	if job.AIOnly {
 		job.Summary["ai_only"] = true
 	}
+	if uid := strings.TrimSpace(job.ActorUserID); uid != "" {
+		job.Summary["actor_user_id"] = uid
+	}
 	persistSCMJobFile(job)
 	if writer == nil {
 		return
@@ -338,17 +344,28 @@ func handleSCMJobsList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
+	a := actorFromRequest(r)
 	list := []*scmJob{}
 	counts := map[string]int{}
 	scmJobLive.Range(func(_, v interface{}) bool {
-		if j, ok := v.(*scmJob); ok {
-			list = append(list, j)
-			st := strings.TrimSpace(j.Status)
-			if st == "" {
-				st = "unknown"
-			}
-			counts[st]++
+		j, ok := v.(*scmJob)
+		if !ok {
+			return true
 		}
+		// Tenant filter: when auth is on (or an org is selected), hide other orgs' jobs.
+		if a.OrganizationID != "" && j.OrganizationID != "" && j.OrganizationID != a.OrganizationID {
+			return true
+		}
+		if authEnforced && a.OrganizationID == "" {
+			// No org selected under auth → no job leakage across tenants.
+			return true
+		}
+		list = append(list, j)
+		st := strings.TrimSpace(j.Status)
+		if st == "" {
+			st = "unknown"
+		}
+		counts[st]++
 		return true
 	})
 	sortSCMJobsActiveFirst(list)
@@ -389,6 +406,15 @@ func handleSCMJobSub(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 1 && r.Method == http.MethodGet {
 		job := getSCMJob(id)
 		if job == nil {
+			http.Error(w, "not found", 404)
+			return
+		}
+		a := actorFromRequest(r)
+		if a.OrganizationID != "" && job.OrganizationID != "" && job.OrganizationID != a.OrganizationID {
+			http.Error(w, "not found", 404)
+			return
+		}
+		if authEnforced && a.OrganizationID == "" {
 			http.Error(w, "not found", 404)
 			return
 		}
@@ -480,7 +506,8 @@ func handleSCMAIReview(w http.ResponseWriter, r *http.Request) {
 	if body.Force != nil {
 		force = *body.Force
 	}
-	job, errMsg, code := enqueueManualAIReview(repo, pr, body.ConnectorID, body.SHA, body.Title, body.Draft, force, body.AIOnly, body.AllowUnwatched)
+	actor := actorFromRequest(r)
+	job, errMsg, code := enqueueManualAIReview(repo, pr, body.ConnectorID, body.SHA, body.Title, body.Draft, force, body.AIOnly, body.AllowUnwatched, actor.Username)
 	if errMsg != "" {
 		http.Error(w, errMsg, code)
 		return
@@ -491,7 +518,7 @@ func handleSCMAIReview(w http.ResponseWriter, r *http.Request) {
 		"ok": true, "job_id": job.ID, "status": "queued",
 		"repo_full_name": repo, "pr_number": pr,
 		"force_ai": job.ForceAI, "ai_only": job.AIOnly,
-		"cursor_key_set": resolveCursorAPIKey(job.OrganizationID, job.ProjectID) != "",
+		"cursor_key_set": resolveCursorAPIKey(job.OrganizationID, job.ProjectID, job.ActorUserID) != "",
 		"skip_cursor_ai": envOr("SKIP_CURSOR_AI", "0") == "1",
 		"review_contexts": summarizeAppliedContexts(applied),
 		"honesty":         "Manual OPA Review — Check Runs need GitHub App (PAT often cannot create checks). SKIP_CURSOR_AI=1 still completes with ai.status=skipped. Reviewer contexts: full primary for this repo + linked awareness; related repos are shallow-cloned under job/related/. Findings sync as inline PR comments (add/update/resolve on re-run); global body is a short résumé upserted in place.",
@@ -513,7 +540,8 @@ func handleSCMAIReviewFromJob(w http.ResponseWriter, r *http.Request, src *scmJo
 	if body.AIOnly != nil {
 		aiOnly = *body.AIOnly
 	}
-	job, errMsg, code := enqueueManualAIReview(src.RepoFullName, src.PRNumber, src.ConnectorID, src.CommitSHA, src.Title, src.Draft, force, aiOnly, true)
+	actor := actorFromRequest(r)
+	job, errMsg, code := enqueueManualAIReview(src.RepoFullName, src.PRNumber, src.ConnectorID, src.CommitSHA, src.Title, src.Draft, force, aiOnly, true, actor.Username)
 	if errMsg != "" {
 		http.Error(w, errMsg, code)
 		return
@@ -525,7 +553,7 @@ func handleSCMAIReviewFromJob(w http.ResponseWriter, r *http.Request, src *scmJo
 	})
 }
 
-func enqueueManualAIReview(repo string, pr int, connectorID, sha, title string, draft, force, aiOnly, allowUnwatched bool) (*scmJob, string, int) {
+func enqueueManualAIReview(repo string, pr int, connectorID, sha, title string, draft, force, aiOnly, allowUnwatched bool, actorUserID string) (*scmJob, string, int) {
 	wr, conn := findWatched(repo)
 	if connectorID != "" {
 		if c := getOrHydrateConnector(connectorID); c != nil && c.Status != "deleted" {
@@ -547,12 +575,12 @@ func enqueueManualAIReview(repo string, pr int, connectorID, sha, title string, 
 			return nil, "repo not watched and no connector_id — watch the repo or pass connector_id with allow_unwatched", 404
 		}
 		// One-off: bind ephemeral watched policy with ai_review on.
-		wr = upsertWatched(conn.OrganizationID, conn.ProjectID, conn.ID, repo, "", true, defaultWatchedChecks(), "auto", "high", false)
+		wr = upsertWatched(conn.OrganizationID, conn.ProjectID, conn.ID, repo, "", true, defaultWatchedChecks(), "auto", "high", false, false, 0)
 	} else if wr == nil && allowUnwatched {
 		if conn == nil {
 			return nil, "connector_id required for unwatched one-off", 400
 		}
-		wr = upsertWatched(conn.OrganizationID, conn.ProjectID, conn.ID, repo, "", true, defaultWatchedChecks(), "auto", "high", false)
+		wr = upsertWatched(conn.OrganizationID, conn.ProjectID, conn.ID, repo, "", true, defaultWatchedChecks(), "auto", "high", false, false, 0)
 	}
 	if conn == nil {
 		conn = getOrHydrateConnector(wr.ConnectorID)
@@ -587,6 +615,7 @@ func enqueueManualAIReview(repo string, pr int, connectorID, sha, title string, 
 	job := enqueueSCMJob(wr, conn, repo, pr, sha, event, draft, title, prBody)
 	job.ForceAI = force
 	job.AIOnly = aiOnly
+	job.ActorUserID = strings.TrimSpace(actorUserID)
 	persistSCMJob(job)
 	return job, "", 0
 }
@@ -622,7 +651,7 @@ func handleSCMSimulate(w http.ResponseWriter, r *http.Request) {
 		persistConnector(c)
 	}
 	checks := defaultWatchedChecks()
-	wr := upsertWatched(org, proj, connID, repo, "", true, checks, nz(body.Profile, "auto"), "high", false)
+	wr := upsertWatched(org, proj, connID, repo, "", true, checks, nz(body.Profile, "auto"), "high", false, false, 0)
 	if body.Service != "" {
 		wr.ServiceName = body.Service
 	}
@@ -690,12 +719,16 @@ func processSCMJob(jobID string) {
 	profile := "auto"
 	minSev := "high"
 	aiBlocking := false
+	autoRequestReviewer := false
+	autoApproveMinScore := 0
 	service := strings.ReplaceAll(job.RepoFullName, "/", "-")
 	if wr != nil {
 		_ = json.Unmarshal([]byte(wr.ChecksJSON), &checks)
 		profile = nz(wr.Profile, "auto")
 		minSev = nz(wr.MinSeverity, "high")
 		aiBlocking = wr.AIBlocking
+		autoRequestReviewer = wr.AutoRequestReviewer
+		autoApproveMinScore = wr.AutoApproveMinScore
 		service = nz(wr.ServiceName, service)
 	}
 	if len(checks) == 0 {
@@ -740,6 +773,15 @@ func processSCMJob(jobID string) {
 		scanList = []string{}
 	}
 	runAI := wantAI && job.PRNumber > 0 && (!job.Draft || job.ForceAI)
+
+	// Optionally request this GitHub App as a PR reviewer before the review runs.
+	if runAI && autoRequestReviewer && conn != nil {
+		if err := githubRequestPRReviewers(conn, owner, repoName, job.PRNumber, []string{githubAppReviewerLogin()}); err != nil {
+			job.Summary["request_reviewer_error"] = err.Error()
+		} else {
+			job.Summary["requested_reviewer"] = githubAppReviewerLogin()
+		}
+	}
 
 	// Check runs (queued)
 	var appSecID int64
@@ -929,7 +971,7 @@ func processSCMJob(jobID string) {
 			ScanSeverity:      scanSeverityCountsForRun(runID),
 			MCP:               mcpPlan,
 		}
-		inline := postOPAReviewFindings(conn, owner, repoName, job, aiResult, pubMeta)
+		inline := postOPAReviewFindings(conn, owner, repoName, job, aiResult, pubMeta, autoApproveMinScore)
 		aiResult.InlinePosted = inline.Posted
 		aiResult.InlineFailed = inline.Failed
 		aiResult.InlineMode = inline.Mode
@@ -942,11 +984,17 @@ func processSCMJob(jobID string) {
 		aiComment, checkSum := publishAIReviewComment(job, aiResult, pubMeta)
 		aiResult.Comment = aiComment
 		job.Summary["ai"] = aiResult
+		job.Summary["review_event"] = decideOPAReviewEvent(aiResult, autoApproveMinScore)
 		aiConclusion := "neutral"
+		decision := decideOPAReviewEvent(aiResult, autoApproveMinScore)
 		if aiBlocking && aiResult.Status == "findings" {
+			aiConclusion = "failure"
+		} else if decision == "REQUEST_CHANGES" && autoApproveMinScore > 0 {
 			aiConclusion = "failure"
 		} else if aiResult.Status == "skipped" || aiResult.Status == "error" {
 			aiConclusion = "neutral"
+		} else if decision == "APPROVE" || aiResult.Status != "findings" {
+			aiConclusion = "success"
 		} else {
 			aiConclusion = "success"
 		}

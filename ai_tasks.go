@@ -36,10 +36,19 @@ func handleAITasks(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	res, err := Complete(r.Context(), kind, aiCompleteRequest{
+	a := actorFromRequest(r)
+	if a.OrganizationID == "" {
+		http.Error(w, "organization required for AI tasks (set X-Organization-ID); admin keys are not shared", 400)
+		return
+	}
+	res, err := CompleteFor(r.Context(), kind, aiCompleteRequest{
 		System:    system,
 		Prompt:    prompt,
 		MaxTokens: body.MaxTokens,
+	}, credResolveQuery{
+		OrganizationID: a.OrganizationID,
+		ProjectID:      a.ProjectID,
+		UserID:         a.Username,
 	})
 	if err != nil {
 		writeJSON(w, map[string]interface{}{

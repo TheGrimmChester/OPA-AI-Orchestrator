@@ -128,7 +128,8 @@ func handleOPAReviewStack(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		preview := strings.TrimSpace(nz(it.PreviewURL, body.Preview))
-		job, errMsg, code := enqueueManualAIReview(repo, pr, it.ConnectorID, "", "", false, force, body.AIOnly, true)
+		actorUID := actorFromRequest(r).Username
+		job, errMsg, code := enqueueManualAIReview(repo, pr, it.ConnectorID, "", "", false, force, body.AIOnly, true, actorUID)
 		if errMsg != "" {
 			items = append(items, opaReviewStackItem{
 				RepoFullName: repo, PRNumber: pr, ConnectorID: it.ConnectorID,

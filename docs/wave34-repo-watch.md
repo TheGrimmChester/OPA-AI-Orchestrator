@@ -36,10 +36,10 @@ Harness: `OPA-stack/harness/appsec-pr-check.sh`
 | `OPA_DASHBOARD_URL` | Redirect after install |
 | `OPA_SCM_STATE_DIR` | Durable SCM job + OPA Review stack JSON (default `$OPA_SECURITY_WORKSPACE/scm-state`). Survives Agent restart when the workspace (or this dir) is volume-mounted. Dual-written with ClickHouse `opa.scm_jobs` / `opa.scm_review_stacks`. |
 | `OPA_REVIEW_TMP` | OPA Review + context-gen checkout root (default `/tmp/opa-review`) |
-| `CURSOR_API_KEY` | AI agent API key for OPA Review (optional env override; process-wide / single-tenant) |
+| `CURSOR_API_KEY` | **Unused for tenant jobs** (formerly a process-wide fallback). Set CLI keys via Account / AI settings (`opa.scm_secrets` scopes). Still injected into the child agent process after scoped resolution. |
 | `OPA_CURSOR_AGENT_BIN` | Path to AI agent binary (image default `/usr/local/bin/agent`) |
 | `OPA_CURSOR_MODEL` | default `auto` |
-| `SKIP_CURSOR_AI` | `1` to skip AI. Default `0` in compose — with a persisted/env API key, OPA Review runs |
+| `SKIP_CURSOR_AI` | `1` to skip AI. Default `0` in compose — with a scoped user/org API key, OPA Review runs |
 | `OPA_CURSOR_AGENT_FORCE` | `1` to pass `--force` to the AI agent (default off; `--trust` alone for headless) |
 | `OPA_AI_REVIEW_MAX_UNITS` | Cap independent review units per PR (default 10, max 12) |
 | `OPA_GITLEAKS_CONFIG` | Path to gitleaks.toml (image default `/etc/opa/gitleaks.toml` allowlists UI `key:` FPs) |
@@ -69,7 +69,7 @@ $OPA_REVIEW_TMP/                     # default /tmp/opa-review
 - AI agent: `cmd.Dir = checkout`, prompt + `OPA_SCAN_WORKTREE` env point at the full tree; brief instructs **surrounding-code analysis** (callers, neighbors, related tests) — not hunk-only. `--trust` by default (`OPA_CURSOR_AGENT_FORCE=1` adds `--force`). Reviews run **per changed file** (or package group when over `OPA_AI_REVIEW_MAX_UNITS`), then findings are aggregated.
 - Gitleaks uses `/etc/opa/gitleaks.toml` (UI `key:` / React prop allowlists) plus an Agent post-filter; AppSec gate default `min_severity=high` ignores medium-only generic-api-key noise. Manual `force_ai` / `ai_only` jobs still run AI and report gate+ai together.
 - Old `$OPA_REVIEW_TMP/*` (and legacy `worktrees/`/`jobs/`) cleaned after ~24h (`git worktree remove` + delete).
-- **OPA Review API key tenancy:** stored in `opa.scm_secrets` with `organization_id`+`project_id`. Env `CURSOR_API_KEY` is a process-wide override (honest single-tenant). Multi-tenant deploys should set keys per tenant via the API, not the env.
+- **OPA Review API key tenancy:** stored in `opa.scm_secrets` with `scope` (`admin`|`org`|`user`) + `organization_id`/`user_id`. Job resolution: **user → org → fail closed**. Admin keys are never inherited. Process env `CURSOR_API_KEY` / `OPA_OPENAI_API_KEY` / `OPA_ANTHROPIC_API_KEY` are **not** used as tenant fallbacks.
 
 Dashboard: **PR Jobs** shows SHA + Worktree path from job summary.
 

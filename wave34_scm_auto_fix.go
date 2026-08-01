@@ -358,7 +358,7 @@ func runOPAAutoFix(parent *scmJob, conn *opaConnector, fix *opaAutoFixJob) (*opa
 		return fix, err
 	}
 
-	skippedAI := envOr("SKIP_CURSOR_AI", "0") == "1" || resolveCursorAPIKey(parent.OrganizationID, parent.ProjectID) == ""
+	skippedAI := envOr("SKIP_CURSOR_AI", "0") == "1" || resolveCursorAPIKey(parent.OrganizationID, parent.ProjectID, parent.ActorUserID) == ""
 	if skippedAI || githubUseMockAPI(conn) {
 		// Mock / skipped: write a small honesty note file so there is something to commit.
 		note := filepath.Join(absRoot, ".opa-review-autofix.md")
@@ -477,9 +477,9 @@ func buildAutoFixPRBody(parent *scmJob, fix *opaAutoFixJob) string {
 }
 
 func runAutoFixAgent(parent *scmJob, checkoutRoot string, fix *opaAutoFixJob) error {
-	key, agentBin, model, force := resolveCLICursorConfig(parent.OrganizationID, parent.ProjectID)
+	key, agentBin, model, force := resolveCLICursorConfig(parent.OrganizationID, parent.ProjectID, parent.ActorUserID)
 	if key == "" {
-		return fmt.Errorf("OPA Review API key not set")
+		return fmt.Errorf("CLI agent API key not set — save one under Account (personal or org)")
 	}
 	brief := packAutoFixBrief(parent, checkoutRoot, fix)
 	promptPath := filepath.Join(os.TempDir(), fmt.Sprintf("opa-autofix-%s.md", fix.ID))

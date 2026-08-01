@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,9 +22,10 @@ func registerWave34Mux(mux *http.ServeMux, authView, authAdmin func(string, http
 	authView("/api/connectors", handleConnectorsList)
 	authAdmin("/api/connectors/github/install-url", handleGitHubInstallURL)
 	mux.HandleFunc("/api/connectors/github/callback", handleGitHubCallback)
-	authAdmin("/api/connectors/github/pat", handleGitHubPATConnect)
-	// Method-aware auth: GET viewer, mutating admin when OPA_AUTH_REQUIRED=1.
-	registerSCMAuthFlexible(mux, "/api/connectors/", handleConnectorSub)
+	// PAT connect: viewer+ (scope gates in-handler — users can add personal PATs).
+	registerAISettingsAuth(mux, "/api/connectors/github/pat", handleGitHubPATConnect)
+	// Connector sub-routes: viewer+; mutate gates live in-handler (owner / org-admin / admin).
+	registerAISettingsAuth(mux, "/api/connectors/", handleConnectorSub)
 	authView("/api/scm/jobs", handleSCMJobsList)
 	authAdmin("/api/scm/jobs/resume", handleSCMJobsResume)
 	registerSCMAuthFlexible(mux, "/api/scm/jobs/", handleSCMJobSub)
@@ -81,6 +83,8 @@ type opaConnector struct {
 	ID             string `json:"id"`
 	OrganizationID string `json:"organization_id"`
 	ProjectID      string `json:"project_id"`
+	Scope          string `json:"scope"`   // admin|org|user
+	UserID         string `json:"user_id"` // set for user-scoped connectors
 	Kind           string `json:"kind"`
 	InstallationID string `json:"installation_id"`
 	AccountLogin   string `json:"account_login"`
@@ -104,8 +108,14 @@ type opaWatchedRepo struct {
 	ChecksJSON     string `json:"checks_json"`
 	MinSeverity    string `json:"min_severity"`
 	AIBlocking     bool   `json:"ai_blocking"`
-	LinkGroupID    string `json:"link_group_id"`
-	UpdatedAt      string `json:"updated_at"`
+	// AutoRequestReviewer asks GitHub to add this App as a PR reviewer.
+	AutoRequestReviewer bool `json:"auto_request_reviewer"`
+	// AutoApproveMinScore is 1–100; when >0 OPA submits APPROVE if
+	// auto_merge_confidence >= threshold (and no blocker/high findings),
+	// else REQUEST_CHANGES. 0 keeps legacy COMMENT-only reviews.
+	AutoApproveMinScore int    `json:"auto_approve_min_score"`
+	LinkGroupID         string `json:"link_group_id"`
+	UpdatedAt           string `json:"updated_at"`
 }
 
 func handleConnectorsList(w http.ResponseWriter, r *http.Request) {
@@ -113,24 +123,41 @@ func handleConnectorsList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
+	a := actorFromRequest(r)
 	seen := map[string]struct{}{}
 	list := []map[string]interface{}{}
-	connectorLive.Range(func(_, v interface{}) bool {
-		c, ok := v.(*opaConnector)
-		if !ok || c.Status == "deleted" {
-			return true
+	appendIfVisible := func(c *opaConnector) {
+		if c == nil || c.Status == "deleted" {
+			return
+		}
+		scope := inferLegacyScope(c.OrganizationID, c.Scope)
+		if !canSeeCredScope(a, scope, c.UserID, c.OrganizationID) {
+			return
 		}
 		list = append(list, connectorPublic(c))
 		seen[c.ID] = struct{}{}
+	}
+	connectorLive.Range(func(_, v interface{}) bool {
+		c, ok := v.(*opaConnector)
+		if !ok {
+			return true
+		}
+		appendIfVisible(c)
 		return true
 	})
-	// Merge ClickHouse rows and hydrate encrypted PATs when missing from memory.
 	if queryClient != nil {
-		scope := tenantScopeSQL(r, queryClient, "")
+		scopeSQL := tenantScopeSQL(r, queryClient, "")
 		rows, err := queryClient.Query(fmt.Sprintf(`
-			SELECT id, organization_id, project_id, kind, installation_id, account_login,
+			SELECT id, organization_id, project_id, scope, user_id, kind, installation_id, account_login,
 			       status, token_ref, meta_json, created_at, updated_at
-			FROM opa.connectors WHERE status != 'deleted'%s ORDER BY updated_at DESC LIMIT 50`, scope))
+			FROM opa.connectors WHERE status != 'deleted'%s ORDER BY updated_at DESC LIMIT 100`, scopeSQL))
+		if err != nil {
+			// Pre-migration schemas lack scope/user_id.
+			rows, err = queryClient.Query(fmt.Sprintf(`
+				SELECT id, organization_id, project_id, kind, installation_id, account_login,
+				       status, token_ref, meta_json, created_at, updated_at
+				FROM opa.connectors WHERE status != 'deleted'%s ORDER BY updated_at DESC LIMIT 100`, scopeSQL))
+		}
 		if err == nil {
 			for _, row := range rows {
 				id, _ := row["id"].(string)
@@ -140,22 +167,23 @@ func handleConnectorsList(w http.ResponseWriter, r *http.Request) {
 				if _, ok := seen[id]; ok {
 					continue
 				}
-				if live := getOrHydrateConnector(id); live != nil && live.Status != "deleted" {
-					list = append(list, connectorPublic(live))
-					seen[id] = struct{}{}
+				if live := getOrHydrateConnector(id); live != nil {
+					appendIfVisible(live)
 					continue
 				}
-				row["has_token"] = false
-				delete(row, "token_ref")
-				list = append(list, row)
-				seen[id] = struct{}{}
+				c := connectorFromCHRow(row, false)
+				appendIfVisible(c)
 			}
 		}
 	}
 	writeJSON(w, map[string]interface{}{
 		"connectors":            list,
 		"github_app_configured": githubAppConfigured(),
-		"honesty":               "GitHub App is production; PAT is local/dev bootstrap. PATs and OPA Review API keys are AES-GCM encrypted in ClickHouse (OPA_CONNECTOR_SECRET or JWT_SECRET) and rehydrated on Agent boot.",
+		"scopes":                []string{credScopeUser, credScopeOrg, credScopeAdmin},
+		"can_edit_org":          a.isAdmin() && a.OrganizationID != "",
+		"can_edit_admin":        a.isAdmin(),
+		"can_edit_user":         a.Username != "" || !authEnforced,
+		"honesty":               "Connectors are scoped admin|org|user. Admin connectors are never shared. Org connectors are inherited by members; users may add personal overrides.",
 	})
 }
 
@@ -166,9 +194,12 @@ func connectorPublic(c *opaConnector) map[string]interface{} {
 			display = s
 		}
 	}
+	scope := inferLegacyScope(c.OrganizationID, c.Scope)
 	return map[string]interface{}{
 		"id": c.ID, "kind": c.Kind, "installation_id": c.InstallationID,
 		"account_login": c.AccountLogin, "status": c.Status,
+		"organization_id": c.OrganizationID, "project_id": c.ProjectID,
+		"scope": scope, "user_id": c.UserID,
 		"meta_json": c.MetaJSON, "display_name": display,
 		"created_at": c.CreatedAt, "updated_at": c.UpdatedAt,
 		"has_token": c.TokenRef != "",
@@ -242,8 +273,8 @@ func handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 	id := loadID("conn", org, proj, "github_app", inst)
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
 	c := &opaConnector{
-		ID: id, OrganizationID: org, ProjectID: proj, Kind: "github_app",
-		InstallationID: inst, AccountLogin: "", Status: "active",
+		ID: id, OrganizationID: org, ProjectID: proj, Scope: credScopeOrg, UserID: "",
+		Kind: "github_app", InstallationID: inst, AccountLogin: "", Status: "active",
 		MetaJSON: fmt.Sprintf(`{"setup_action":%q}`, setup), CreatedAt: now, UpdatedAt: now,
 	}
 	connectorLive.Store(id, c)
@@ -262,22 +293,36 @@ func handleGitHubPATConnect(w http.ResponseWriter, r *http.Request) {
 		Token   string   `json:"token"`
 		Login   string   `json:"login"`
 		Repos []string `json:"repos"`
+		Scope   string   `json:"scope"`
 	}
 	if json.Unmarshal(raw, &body) != nil || strings.TrimSpace(body.Token) == "" {
 		http.Error(w, "token required", 400)
 		return
 	}
-	ctx, _ := ExtractTenantContext(r, queryClient)
-	org, proj := ctx.WriteTenant()
+	a := actorFromRequest(r)
+	scope, err := normalizeCredScope(body.Scope, a)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	// Non-admins may only create personal connectors.
+	if !a.isAdmin() {
+		scope = credScopeUser
+	}
+	if err := canWriteCredScope(a, scope); err != nil {
+		http.Error(w, err.Error(), 403)
+		return
+	}
+	org, proj, userID := resolveCredTarget(a, scope)
 	if !enforceWriteLocalityHTTP(w, r, org, proj) {
 		return
 	}
 	login := nz(body.Login, "pat-user")
-	id := loadID("conn", org, proj, "github_pat", login, newRandomHex(8))
+	id := loadID("conn", org, proj, scope, userID, "github_pat", login, newRandomHex(8))
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
 	c := &opaConnector{
-		ID: id, OrganizationID: org, ProjectID: proj, Kind: "github_pat",
-		InstallationID: "", AccountLogin: login, Status: "active",
+		ID: id, OrganizationID: org, ProjectID: proj, Scope: scope, UserID: userID,
+		Kind: "github_pat", InstallationID: "", AccountLogin: login, Status: "active",
 		TokenRef: body.Token, MetaJSON: `{"bootstrap":true}`, CreatedAt: now, UpdatedAt: now,
 	}
 	connectorLive.Store(id, c)
@@ -287,11 +332,11 @@ func handleGitHubPATConnect(w http.ResponseWriter, r *http.Request) {
 		if repo == "" {
 			continue
 		}
-		upsertWatched(org, proj, id, repo, "", true, defaultWatchedChecks(), "auto", "high", false)
+		upsertWatched(org, proj, id, repo, "", true, defaultWatchedChecks(), "auto", "high", false, false, 0)
 	}
 	writeJSON(w, map[string]interface{}{
 		"ok": true, "connector": connectorPublic(c),
-		"honesty": "PAT bootstrap — prefer GitHub App for webhooks and Check Runs in production. Token is AES-GCM encrypted in ClickHouse.",
+		"honesty": "PAT bootstrap — prefer GitHub App for webhooks and Check Runs in production. Token is AES-GCM encrypted. Scope=" + scope + " (admin keys are never shared with org/users).",
 	})
 }
 
@@ -343,10 +388,40 @@ func handleConnectorSub(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "not found", 404)
 }
 
-func handleConnectorGet(w http.ResponseWriter, r *http.Request, id string) {
-	c := getOrHydrateConnector(id)
+// denyConnectorIfInvisible writes 404 when the connector is missing or the
+// caller must not learn it exists (no cross-tenant / cross-scope leakage).
+func denyConnectorIfInvisible(w http.ResponseWriter, r *http.Request, c *opaConnector) bool {
 	if c == nil || c.Status == "deleted" {
 		http.Error(w, "not found", 404)
+		return true
+	}
+	a := actorFromRequest(r)
+	scope := inferLegacyScope(c.OrganizationID, c.Scope)
+	if !canSeeCredScope(a, scope, c.UserID, c.OrganizationID) {
+		http.Error(w, "not found", 404)
+		return true
+	}
+	return false
+}
+
+// denyConnectorIfImmutable writes 404 if invisible, else 403 if the caller
+// cannot mutate this connector's scope/ownership.
+func denyConnectorIfImmutable(w http.ResponseWriter, r *http.Request, c *opaConnector) bool {
+	if denyConnectorIfInvisible(w, r, c) {
+		return true
+	}
+	a := actorFromRequest(r)
+	scope := inferLegacyScope(c.OrganizationID, c.Scope)
+	if err := canMutateCred(a, scope, c.UserID, c.OrganizationID); err != nil {
+		http.Error(w, err.Error(), 403)
+		return true
+	}
+	return false
+}
+
+func handleConnectorGet(w http.ResponseWriter, r *http.Request, id string) {
+	c := getOrHydrateConnector(id)
+	if denyConnectorIfInvisible(w, r, c) {
 		return
 	}
 	writeJSON(w, map[string]interface{}{"connector": connectorPublic(c)})
@@ -354,8 +429,7 @@ func handleConnectorGet(w http.ResponseWriter, r *http.Request, id string) {
 
 func handleConnectorPatch(w http.ResponseWriter, r *http.Request, id string) {
 	c := getOrHydrateConnector(id)
-	if c == nil || c.Status == "deleted" {
-		http.Error(w, "not found", 404)
+	if denyConnectorIfImmutable(w, r, c) {
 		return
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
@@ -391,28 +465,31 @@ func handleConnectorPatch(w http.ResponseWriter, r *http.Request, id string) {
 
 func handleConnectorDelete(w http.ResponseWriter, r *http.Request, id string) {
 	c := getOrHydrateConnector(id)
-	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
-	if c != nil {
-		c.Status = "deleted"
-		c.TokenRef = ""
-		c.UpdatedAt = now
-		connectorLive.Store(id, c)
-		persistConnector(c)
-	} else if queryClient != nil {
+	if c == nil && queryClient != nil {
+		// Soft-load metadata for auth before delete (token not required).
 		rows, err := queryClient.Query(fmt.Sprintf(`
-			SELECT id, organization_id, project_id, kind, installation_id, account_login,
+			SELECT id, organization_id, project_id, scope, user_id, kind, installation_id, account_login,
 			       status, token_ref, meta_json, created_at, updated_at
 			FROM opa.connectors WHERE id = '%s' ORDER BY updated_at DESC LIMIT 1`, escapeSQL(id)))
+		if err != nil {
+			rows, err = queryClient.Query(fmt.Sprintf(`
+				SELECT id, organization_id, project_id, kind, installation_id, account_login,
+				       status, token_ref, meta_json, created_at, updated_at
+				FROM opa.connectors WHERE id = '%s' ORDER BY updated_at DESC LIMIT 1`, escapeSQL(id)))
+		}
 		if err == nil && len(rows) > 0 {
 			c = connectorFromCHRow(rows[0], false)
-			if c != nil {
-				c.Status = "deleted"
-				c.TokenRef = ""
-				c.UpdatedAt = now
-				persistConnector(c)
-			}
 		}
 	}
+	if denyConnectorIfImmutable(w, r, c) {
+		return
+	}
+	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	c.Status = "deleted"
+	c.TokenRef = ""
+	c.UpdatedAt = now
+	connectorLive.Store(id, c)
+	persistConnector(c)
 	cascadeDeleteWatched(id)
 	connectorLive.Delete(id)
 	writeJSON(w, map[string]interface{}{"ok": true, "deleted": id})
@@ -468,6 +545,9 @@ func handleConnectorRepos(w http.ResponseWriter, r *http.Request, id string) {
 		})
 		return
 	}
+	if denyConnectorIfInvisible(w, r, c) {
+		return
+	}
 	if c.Kind == "github_pat" && c.TokenRef == "" {
 		writeJSON(w, map[string]interface{}{
 			"repos": []interface{}{},
@@ -503,6 +583,10 @@ func handleConnectorRepos(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func handleWatchedList(w http.ResponseWriter, r *http.Request, connectorID string) {
+	c := getOrHydrateConnector(connectorID)
+	if denyConnectorIfInvisible(w, r, c) {
+		return
+	}
 	list := []opaWatchedRepo{}
 	watchedLive.Range(func(_, v interface{}) bool {
 		wr, ok := v.(*opaWatchedRepo)
@@ -516,10 +600,19 @@ func handleWatchedList(w http.ResponseWriter, r *http.Request, connectorID strin
 		scope := tenantScopeSQL(r, queryClient, "")
 		rows, err := queryClient.Query(fmt.Sprintf(`
 			SELECT id, organization_id, project_id, connector_id, repo_full_name, repo_id,
-			       enabled, service_name, profile, checks_json, min_severity, ai_blocking, link_group_id, updated_at
+			       enabled, service_name, profile, checks_json, min_severity, ai_blocking,
+			       auto_request_reviewer, auto_approve_min_score, link_group_id, updated_at
 			FROM opa.watched_repos
 			WHERE connector_id = '%s'%s
 			ORDER BY updated_at DESC LIMIT 200`, escapeSQL(connectorID), scope))
+		if err != nil {
+			rows, err = queryClient.Query(fmt.Sprintf(`
+				SELECT id, organization_id, project_id, connector_id, repo_full_name, repo_id,
+				       enabled, service_name, profile, checks_json, min_severity, ai_blocking, link_group_id, updated_at
+				FROM opa.watched_repos
+				WHERE connector_id = '%s'%s
+				ORDER BY updated_at DESC LIMIT 200`, escapeSQL(connectorID), scope))
+		}
 		if err == nil {
 			for _, row := range rows {
 				wr := watchedFromCHRow(row)
@@ -543,27 +636,15 @@ func watchedFromCHRow(row map[string]interface{}) *opaWatchedRepo {
 	if id == "" || repo == "" {
 		return nil
 	}
-	enabled := true
-	switch v := row["enabled"].(type) {
-	case uint8:
-		enabled = v != 0
-	case int64:
-		enabled = v != 0
-	case float64:
-		enabled = v != 0
-	case bool:
-		enabled = v
+	enabled := chBool(row["enabled"], true)
+	ai := chBool(row["ai_blocking"], false)
+	autoReq := chBool(row["auto_request_reviewer"], false)
+	minScore := chInt(row["auto_approve_min_score"], 0)
+	if minScore < 0 {
+		minScore = 0
 	}
-	ai := false
-	switch v := row["ai_blocking"].(type) {
-	case uint8:
-		ai = v != 0
-	case int64:
-		ai = v != 0
-	case float64:
-		ai = v != 0
-	case bool:
-		ai = v
+	if minScore > 100 {
+		minScore = 100
 	}
 	str := func(k string) string {
 		if s, ok := row[k].(string); ok {
@@ -576,33 +657,80 @@ func watchedFromCHRow(row map[string]interface{}) *opaWatchedRepo {
 		ConnectorID: str("connector_id"), RepoFullName: repo, RepoID: str("repo_id"),
 		Enabled: enabled, ServiceName: str("service_name"), Profile: nz(str("profile"), "auto"),
 		ChecksJSON: nz(str("checks_json"), "[]"), MinSeverity: nz(str("min_severity"), "high"),
-		AIBlocking: ai, LinkGroupID: str("link_group_id"), UpdatedAt: str("updated_at"),
+		AIBlocking: ai, AutoRequestReviewer: autoReq, AutoApproveMinScore: minScore,
+		LinkGroupID: str("link_group_id"), UpdatedAt: str("updated_at"),
+	}
+}
+
+func chBool(v interface{}, def bool) bool {
+	switch t := v.(type) {
+	case nil:
+		return def
+	case bool:
+		return t
+	case uint8:
+		return t != 0
+	case int64:
+		return t != 0
+	case float64:
+		return t != 0
+	case string:
+		s := strings.TrimSpace(strings.ToLower(t))
+		return s == "1" || s == "true" || s == "yes"
+	default:
+		return def
+	}
+}
+
+func chInt(v interface{}, def int) int {
+	switch t := v.(type) {
+	case nil:
+		return def
+	case int:
+		return t
+	case int64:
+		return int(t)
+	case uint8:
+		return int(t)
+	case float64:
+		return int(t)
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(t))
+		if err != nil {
+			return def
+		}
+		return n
+	default:
+		return def
 	}
 }
 
 func handleWatchedPut(w http.ResponseWriter, r *http.Request, connectorID string) {
+	c := getOrHydrateConnector(connectorID)
+	if denyConnectorIfImmutable(w, r, c) {
+		return
+	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 2<<20))
 	var body struct {
 		Repos []struct {
-			RepoFullName string   `json:"repo_full_name"`
-			RepoID       string   `json:"repo_id"`
-			Enabled      *bool    `json:"enabled"`
-			ServiceName  string   `json:"service_name"`
-			Profile      string   `json:"profile"`
-			Checks       []string `json:"checks"`
-			MinSeverity  string   `json:"min_severity"`
-			AIBlocking   bool     `json:"ai_blocking"`
+			RepoFullName          string   `json:"repo_full_name"`
+			RepoID                string   `json:"repo_id"`
+			Enabled               *bool    `json:"enabled"`
+			ServiceName           string   `json:"service_name"`
+			Profile               string   `json:"profile"`
+			Checks                []string `json:"checks"`
+			MinSeverity           string   `json:"min_severity"`
+			AIBlocking            bool     `json:"ai_blocking"`
+			AutoRequestReviewer   bool     `json:"auto_request_reviewer"`
+			AutoApproveMinScore   int      `json:"auto_approve_min_score"`
 		} `json:"repos"`
 	}
 	if json.Unmarshal(raw, &body) != nil {
 		http.Error(w, "bad json", 400)
 		return
 	}
-	c := getOrHydrateConnector(connectorID)
-	org, proj := "", ""
-	if c != nil {
-		org, proj = c.OrganizationID, c.ProjectID
-	} else {
+	org, proj := c.OrganizationID, c.ProjectID
+	if org == "" {
 		ctx, _ := ExtractTenantContext(r, queryClient)
 		org, proj = ctx.WriteTenant()
 	}
@@ -620,7 +748,14 @@ func handleWatchedPut(w http.ResponseWriter, r *http.Request, connectorID string
 		if len(checks) == 0 {
 			checks = defaultWatchedChecks()
 		}
-		wr := upsertWatched(org, proj, connectorID, repo, item.RepoID, en, checks, nz(item.Profile, "auto"), nz(item.MinSeverity, "high"), item.AIBlocking)
+		minScore := item.AutoApproveMinScore
+		if minScore < 0 {
+			minScore = 0
+		}
+		if minScore > 100 {
+			minScore = 100
+		}
+		wr := upsertWatched(org, proj, connectorID, repo, item.RepoID, en, checks, nz(item.Profile, "auto"), nz(item.MinSeverity, "high"), item.AIBlocking, item.AutoRequestReviewer, minScore)
 		if item.ServiceName != "" {
 			wr.ServiceName = item.ServiceName
 			persistWatched(wr)
@@ -634,7 +769,7 @@ func defaultWatchedChecks() []string {
 	return []string{"secrets", "sast", "iac", "sbom", "ai_review"}
 }
 
-func upsertWatched(org, proj, connectorID, repo, repoID string, enabled bool, checks []string, profile, minSev string, aiBlock bool) *opaWatchedRepo {
+func upsertWatched(org, proj, connectorID, repo, repoID string, enabled bool, checks []string, profile, minSev string, aiBlock, autoRequest bool, minScore int) *opaWatchedRepo {
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
 	checksJSON, _ := json.Marshal(checks)
 	id := loadID("watch", org, proj, connectorID, repo)
@@ -644,12 +779,20 @@ func upsertWatched(org, proj, connectorID, repo, repoID string, enabled bool, ch
 			prevGroup = old.LinkGroupID
 		}
 	}
+	if minScore < 0 {
+		minScore = 0
+	}
+	if minScore > 100 {
+		minScore = 100
+	}
 	wr := &opaWatchedRepo{
 		ID: id, OrganizationID: org, ProjectID: proj, ConnectorID: connectorID,
 		RepoFullName: repo, RepoID: repoID, Enabled: enabled,
 		ServiceName: strings.ReplaceAll(repo, "/", "-"),
 		Profile: profile, ChecksJSON: string(checksJSON),
-		MinSeverity: minSev, AIBlocking: aiBlock, LinkGroupID: prevGroup, UpdatedAt: now,
+		MinSeverity: minSev, AIBlocking: aiBlock,
+		AutoRequestReviewer: autoRequest, AutoApproveMinScore: minScore,
+		LinkGroupID: prevGroup, UpdatedAt: now,
 	}
 	watchedLive.Store(connectorID+"|"+repo, wr)
 	persistWatched(wr)
@@ -716,6 +859,7 @@ func connectorFromCHRow(row map[string]interface{}, decryptToken bool) *opaConne
 	}
 	c := &opaConnector{
 		ID: id, OrganizationID: str("organization_id"), ProjectID: str("project_id"),
+		Scope: inferLegacyScope(str("organization_id"), str("scope")), UserID: str("user_id"),
 		Kind: str("kind"), InstallationID: str("installation_id"), AccountLogin: str("account_login"),
 		Status: nz(str("status"), "active"), MetaJSON: nz(str("meta_json"), "{}"),
 		CreatedAt: str("created_at"), UpdatedAt: str("updated_at"),
@@ -768,6 +912,7 @@ func persistConnector(c *opaConnector) {
 	}
 	payload, _ := json.Marshal(map[string]interface{}{
 		"id": c.ID, "organization_id": c.OrganizationID, "project_id": c.ProjectID,
+		"scope": inferLegacyScope(c.OrganizationID, c.Scope), "user_id": c.UserID,
 		"kind": c.Kind, "installation_id": c.InstallationID, "account_login": c.AccountLogin,
 		"status": c.Status, "token_ref": tokenRef, "meta_json": c.MetaJSON,
 		"created_at": c.CreatedAt, "updated_at": c.UpdatedAt,
@@ -780,18 +925,29 @@ func persistWatched(wr *opaWatchedRepo) {
 	if writer == nil {
 		return
 	}
-	en, ai := uint8(0), uint8(0)
+	en, ai, autoReq := uint8(0), uint8(0), uint8(0)
 	if wr.Enabled {
 		en = 1
 	}
 	if wr.AIBlocking {
 		ai = 1
 	}
+	if wr.AutoRequestReviewer {
+		autoReq = 1
+	}
+	minScore := wr.AutoApproveMinScore
+	if minScore < 0 {
+		minScore = 0
+	}
+	if minScore > 100 {
+		minScore = 100
+	}
 	payload, _ := json.Marshal(map[string]interface{}{
 		"id": wr.ID, "organization_id": wr.OrganizationID, "project_id": wr.ProjectID,
 		"connector_id": wr.ConnectorID, "repo_full_name": wr.RepoFullName, "repo_id": wr.RepoID,
 		"enabled": en, "service_name": wr.ServiceName, "profile": wr.Profile,
 		"checks_json": wr.ChecksJSON, "min_severity": wr.MinSeverity, "ai_blocking": ai,
+		"auto_request_reviewer": autoReq, "auto_approve_min_score": minScore,
 		"link_group_id": wr.LinkGroupID, "updated_at": wr.UpdatedAt,
 	})
 	writer.insertAsync("watched_repos", append(payload, '\n'))
@@ -802,30 +958,63 @@ func handleSCMSettings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
+	a := actorFromRequest(r)
+	org, proj := a.OrganizationID, a.ProjectID
 	ctx, _ := ExtractTenantContext(r, queryClient)
-	org, proj := ctx.WriteTenant()
-	// Lazy hydrate if boot missed CH (or key set after boot on another replica).
-	if resolveCursorAPIKey(org, proj) == "" {
-		hydrateCursorKeyFromCH(org, proj)
+	if ctx == nil {
+		ctx = &TenantContext{}
 	}
-	hasKey := resolveCursorAPIKey(org, proj) != ""
-	_, _, cursorModel, _ := resolveCLICursorConfig(org, proj)
+	if org == "" {
+		org, proj = ctx.WriteTenant()
+	} else if proj == "" || proj == tenantAll {
+		_, defProj := ctx.WriteTenant()
+		proj = defProj
+	}
+	userID := strings.TrimSpace(a.Username)
+	// Same resolution as OPA Review / Generate: user → org → fail closed.
+	hit := resolveSCMSecret(credResolveQuery{
+		OrganizationID: org, ProjectID: proj, UserID: userID,
+	}, scmCursorSecretKey)
+	hasKey := hit.Plain != ""
+	_, _, cursorModel, _ := resolveCLICursorConfig(org, proj, userID)
+	honesty := "OPA Review CLI key resolves user → org → fail closed (never admin, never process env). Manage under Account (personal or org)."
+	if !hasKey {
+		who := userID
+		if who == "" {
+			who = "(no username — sign in so personal keys can resolve)"
+		}
+		orgLabel := org
+		if orgLabel == "" {
+			orgLabel = "(no org selected)"
+		}
+		honesty = "No CLI agent API key for user " + who + " in org " + orgLabel +
+			". Save a personal key while signed in as that user, or an org key under Account → Organization. Keys are not shared across usernames (e.g. admin ≠ opa-admin)."
+	}
 	writeJSON(w, map[string]interface{}{
 		"github_app_configured": githubAppConfigured(),
 		"cursor_key_set":        hasKey,
+		"cursor_key_scope":      hit.Scope,
 		"cursor_model":          cursorModel,
+		"organization_id":       org,
+		"project_id":            proj,
+		"user_id":               userID,
 		"webhook_url":           strings.TrimRight(envOr("OPA_PUBLIC_URL", "http://127.0.0.1:8080"), "/") + "/v1/scm/github/webhook",
 		"skip_cursor_ai":        envOr("SKIP_CURSOR_AI", "0") == "1",
 		"workspace":             securityWorkspaceRoot(),
-		"cursor_key_scope":      "cli_cursor in unified AI settings (opa.scm_secrets); env CURSOR_API_KEY is a process-wide override (single-tenant)",
 		"ai_settings_path":      "/api/ai/settings",
-		"honesty":               "OPA Review CLI key is AES-GCM encrypted via AI settings / scm_secrets (never returned). Manage under /settings/ai. CURSOR_API_KEY env is a global override for single-tenant deploys.",
+		"account_path":          "/settings/account",
+		"honesty":               honesty,
 	})
 }
 
 func handleCursorKeySet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
+		return
+	}
+	a := actorFromRequest(r)
+	if err := canWriteCredScope(a, credScopeOrg); err != nil {
+		http.Error(w, err.Error(), 403)
 		return
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
@@ -839,6 +1028,14 @@ func handleCursorKeySet(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, _ := ExtractTenantContext(r, queryClient)
 	org, proj := ctx.WriteTenant()
+	if a.OrganizationID == "" {
+		http.Error(w, "org scope requires X-Organization-ID", 400)
+		return
+	}
+	org = a.OrganizationID
+	if a.ProjectID != "" {
+		proj = a.ProjectID
+	}
 	if body.Clear {
 		if err := setCLICursorKeyFromAlias(org, proj, "", true); err != nil {
 			log.Printf("[WARN] clear cli_cursor via cursor-key alias: %v", err)
@@ -861,136 +1058,33 @@ func handleCursorKeySet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"ok": true, "cursor_key_set": true, "organization_id": org, "project_id": proj, "alias_of": "cli_cursor"})
 }
 
-// resolveCursorAPIKey returns the CLI agent (Cursor) API key for an optional org/project.
-// Precedence: CURSOR_API_KEY env → unified AI settings (cli_cursor) → legacy memory/CH.
+// resolveCursorAPIKey returns the CLI agent API key for a tenant job.
+// Resolution: user (optional) → org → fail closed. Never admin, never env.
 func resolveCursorAPIKey(orgProj ...string) string {
-	org, proj := "", ""
+	org, proj, userID := "", "", ""
 	if len(orgProj) >= 1 {
 		org = orgProj[0]
 	}
 	if len(orgProj) >= 2 {
 		proj = orgProj[1]
 	}
-	if env := strings.TrimSpace(os.Getenv("CURSOR_API_KEY")); env != "" {
-		return env
+	if len(orgProj) >= 3 {
+		userID = orgProj[2]
 	}
-	key, _, _, _ := resolveCLICursorConfig(org, proj)
-	if key != "" {
-		return key
-	}
-	cursorKeyMu.Lock()
-	if cursorKeyMem != "" {
-		if org == "" || (cursorKeyOrg == org && (proj == "" || cursorKeyProj == proj || cursorKeyProj == "")) {
-			k := cursorKeyMem
-			cursorKeyMu.Unlock()
-			return k
-		}
-	}
-	cursorKeyMu.Unlock()
-	hydrateCursorKeyFromCH(org, proj)
-	cursorKeyMu.Lock()
-	defer cursorKeyMu.Unlock()
-	if cursorKeyMem == "" {
-		return ""
-	}
-	if org == "" || (cursorKeyOrg == org && (proj == "" || cursorKeyProj == proj || cursorKeyProj == "")) {
-		return cursorKeyMem
-	}
-	if cursorKeyOrg != "" && org != "" && cursorKeyOrg != org {
-		return ""
-	}
-	return cursorKeyMem
-}
-
-func persistSCMSecret(org, proj, key, plaintext string, deleted bool) error {
-	if writer == nil {
-		return nil
-	}
-	ct := ""
-	if !deleted && plaintext != "" {
-		enc, err := encryptSecret(plaintext)
-		if err != nil {
-			return err
-		}
-		ct = enc
-	}
-	del := uint8(0)
-	if deleted {
-		del = 1
-	}
-	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
-	payload, _ := json.Marshal(map[string]interface{}{
-		"key": key, "organization_id": org, "project_id": proj,
-		"ciphertext": ct, "updated_at": now, "deleted": del,
-	})
-	writer.insert("scm_secrets", append(payload, '\n'))
-	return nil
+	key, _, _, _ := resolveCLICursorConfig(org, proj, userID)
+	return key
 }
 
 func hydrateCursorKeyFromCH(org, proj string) {
-	if queryClient == nil {
+	// Fail-closed scoped load only — no "any row" / admin / env fallback.
+	plain := loadSCMSecretPlain(org, proj, scmCursorSecretKey)
+	if plain == "" {
 		return
 	}
-	// Prefer exact org+project, then org-wide, then any legacy row.
-	q := fmt.Sprintf(`
-		SELECT organization_id, project_id, ciphertext, deleted FROM opa.scm_secrets
-		WHERE key = '%s'
-		ORDER BY updated_at DESC LIMIT 20`, escapeSQL(scmCursorSecretKey))
-	rows, err := queryClient.Query(q)
-	if err != nil || len(rows) == 0 {
-		return
-	}
-	pick := func(wantOrg, wantProj string, allowAny bool) bool {
-		for _, row := range rows {
-			deleted := false
-			switch v := row["deleted"].(type) {
-			case uint8:
-				deleted = v != 0
-			case int64:
-				deleted = v != 0
-			case float64:
-				deleted = v != 0
-			case bool:
-				deleted = v
-			}
-			if deleted {
-				continue
-			}
-			rowOrg, _ := row["organization_id"].(string)
-			rowProj, _ := row["project_id"].(string)
-			if !allowAny {
-				if wantOrg != "" && rowOrg != wantOrg {
-					continue
-				}
-				if wantProj != "" && rowProj != wantProj && rowProj != "" {
-					continue
-				}
-			}
-			ct, _ := row["ciphertext"].(string)
-			if !isEncryptedSecret(ct) {
-				continue
-			}
-			plain, err := decryptSecret(ct)
-			if err != nil || plain == "" {
-				continue
-			}
-			cursorKeyMu.Lock()
-			if cursorKeyMem == "" {
-				cursorKeyMem = plain
-				cursorKeyOrg, cursorKeyProj = rowOrg, rowProj
-			}
-			cursorKeyMu.Unlock()
-			return true
-		}
-		return false
-	}
-	if org != "" && pick(org, proj, false) {
-		return
-	}
-	if org != "" && pick(org, "", false) {
-		return
-	}
-	_ = pick("", "", true)
+	cursorKeyMu.Lock()
+	cursorKeyMem = plain
+	cursorKeyOrg, cursorKeyProj = org, proj
+	cursorKeyMu.Unlock()
 }
 
 // hydrateSCMOnBoot reloads encrypted PATs, watched repos, and Cursor API key after ClickHouse is ready.
@@ -998,6 +1092,8 @@ func hydrateSCMOnBoot() {
 	if queryClient == nil {
 		return
 	}
+	ensureCredentialScopeColumns()
+	ensureWatchedRepoReviewColumns()
 	n := 0
 	rows, err := queryClient.Query(`
 		SELECT id, organization_id, project_id, kind, installation_id, account_login,
@@ -1035,7 +1131,21 @@ func hydrateSCMOnBoot() {
 	cursorKeyMu.Lock()
 	hasCursor := cursorKeyMem != ""
 	cursorKeyMu.Unlock()
-	log.Printf("[INFO] SCM hydrate: %d connector(s), %d watched repo(s) from ClickHouse; cursor_key_set=%v", n, nw, hasCursor || strings.TrimSpace(os.Getenv("CURSOR_API_KEY")) != "")
+	log.Printf("[INFO] SCM hydrate: %d connector(s), %d watched repo(s) from ClickHouse; cursor_key_set=%v", n, nw, hasCursor)
+}
+
+func ensureWatchedRepoReviewColumns() {
+	if queryClient == nil {
+		return
+	}
+	for _, q := range []string{
+		`ALTER TABLE opa.watched_repos ADD COLUMN IF NOT EXISTS auto_request_reviewer UInt8 DEFAULT 0`,
+		`ALTER TABLE opa.watched_repos ADD COLUMN IF NOT EXISTS auto_approve_min_score UInt8 DEFAULT 0`,
+	} {
+		if err := queryClient.Execute(q); err != nil {
+			log.Printf("[WARN] ensureWatchedRepoReviewColumns: %v", err)
+		}
+	}
 }
 
 func hydrateWatchedReposOnBoot() int {
@@ -1044,12 +1154,21 @@ func hydrateWatchedReposOnBoot() int {
 	}
 	rows, err := queryClient.Query(`
 		SELECT id, organization_id, project_id, connector_id, repo_full_name, repo_id,
-		       enabled, service_name, profile, checks_json, min_severity, ai_blocking, link_group_id, updated_at
+		       enabled, service_name, profile, checks_json, min_severity, ai_blocking,
+		       auto_request_reviewer, auto_approve_min_score, link_group_id, updated_at
 		FROM opa.watched_repos
 		ORDER BY updated_at DESC LIMIT 500`)
 	if err != nil {
-		log.Printf("[WARN] hydrateSCMOnBoot watched_repos: %v", err)
-		return 0
+		// Older schemas lack review-policy columns — fall back then retry after ALTER.
+		rows, err = queryClient.Query(`
+			SELECT id, organization_id, project_id, connector_id, repo_full_name, repo_id,
+			       enabled, service_name, profile, checks_json, min_severity, ai_blocking, link_group_id, updated_at
+			FROM opa.watched_repos
+			ORDER BY updated_at DESC LIMIT 500`)
+		if err != nil {
+			log.Printf("[WARN] hydrateSCMOnBoot watched_repos: %v", err)
+			return 0
+		}
 	}
 	seen := map[string]struct{}{}
 	n := 0

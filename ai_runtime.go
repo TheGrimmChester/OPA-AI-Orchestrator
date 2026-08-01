@@ -38,7 +38,7 @@ type aiCompleteResult struct {
 }
 
 var (
-	errAINoProvider = errors.New("no AI provider configured — set OpenAI-compatible, Anthropic-compatible, or CLI agent in AI settings")
+	errAINoProvider = errors.New("no AI provider configured — save a CLI agent key under Account, or configure OpenAI/Anthropic (personal or org)")
 	errAITimeout    = errors.New("AI completion timed out")
 )
 
@@ -58,43 +58,52 @@ func aiDefaultMaxTokens() int {
 }
 
 // ResolveProvider picks a provider for a task kind.
-// opa_review / auto_fix → CLI Cursor first, then HTTP fallback.
-// dashboard kinds → OpenAI then Anthropic (honoring default_provider when set).
+// opa_review / auto_fix / cli → CLI Cursor first, then HTTP fallback.
+// dashboard kinds:
+//   - default_provider=cli_cursor → CLI first
+//   - default_provider=openai|anthropic → that provider first
+//   - auto → CLI (when key set) then OpenAI then Anthropic
 func ResolveProvider(taskKind string, doc aiSettingsDoc) []string {
 	kind := strings.ToLower(strings.TrimSpace(taskKind))
+	cliOK := doc.CLICursor.Enabled && doc.CLICursor.APIKey != ""
 	switch kind {
 	case "opa_review", "auto_fix", "cli":
 		out := []string{}
-		if doc.CLICursor.Enabled && (doc.CLICursor.APIKey != "" || strings.TrimSpace(os.Getenv("CURSOR_API_KEY")) != "") {
+		if cliOK {
 			out = append(out, aiProviderCLICursor)
 		}
 		out = append(out, httpProvidersPrefer(doc)...)
 		return uniqueStrings(out)
 	default:
-		// generic, metrics_explain, trace_analyze, …
-		prefs := httpProvidersPrefer(doc)
-		if def := strings.TrimSpace(doc.DefaultProvider); def != "" && def != "auto" {
-			prefs = prependProvider(prefs, def)
+		// generic, metrics_explain, trace_analyze, context_generate, …
+		def := strings.TrimSpace(doc.DefaultProvider)
+		switch def {
+		case aiProviderCLICursor:
+			out := []string{}
+			if cliOK {
+				out = append(out, aiProviderCLICursor)
+			}
+			out = append(out, httpProvidersPrefer(doc)...)
+			return uniqueStrings(out)
+		case aiProviderOpenAI, aiProviderAnthropic:
+			return uniqueStrings(prependProvider(httpProvidersPrefer(doc), def))
+		default: // auto / empty
+			out := []string{}
+			if cliOK {
+				out = append(out, aiProviderCLICursor)
+			}
+			out = append(out, httpProvidersPrefer(doc)...)
+			return uniqueStrings(out)
 		}
-		return prefs
 	}
 }
 
 func httpProvidersPrefer(doc aiSettingsDoc) []string {
 	out := []string{}
-	openOK := doc.OpenAI.Enabled && doc.OpenAI.APIKey != ""
-	anthOK := doc.Anthropic.Enabled && doc.Anthropic.APIKey != ""
-	// Env-only keys still count via applyAIEnvOverrides (Enabled flipped on)
-	if !openOK && doc.OpenAI.APIKey != "" {
-		openOK = true
-	}
-	if !anthOK && doc.Anthropic.APIKey != "" {
-		anthOK = true
-	}
-	if openOK {
+	if doc.OpenAI.Enabled && doc.OpenAI.APIKey != "" {
 		out = append(out, aiProviderOpenAI)
 	}
-	if anthOK {
+	if doc.Anthropic.Enabled && doc.Anthropic.APIKey != "" {
 		out = append(out, aiProviderAnthropic)
 	}
 	return out
@@ -127,8 +136,14 @@ func uniqueStrings(in []string) []string {
 }
 
 // Complete runs the first available provider from ResolveProvider(taskKind).
+// Uses org-scoped settings only (no user) — prefer CompleteFor when actor is known.
 func Complete(ctx context.Context, taskKind string, req aiCompleteRequest) (*aiCompleteResult, error) {
-	doc := getAISettings("", "")
+	return CompleteFor(ctx, taskKind, req, credResolveQuery{})
+}
+
+// CompleteFor resolves providers with scoped credentials (user → org; never admin/env).
+func CompleteFor(ctx context.Context, taskKind string, req aiCompleteRequest, q credResolveQuery) (*aiCompleteResult, error) {
+	doc := getAISettingsFor(q)
 	providers := ResolveProvider(taskKind, doc)
 	if len(providers) == 0 {
 		return nil, errAINoProvider
@@ -146,7 +161,6 @@ func Complete(ctx context.Context, taskKind string, req aiCompleteRequest) (*aiC
 			return res, nil
 		}
 		lastErr = err
-		// CLI unavailable → try HTTP fallback
 		if p == aiProviderCLICursor {
 			continue
 		}
@@ -359,9 +373,22 @@ func buildChatMessages(req aiCompleteRequest) []map[string]string {
 	return out
 }
 
-// resolveCLICursorConfig returns key/bin/model/force from unified AI settings.
-func resolveCLICursorConfig(org, proj string) (key, bin, model string, force bool) {
-	doc := getAISettings(org, proj)
+// resolveCLICursorConfig returns key/bin/model/force from scoped AI settings.
+// Extra orgProj[2] may be acting userID for user→org inheritance.
+func resolveCLICursorConfig(orgProj ...string) (key, bin, model string, force bool) {
+	org, proj, userID := "", "", ""
+	if len(orgProj) >= 1 {
+		org = orgProj[0]
+	}
+	if len(orgProj) >= 2 {
+		proj = orgProj[1]
+	}
+	if len(orgProj) >= 3 {
+		userID = orgProj[2]
+	}
+	doc := getAISettingsFor(credResolveQuery{
+		OrganizationID: org, ProjectID: proj, UserID: userID,
+	})
 	key = doc.CLICursor.APIKey
 	bin = nz(doc.CLICursor.Bin, envOr("OPA_CURSOR_AGENT_BIN", "agent"))
 	model = nz(doc.CLICursor.Model, envOr("OPA_CURSOR_MODEL", "auto"))

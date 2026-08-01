@@ -293,6 +293,9 @@ func scmJobFromCHRow(row map[string]interface{}) *scmJob {
 	if v, ok := job.Summary["ai_only"].(bool); ok {
 		job.AIOnly = v
 	}
+	if uid, _ := job.Summary["actor_user_id"].(string); strings.TrimSpace(uid) != "" {
+		job.ActorUserID = strings.TrimSpace(uid)
+	}
 	return job
 }
 
