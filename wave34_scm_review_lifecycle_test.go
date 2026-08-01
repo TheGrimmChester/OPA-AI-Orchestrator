@@ -83,11 +83,27 @@ func TestSeverityAndConfidenceEmoji(t *testing.T) {
 	if severityEmoji("high") != "🟠" {
 		t.Fatal("high emoji")
 	}
-	if confidenceEmoji("high", 80) != "🟢" {
+	if confidenceEmoji(80) != "🟢" {
 		t.Fatal("confidence high")
 	}
-	if confidenceEmoji("low", 10) != "🔴" {
+	if confidenceEmoji(10) != "🔴" {
 		t.Fatal("confidence low")
+	}
+	if confidenceEmoji(55) != "🟡" {
+		t.Fatal("confidence medium")
+	}
+	// Model may claim "high" while scoring low — emoji follows the score.
+	if confidenceEmoji(8) != "🔴" {
+		t.Fatal("low score must not paint green")
+	}
+	if confidenceLabelFromScore(8) != "low" {
+		t.Fatal("score 8 is low")
+	}
+	if confidenceLabelFromScore(40) != "medium" || confidenceLabelFromScore(69) != "medium" {
+		t.Fatal("40–69 is medium")
+	}
+	if confidenceLabelFromScore(70) != "high" {
+		t.Fatal("70+ is high")
 	}
 }
 

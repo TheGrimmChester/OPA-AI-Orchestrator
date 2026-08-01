@@ -169,12 +169,11 @@ func severityEmoji(sev string) string {
 	}
 }
 
-func confidenceEmoji(label string, score int) string {
-	label = strings.ToLower(strings.TrimSpace(label))
-	if label == "" {
-		label = confidenceLabelFromScore(score)
-	}
-	switch label {
+func confidenceEmoji(score int) string {
+	// Numeric score is authoritative. Models sometimes emit confidence_label
+	// "high" with a low auto_merge_confidence (e.g. 8/100); never trust the
+	// label alone for the traffic-light emoji.
+	switch confidenceLabelFromScore(score) {
 	case "high":
 		return "🟢"
 	case "medium":
