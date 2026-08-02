@@ -447,6 +447,9 @@ func runSecurityAgent(job *scmJob) error {
 	job.SecurityRunID = runID
 
 	jobDashURL := scmJobDashboardURL(job.RunID)
+	if !githubUseMockAPI(conn) {
+		_ = ensureGitHubWriteAllowed(job, conn) // honesty when PAT allowed; write helpers fail closed
+	}
 	appSecID, _ := githubCreateCheckRun(conn, owner, repoName, "OPA AppSec Gate", job.CommitSHA, "in_progress", "", "Scanning…", checkRunSummaryWithJobLink("Repo Watch scanners running", job.RunID), jobDashURL, nil)
 	if job.CheckRunIDs == nil {
 		job.CheckRunIDs = map[string]int64{}
@@ -513,6 +516,9 @@ func runBugbotAgent(job *scmJob) error {
 	}
 
 	jobDashURL := scmJobDashboardURL(job.RunID)
+	if !githubUseMockAPI(conn) {
+		_ = ensureGitHubWriteAllowed(job, conn)
+	}
 	aiCheckID, _ := githubCreateCheckRun(conn, owner, repoName, "OPA Review", job.CommitSHA, "in_progress", "", "OPA reviewing…", checkRunSummaryWithJobLink("Running OPA Review", job.RunID), jobDashURL, nil)
 	if job.CheckRunIDs == nil {
 		job.CheckRunIDs = map[string]int64{}
@@ -605,6 +611,12 @@ func runApprovalAgent(job *scmJob) error {
 		conn = getOrHydrateConnector(job.ConnectorID)
 	}
 	owner, repoName := splitOwnerRepo(job.RepoFullName)
+	if !githubUseMockAPI(conn) {
+		if err := ensureGitHubWriteAllowed(job, conn); err != nil {
+			job.Summary["approval_publish_error"] = err.Error()
+			return err
+		}
+	}
 	prefs := agentPrefsFromSummary(getSCMJob(job.RunID))
 	minScore := 0
 	if wr != nil {

@@ -1581,6 +1581,17 @@ func postOPAReviewFindings(conn *opaConnector, owner, repo string, job *scmJob, 
 	if job == nil || job.PRNumber <= 0 {
 		return out
 	}
+	if !githubUseMockAPI(conn) {
+		if err := ensureGitHubWriteAllowed(job, conn); err != nil {
+			out.Mode = "refused"
+			out.Failed = 1
+			if job.Summary == nil {
+				job.Summary = map[string]interface{}{}
+			}
+			job.Summary["publish_refused"] = err.Error()
+			return out
+		}
+	}
 
 	pubMeta := meta
 	if pubMeta.DesignEnforcement == false {

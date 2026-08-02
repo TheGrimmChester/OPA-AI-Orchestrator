@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -201,6 +202,51 @@ func authorizeGitPush(conn *opaConnector) error {
 	if conn.Kind != "github_app" {
 		return fmt.Errorf("capGitPush requires github_app (got %s)", conn.Kind)
 	}
+	return nil
+}
+
+// authorizeGitHubWrite gates capGitHubWrite. github_app is always allowed.
+// PAT is refused unless OPA_AGENTS_ALLOW_PAT_WRITE=1 (logged + honesty string).
+// Smoke mock PAT paths that never hit GitHub skip this via githubUseMockAPI
+// short-circuits in write helpers; when called directly against mock PAT it
+// still fails closed unless the flag is set.
+func authorizeGitHubWrite(conn *opaConnector) (honesty string, err error) {
+	if conn == nil {
+		return "", fmt.Errorf("no connector")
+	}
+	switch conn.Kind {
+	case "github_app":
+		return "", nil
+	case "github_pat":
+		if envOr("OPA_AGENTS_ALLOW_PAT_WRITE", "0") != "1" {
+			return "", fmt.Errorf("capGitHubWrite refuses PAT connectors unless OPA_AGENTS_ALLOW_PAT_WRITE=1")
+		}
+		log.Printf("[WARN] capGitHubWrite: PAT write allowed via OPA_AGENTS_ALLOW_PAT_WRITE=1 — capability matrix degraded to shared token")
+		return "capability matrix degraded to shared PAT token (OPA_AGENTS_ALLOW_PAT_WRITE=1)", nil
+	default:
+		return "", fmt.Errorf("capGitHubWrite requires github_app or allowed PAT (got %s)", conn.Kind)
+	}
+}
+
+// noteCapabilityHonesty records authorizeGitHubWrite honesty on the job summary.
+func noteCapabilityHonesty(job *scmJob, honesty string) {
+	if job == nil || strings.TrimSpace(honesty) == "" {
+		return
+	}
+	if job.Summary == nil {
+		job.Summary = map[string]interface{}{}
+	}
+	job.Summary["capability_honesty"] = honesty
+}
+
+// ensureGitHubWriteAllowed fails closed for PAT without the allow flag and
+// records capability_honesty when the matrix is degraded to a shared PAT.
+func ensureGitHubWriteAllowed(job *scmJob, conn *opaConnector) error {
+	honesty, err := authorizeGitHubWrite(conn)
+	if err != nil {
+		return err
+	}
+	noteCapabilityHonesty(job, honesty)
 	return nil
 }
 

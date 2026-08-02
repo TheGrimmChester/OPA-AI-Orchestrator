@@ -315,6 +315,9 @@ func runCheckupAgent(job *scmJob) error {
 		job.Summary["checkup"] = checkupRunResult{Status: "failed", Honesty: "no checkout path"}
 		return fmt.Errorf("checkup: no checkout path")
 	}
+	if !githubUseMockAPI(conn) {
+		_ = ensureGitHubWriteAllowed(job, conn)
+	}
 
 	jobDashURL := scmJobDashboardURL(nz(job.RunID, job.ID))
 	checkID, _ := githubCreateCheckRun(conn, owner, repoName, "OPA Checkup", job.CommitSHA, "in_progress", "",

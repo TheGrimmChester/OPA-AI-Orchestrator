@@ -49,6 +49,12 @@ See also [wave35-job-isolation.md](./wave35-job-isolation.md).
 
 ## Honesty / remaining gaps
 
+- **PAT GitHub writes** (`capGitHubWrite`): refused unless
+  `OPA_AGENTS_ALLOW_PAT_WRITE=1`. When set, writes use the shared undifferentiable
+  PAT and `Summary.capability_honesty` records the matrix degradation.
+  `capGitPush` (land) still refuses PATs unconditionally — use a `github_app`
+  connector. Installation tokens for clone/publish/push are repo-scoped with
+  explicit permissions (`workflows` never requested).
 - Legacy jobs (`kind=""`) still run the pre-split pipeline — dual path until
   traffic fully migrates.
 - **PHP checkup runner** ships as `opa-runner-php` (official `php:8.4-cli-bookworm`
