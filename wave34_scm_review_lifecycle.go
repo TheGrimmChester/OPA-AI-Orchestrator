@@ -215,7 +215,10 @@ type opaReviewPlannedUpdate struct {
 	Retarget bool
 }
 
-func planOPAReviewCommentActions(findings []map[string]interface{}, prior []opaReviewPriorComment) opaReviewCommentPlan {
+func planOPAReviewCommentActions(findings []map[string]interface{}, prior []opaReviewPriorComment, carried map[string]struct{}) opaReviewCommentPlan {
+	if carried == nil {
+		carried = map[string]struct{}{}
+	}
 	priorByKey := map[string]opaReviewPriorComment{}
 	for _, p := range prior {
 		if p.Key == "" {
@@ -256,6 +259,10 @@ func planOPAReviewCommentActions(findings []map[string]interface{}, prior []opaR
 	}
 	for key, old := range priorByKey {
 		if _, ok := seen[key]; ok {
+			continue
+		}
+		// Carried-forward keys from incremental review must not mass-close.
+		if _, ok := carried[key]; ok {
 			continue
 		}
 		// Already superseded? skip re-closing.

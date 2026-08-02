@@ -29,6 +29,8 @@ func registerWave34Mux(mux *http.ServeMux, authView, authAdmin func(string, http
 	authView("/api/scm/jobs", handleSCMJobsList)
 	authAdmin("/api/scm/jobs/resume", handleSCMJobsResume)
 	registerSCMAuthFlexible(mux, "/api/scm/jobs/", handleSCMJobSub)
+	authView("/api/scm/webhooks", handleSCMWebhooksList)
+	registerSCMAuthFlexible(mux, "/api/scm/webhooks/", handleSCMWebhookSub)
 	authView("/api/scm/settings", handleSCMSettings)
 	authAdmin("/api/scm/settings/cursor-key", handleCursorKeySet)
 	mux.HandleFunc("/v1/scm/github/webhook", handleGitHubWebhook)
@@ -110,9 +112,10 @@ type opaWatchedRepo struct {
 	AIBlocking     bool   `json:"ai_blocking"`
 	// AutoRequestReviewer asks GitHub to add this App as a PR reviewer.
 	AutoRequestReviewer bool `json:"auto_request_reviewer"`
-	// AutoApproveMinScore is 1–100; when >0 OPA submits APPROVE if
-	// auto_merge_confidence >= threshold (and no blocker/high findings),
-	// else REQUEST_CHANGES. 0 keeps legacy COMMENT-only reviews.
+	// AutoApproveMinScore is 1–100 confidence veto only: when >0 and
+	// auto_merge_confidence is below the threshold, APPROVE is blocked
+	// (REQUEST_CHANGES). It never grants APPROVE by itself — that requires
+	// agent prefs AutoApprove plus the evidence conjunction.
 	AutoApproveMinScore int    `json:"auto_approve_min_score"`
 	LinkGroupID         string `json:"link_group_id"`
 	UpdatedAt           string `json:"updated_at"`
@@ -874,22 +877,151 @@ func connectorFromCHRow(row map[string]interface{}, decryptToken bool) *opaConne
 }
 
 func findWatched(repo string) (*opaWatchedRepo, *opaConnector) {
-	var found *opaWatchedRepo
+	var candidates []*opaWatchedRepo
 	watchedLive.Range(func(_, v interface{}) bool {
 		wr, ok := v.(*opaWatchedRepo)
 		if !ok || !wr.Enabled {
 			return true
 		}
 		if strings.EqualFold(wr.RepoFullName, repo) {
-			found = wr
+			candidates = append(candidates, wr)
+		}
+		return true
+	})
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	found := preferWatchedForChecks(candidates)
+	return found, getOrHydrateConnector(found.ConnectorID)
+}
+
+// preferWatchedForChecks picks the github_app watch when both App and PAT watch
+// the same repo so Check Runs post as the GitHub App bot.
+func preferWatchedForChecks(cands []*opaWatchedRepo) *opaWatchedRepo {
+	if len(cands) == 1 {
+		return cands[0]
+	}
+	var best *opaWatchedRepo
+	bestScore := -1
+	for _, wr := range cands {
+		score := 0
+		c := getOrHydrateConnector(wr.ConnectorID)
+		if c != nil && c.Kind == "github_app" && c.InstallationID != "" {
+			score += 100
+		}
+		if wr.AutoRequestReviewer {
+			score += 10
+		}
+		if strings.Contains(wr.ChecksJSON, "ai_review") {
+			score += 5
+		}
+		if score > bestScore {
+			bestScore = score
+			best = wr
+		}
+	}
+	if best == nil {
+		return cands[0]
+	}
+	return best
+}
+
+// ensureGitHubAppConnector creates or returns the connector for an installation.
+// Used by install webhooks and PR auto-watch so every installed repo can be checked.
+func ensureGitHubAppConnector(installationID, accountLogin string) *opaConnector {
+	inst := strings.TrimSpace(installationID)
+	if inst == "" || !githubAppConfigured() {
+		return nil
+	}
+	if c := findConnectorByInstallation(inst); c != nil {
+		if accountLogin != "" && strings.TrimSpace(c.AccountLogin) == "" {
+			c.AccountLogin = accountLogin
+			c.UpdatedAt = time.Now().UTC().Format("2006-01-02 15:04:05.000")
+			persistConnector(c)
+		}
+		return c
+	}
+	org, proj := "default-org", "default-project"
+	connectorLive.Range(func(_, v interface{}) bool {
+		c, ok := v.(*opaConnector)
+		if !ok || c.Status == "deleted" {
+			return true
+		}
+		if c.Kind == "github_app" || c.Kind == "github_pat" {
+			if c.OrganizationID != "" {
+				org = c.OrganizationID
+			}
+			if c.ProjectID != "" {
+				proj = c.ProjectID
+			}
 			return false
 		}
 		return true
 	})
-	if found == nil {
-		return nil, nil
+	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	id := loadID("conn", org, proj, "github_app", inst)
+	c := &opaConnector{
+		ID: id, OrganizationID: org, ProjectID: proj, Scope: credScopeOrg, UserID: "",
+		Kind: "github_app", InstallationID: inst, AccountLogin: accountLogin, Status: "active",
+		MetaJSON: `{"auto_provisioned":true}`, CreatedAt: now, UpdatedAt: now,
 	}
-	return found, getOrHydrateConnector(found.ConnectorID)
+	connectorLive.Store(id, c)
+	persistConnector(c)
+	log.Printf("[INFO] provisioned github_app connector %s installation=%s account=%s", id, inst, accountLogin)
+	return c
+}
+
+// autoWatchInstalledRepo enables Repo Watch + OPA Review for a repo on an
+// installation connector. Idempotent: existing enabled watches are left as-is
+// (checks are not overwritten).
+func autoWatchInstalledRepo(c *opaConnector, repo string) *opaWatchedRepo {
+	if c == nil {
+		return nil
+	}
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return nil
+	}
+	key := c.ID + "|" + repo
+	if v, ok := watchedLive.Load(key); ok {
+		if wr, ok := v.(*opaWatchedRepo); ok && wr.Enabled {
+			return wr
+		}
+	}
+	// Prefer cloning policy from any existing watch of this repo.
+	autoReq := true
+	minScore := 0
+	minSev := "high"
+	checks := defaultWatchedChecks()
+	watchedLive.Range(func(_, v interface{}) bool {
+		wr, ok := v.(*opaWatchedRepo)
+		if !ok || !strings.EqualFold(wr.RepoFullName, repo) {
+			return true
+		}
+		if wr.ChecksJSON != "" {
+			var parsed []string
+			if json.Unmarshal([]byte(wr.ChecksJSON), &parsed) == nil && len(parsed) > 0 {
+				checks = parsed
+			}
+		}
+		autoReq = wr.AutoRequestReviewer
+		minScore = wr.AutoApproveMinScore
+		minSev = nz(wr.MinSeverity, minSev)
+		return false
+	})
+	hasAI := false
+	for _, ch := range checks {
+		if ch == "ai_review" {
+			hasAI = true
+			break
+		}
+	}
+	if !hasAI {
+		checks = append(checks, "ai_review")
+	}
+	wr := upsertWatched(c.OrganizationID, c.ProjectID, c.ID, repo, "", true, checks, "auto", minSev, false, autoReq, minScore)
+	log.Printf("[INFO] auto-watched %s on connector %s (checks=%v)", repo, c.ID, checks)
+	return wr
 }
 
 func persistConnector(c *opaConnector) {
@@ -1094,6 +1226,7 @@ func hydrateSCMOnBoot() {
 	}
 	ensureCredentialScopeColumns()
 	ensureWatchedRepoReviewColumns()
+	ensureWave35Tables()
 	n := 0
 	rows, err := queryClient.Query(`
 		SELECT id, organization_id, project_id, kind, installation_id, account_login,
@@ -1126,12 +1259,19 @@ func hydrateSCMOnBoot() {
 		}
 	}
 	nw := hydrateWatchedReposOnBoot()
+	_ = hydrateAgentPrefsOnBoot()
+	nWide := ensureOrgWideCLICursorKeys()
 	hydrateCursorKeyFromCH("", "")
 	hydrateSCMJobsAndStacksOnBoot()
 	cursorKeyMu.Lock()
 	hasCursor := cursorKeyMem != ""
 	cursorKeyMu.Unlock()
-	log.Printf("[INFO] SCM hydrate: %d connector(s), %d watched repo(s) from ClickHouse; cursor_key_set=%v", n, nw, hasCursor)
+	// cursor_key_set here is legacy admin/mem hydrate (empty org) — per-tenant
+	// resolution uses scm_secrets via resolveCursorAPIKey. Prefer org keys.
+	orgKeyHint := nWide > 0 || resolveCursorAPIKey("default-org", "default-project", "") != "" ||
+		resolveCursorAPIKey("nas", "infra", "") != ""
+	log.Printf("[INFO] SCM hydrate: %d connector(s), %d watched repo(s) from ClickHouse; cursor_key_mem=%v org_cli_keys=%v org_wide_seeded=%d",
+		n, nw, hasCursor, orgKeyHint, nWide)
 }
 
 func ensureWatchedRepoReviewColumns() {

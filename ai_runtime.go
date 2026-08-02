@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -325,7 +324,7 @@ func completeCLI(ctx context.Context, doc aiSettingsDoc, req aiCompleteRequest) 
 	if key == "" {
 		return nil, errors.New("cli agent: api key not set")
 	}
-	bin := nz(doc.CLICursor.Bin, envOr("OPA_CURSOR_AGENT_BIN", "agent"))
+	_ = nz(doc.CLICursor.Bin, "") // settings bin ignored for agent children
 	model := nz(doc.CLICursor.Model, "auto")
 	prompt := req.Prompt
 	if prompt == "" && len(req.Messages) > 0 {
@@ -343,12 +342,16 @@ func completeCLI(ctx context.Context, doc aiSettingsDoc, req aiCompleteRequest) 
 		args = append(args, "--force")
 	}
 	args = append(args, prompt)
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.CommandContext(ctx, resolveAgentBin(), args...)
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}
-	cmd.Env = append(os.Environ(), "CURSOR_API_KEY="+key, "NO_OPEN_BROWSER=1")
+	cmd.Env = jobEnv(jobEnvSpec{
+		Phase:   jobPhaseAITask,
+		Secrets: map[string]string{"CURSOR_API_KEY": key},
+	})
 	out, err := cmd.CombinedOutput()
+	out = redactJobOutput(out, key)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, errAITimeout
@@ -390,7 +393,9 @@ func resolveCLICursorConfig(orgProj ...string) (key, bin, model string, force bo
 		OrganizationID: org, ProjectID: proj, UserID: userID,
 	})
 	key = doc.CLICursor.APIKey
-	bin = nz(doc.CLICursor.Bin, envOr("OPA_CURSOR_AGENT_BIN", "agent"))
+	// Inverted precedence: env / baked path win. Settings cli_cursor.bin is
+	// ignored for agent children so a PUT cannot choose the executable.
+	bin = resolveAgentBin()
 	model = nz(doc.CLICursor.Model, envOr("OPA_CURSOR_MODEL", "auto"))
 	force = doc.CLICursor.Force || envOr("OPA_CURSOR_AGENT_FORCE", "0") == "1"
 	return

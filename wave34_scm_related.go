@@ -21,6 +21,7 @@ type relatedCheckout struct {
 	SHA          string `json:"sha,omitempty"`
 	Source       string `json:"source"` // link | pr_body | context | mid_review | stack
 	Error        string `json:"error,omitempty"`
+	Honesty      string `json:"honesty,omitempty"`
 }
 
 func opaReviewRelatedMax() int {
@@ -170,7 +171,8 @@ func extractRelatedReposFromText(texts ...string) []string {
 	return out
 }
 
-// prepareRelatedCheckouts shallow-clones related repos under job related/.
+// prepareRelatedCheckouts shallow-clones related repos under job related/, then
+// materializes a no-.git tree for agent-visible consumption (Plan B.5).
 func prepareRelatedCheckouts(c *opaConnector, worktreeID string, repos []string, sourceByRepo map[string]string) []relatedCheckout {
 	out := []relatedCheckout{}
 	if worktreeID == "" || len(repos) == 0 {
@@ -194,18 +196,39 @@ func prepareRelatedCheckouts(c *opaConnector, worktreeID string, repos []string,
 		}
 		dest := scmRelatedRepoAbs(worktreeID, fullName)
 		rc := relatedCheckout{RepoFullName: fullName, Path: dest, Source: src}
-		if st, err := os.Stat(filepath.Join(dest, ".git")); err == nil && st != nil {
-			rc.SHA = gitRevParse(dest)
-			out = append(out, rc)
-			continue
+		// Already a no-.git agent tree — reuse.
+		if st, err := os.Stat(dest); err == nil && st.IsDir() {
+			if _, gerr := os.Stat(filepath.Join(dest, ".git")); gerr != nil {
+				if marker, _ := os.ReadFile(filepath.Join(dest, ".opa-related-sha")); len(marker) > 0 {
+					rc.SHA = strings.TrimSpace(string(marker))
+				}
+				out = append(out, rc)
+				continue
+			}
 		}
 		_ = os.RemoveAll(dest)
-		if err := shallowCloneRelated(c, fullName, dest); err != nil {
+		cloneDir := dest + ".gitclone"
+		_ = os.RemoveAll(cloneDir)
+		if err := shallowCloneRelated(c, fullName, cloneDir); err != nil {
 			rc.Error = truncateStr(err.Error(), 200)
 			out = append(out, rc)
 			continue
 		}
-		rc.SHA = gitRevParse(dest)
+		rc.SHA = gitRevParse(cloneDir)
+		if _, err := materializeTreeWithCheckoutIndex(cloneDir, dest); err != nil {
+			// Fail closed: never leave a .git tree for agent-visible related checkouts.
+			_ = os.RemoveAll(dest)
+			_ = os.RemoveAll(cloneDir)
+			rc.Error = truncateStr("materialize failed (refusing .git fallback): "+err.Error(), 200)
+			rc.Honesty = "related no-.git materialize failed — checkout omitted"
+			out = append(out, rc)
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(dest, ".git"))
+		_ = os.RemoveAll(cloneDir)
+		if rc.SHA != "" {
+			_ = os.WriteFile(filepath.Join(dest, ".opa-related-sha"), []byte(rc.SHA+"\n"), 0o644)
+		}
 		out = append(out, rc)
 	}
 	return out
@@ -226,7 +249,7 @@ func shallowCloneRelated(c *opaConnector, fullName, dest string) error {
 		_ = exec.Command("git", "-C", dest, "commit", "-m", "mock related", "--allow-empty").Run()
 		return nil
 	}
-	tok, err := githubAccessToken(c)
+	tok, err := githubAccessTokenFor(c, fullName, githubPermsCloneRead())
 	if err != nil {
 		return err
 	}
@@ -238,7 +261,13 @@ func shallowCloneRelated(c *opaConnector, fullName, dest string) error {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return err
 	}
-	cloneURL := fmt.Sprintf("https://github.com/%s.git", fullName)
+	if err := validateGitHubRepoFullName(fullName); err != nil {
+		return fmt.Errorf("related clone refused: %w", err)
+	}
+	cloneURL, err := githubHTTPSCloneURL(fullName)
+	if err != nil {
+		return err
+	}
 	cmd := exec.Command("git", "clone", "--depth", "50", "--single-branch", cloneURL, dest)
 	cmd.Env = askEnv
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -248,6 +277,12 @@ func shallowCloneRelated(c *opaConnector, fullName, dest string) error {
 }
 
 func formatRelatedCheckoutsForPrompt(related []relatedCheckout) string {
+	return formatRelatedCheckoutsForPromptWithJob(related, "")
+}
+
+// formatRelatedCheckoutsForPromptWithJob rewrites related paths to the docker
+// identity mount when agentJobID is set and OPA_JOB_SANDBOX=docker.
+func formatRelatedCheckoutsForPromptWithJob(related []relatedCheckout, agentJobID string) string {
 	ok := []relatedCheckout{}
 	for _, r := range related {
 		if r.Error == "" && r.Path != "" {
@@ -261,11 +296,18 @@ func formatRelatedCheckoutsForPrompt(related []relatedCheckout) string {
 	b.WriteString("## Related checkouts\n\n")
 	b.WriteString("Sibling clones for cross-repo context (read files here when contracts/APIs/shared packages matter). Findings must still cite paths in the **primary** PR checkout.\n\n")
 	for _, r := range ok {
+		path := r.Path
+		if sandboxMode() == "docker" && strings.TrimSpace(agentJobID) != "" {
+			path = relatedContainerPath(agentJobID, r.RepoFullName)
+		}
 		sha := r.SHA
 		if sha == "" {
 			sha = "—"
 		}
-		fmt.Fprintf(&b, "- `%s` → `%s` (sha `%s`, source=%s)\n", r.RepoFullName, r.Path, truncateStr(sha, 12), r.Source)
+		fmt.Fprintf(&b, "- `%s` → `%s` (sha `%s`, source=%s)\n", r.RepoFullName, path, truncateStr(sha, 12), r.Source)
+		if r.Honesty != "" {
+			fmt.Fprintf(&b, "  - honesty: %s\n", r.Honesty)
+		}
 	}
 	b.WriteString("\n")
 	return b.String()
@@ -295,11 +337,65 @@ func relatedCheckoutsFromJobSummary(job *scmJob) []relatedCheckout {
 				SHA:          strFromAny(m["sha"]),
 				Source:       strFromAny(m["source"]),
 				Error:        strFromAny(m["error"]),
+				Honesty:      strFromAny(m["honesty"]),
 			})
 		}
 		return out
 	}
 	return nil
+}
+
+// relatedCheckoutsForReview returns sibling clones for AI briefs. Prepare owns
+// related_checkouts under the run graph; bugbot children must read prepare
+// (or the early-mirrored parent) — packing only the child summary yields empty
+// related sections until finalize.
+func relatedCheckoutsForReview(job *scmJob) []relatedCheckout {
+	if job == nil {
+		return nil
+	}
+	if got := relatedCheckoutsFromJobSummary(job); len(got) > 0 {
+		return got
+	}
+	runID := nz(job.RunID, job.ID)
+	if prep := childByKind(runID, kindPrepare); prep != nil && prep.ID != job.ID {
+		if got := relatedCheckoutsFromJobSummary(prep); len(got) > 0 {
+			return got
+		}
+	}
+	if parent := getSCMJob(runID); parent != nil && parent.ID != job.ID {
+		if got := relatedCheckoutsFromJobSummary(parent); len(got) > 0 {
+			return got
+		}
+	}
+	return nil
+}
+
+// persistRelatedCheckoutsOnRun writes related_checkouts onto the acting job and
+// mirrors to prepare + parent so mid-review clones stay visible to siblings.
+func persistRelatedCheckoutsOnRun(job *scmJob, related []relatedCheckout) {
+	if job == nil {
+		return
+	}
+	names := relatedRepoNames(related)
+	write := func(j *scmJob) {
+		if j == nil {
+			return
+		}
+		if j.Summary == nil {
+			j.Summary = map[string]interface{}{}
+		}
+		j.Summary["related_checkouts"] = related
+		j.Summary["related_repos"] = names
+		persistSCMJob(j)
+	}
+	write(job)
+	runID := nz(job.RunID, job.ID)
+	if prep := childByKind(runID, kindPrepare); prep != nil && prep.ID != job.ID {
+		write(prep)
+	}
+	if parent := getSCMJob(runID); parent != nil && parent.ID != job.ID {
+		write(parent)
+	}
 }
 
 func relatedRepoNames(related []relatedCheckout) []string {

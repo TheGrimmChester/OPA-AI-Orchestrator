@@ -285,8 +285,7 @@ func handleSecurityRunCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 var (
-	securityScanMu   sync.Mutex
-	securityRunLive  sync.Map // id -> map[string]interface{}
+	securityRunLive sync.Map // id -> map[string]interface{}
 )
 
 func rememberSecurityRun(row map[string]interface{}) {
@@ -311,8 +310,9 @@ func liveSecurityRun(id string) map[string]interface{} {
 }
 
 func runSecurityScanJob(runID, org, proj, service, profile string, scanners []string, targetPath, image, repo string, pr int, sha, scmJob string) {
-	securityScanMu.Lock()
-	defer securityScanMu.Unlock()
+	// Concurrent scans are safe: live run rows use sync.Map (rememberSecurityRun);
+	// per-run secret tallies are keyed by runID and only touched from this job's
+	// goroutine. ClickHouse inserts are async. Do not serialize whole scans.
 
 	// When scanning a named repo/PR without an existing worktree target, materialize one.
 	if repo != "" && scanWorktreeEnforce() {
@@ -383,7 +383,7 @@ func runSecurityScanJob(runID, org, proj, service, profile string, scanners []st
 		switch s {
 		case "secrets":
 			var det string
-			n, det, e = scanSecrets(runID, org, proj, service, root)
+			n, det, e = scanSecrets(runID, org, proj, service, root, scmJob)
 			secretsDetector = det
 			sev, fp := takeSecretSeverityCounts(runID)
 			if len(sev) > 0 {

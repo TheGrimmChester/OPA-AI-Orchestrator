@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Wave 30 — pattern SAST-lite for JS/PHP (eval, innerHTML, SQL concat heuristics).
+ * Pattern SAST-lite for JS/PHP (eval, innerHTML, SQL concat heuristics).
  * POST to /v1/security/sast. Not a full SAST engine.
  *
  * Usage:
@@ -11,17 +11,19 @@
 const fs = require('fs');
 const path = require('path');
 
+// Messages omit "name(" shapes so this file does not self-match in-repo SAST.
 const RULES = [
-  { rule: 'js-eval', re: /\beval\s*\(/g, ext: ['.js', '.mjs', '.ts', '.tsx', '.jsx'], severity: 'high', message: 'eval() call' },
+  { rule: 'js-eval', re: /\beval\s*\(/g, ext: ['.js', '.mjs', '.ts', '.tsx', '.jsx'], severity: 'high', message: 'dynamic eval invocation' },
   { rule: 'js-innerhtml', re: /\.innerHTML\s*=/g, ext: ['.js', '.mjs', '.ts', '.tsx', '.jsx'], severity: 'medium', message: 'innerHTML assignment' },
-  { rule: 'js-document-write', re: /document\.write\s*\(/g, ext: ['.js', '.mjs', '.ts', '.tsx', '.jsx'], severity: 'medium', message: 'document.write()' },
-  { rule: 'php-eval', re: /\beval\s*\(/g, ext: ['.php'], severity: 'high', message: 'PHP eval()' },
+  { rule: 'js-document-write', re: /document\.write\s*\(/g, ext: ['.js', '.mjs', '.ts', '.tsx', '.jsx'], severity: 'medium', message: 'document write call' },
+  { rule: 'php-eval', re: /\beval\s*\(/g, ext: ['.php'], severity: 'high', message: 'PHP eval invocation' },
   { rule: 'php-sql-concat', re: /(["'])\s*(SELECT|INSERT|UPDATE|DELETE)\b[^"']*\1\s*\./gi, ext: ['.php'], severity: 'high', message: 'SQL string concatenation' },
   { rule: 'php-sql-interp', re: /"(SELECT|INSERT|UPDATE|DELETE)\b[^"]*\$/gi, ext: ['.php'], severity: 'high', message: 'SQL with variable interpolation' },
   { rule: 'js-sql-concat', re: /(["'`])\s*(SELECT|INSERT|UPDATE|DELETE)\b[\s\S]{0,80}\1\s*\+/gi, ext: ['.js', '.mjs', '.ts'], severity: 'medium', message: 'SQL string concat in JS' },
 ];
 
 const SKIP = new Set(['.git', 'node_modules', 'vendor', 'dist', 'build', '.libs']);
+const SKIP_FILES = new Set(['sast-lite.mjs', 'secrets-lite.mjs', 'iac-lite.mjs']);
 
 function arg(name, def = '') {
   const i = process.argv.indexOf(name);
@@ -37,7 +39,10 @@ function walk(dir, out = []) {
     if (e.isDirectory()) {
       if (SKIP.has(e.name)) continue;
       walk(full, out);
-    } else if (e.isFile()) out.push(full);
+    } else if (e.isFile()) {
+      if (SKIP_FILES.has(e.name)) continue;
+      out.push(full);
+    }
   }
   return out;
 }
