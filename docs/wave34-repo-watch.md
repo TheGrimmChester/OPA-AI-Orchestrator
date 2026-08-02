@@ -164,12 +164,18 @@ Legacy CI without Repo Watch can still call `harness/appsec-pr-check.sh` (tenant
 - `GET /api/connectors/{id}/pulls?repo=owner/name` — open PRs
 - `GET|PUT /api/connectors/{id}/watched`
 - `GET /api/scm/jobs` — live SCM jobs (`running` → `queued` → `waiting` first; `counts`/`total`; `limit` max 500). **running** = actively processing; **queued** = next to run (slot reserved / ready); **waiting** = backlog until a free slot or prior stack item. Stack drain keeps at most `OPA_REVIEW_STACK_CONCURRENCY` items in `queued`+`running`; extras stay `waiting`. Non-stack manual jobs stay `queued` until a process slot frees. Jobs + stacks persist under `$OPA_SCM_STATE_DIR` (default `$OPA_SECURITY_WORKSPACE/scm-state`) and ClickHouse; on Agent boot, stuck `running` jobs are recovered (`recovered_from_restart`), incomplete stacks resume drain, and **all non-stack `queued` jobs are re-dispatched** up to concurrency (enqueue-time goroutines do not survive recreate). Also `POST /api/scm/jobs/resume` (admin one-shot), `POST /api/scm/jobs/{id}/retry`, `POST /api/scm/jobs/{id}/cancel`, `POST /api/scm/jobs/{id}/ai-review`, `POST /api/scm/opa-review/stacks/{id}/cancel`
+- `GET /api/scm/webhooks` — GitHub delivery receipts (`outcome` queued/ignored/skipped/duplicate/ping/error; `counts`/`total`; org visibility like jobs). Dual-written to `$OPA_SCM_STATE_DIR/webhooks/*.json` + `opa.scm_webhooks`. Boot backfills synthetic rows from webhook-origin `scm_jobs` when live receipts were missing.
+- `GET /api/scm/webhooks/{id}` — receipt detail (+ related job when visible)
 - `POST /api/scm/ai-review` / `POST /api/scm/opa-review` — manual OPA Review enqueue
 - `POST /api/scm/opa-review/stack` (alias `/api/scm/ai-review/stack`) — multi repo×PR stack `{items, force?, ai_only?, preview_url?}` → `{stack_id, job_ids}` (absolute max **500**; over 40 soft-advises `"note": "large stack — items wait and run serially"`; extras stay `waiting` until a slot frees)
 - `GET /api/scm/opa-review/stacks/{id}` — stack progress (`waiting` | `queued` | `running` | `completed` | `failed`)
 - `OPA_REVIEW_STACK_CONCURRENCY` — parallel SCM jobs (default 1, max 4); drain promotes waiting → queued → running as slots free
 - Global OPA Review comment = narrative résumé only; line findings are inline; stack waiting semantics as above
-- `OPA_REVIEW_MCP_CONFIG` / `OPA_REVIEW_PREVIEW_URL` / `OPA_REVIEW_BROWSER_MCP` — MCP/browser for UI reviews
+- **UI visual MCP (required for UI diffs):** orchestrator image must ship Node.js (`node`/`npx`), Playwright Chromium + system libs, and set `OPA_REVIEW_BROWSER_DEPS_OK=1`. CLI already uses `--approve-mcps`. Env:
+  - `OPA_REVIEW_BROWSER_MCP` — `1` (default) enables browser MCP for UI-touched PRs; `0` disables
+  - `OPA_REVIEW_BROWSER_DEPS_OK` — must be `1` when Chromium/deps are provisioned (image default); otherwise visual MCP is skipped as unmet requirement
+  - `OPA_REVIEW_PREVIEW_URL` — optional preview URL for the agent to open
+  - `OPA_REVIEW_MCP_CONFIG` — optional path to extra `mcpServers` JSON merged into worktree `.cursor/mcp.json`
 - `GET|POST /api/scm/contexts`, `GET|PATCH|DELETE /api/scm/contexts/{id}`, `POST /api/scm/contexts/generate`
 - `PUT /api/scm/context-links`
 - `GET /api/scm/settings`, `POST /api/scm/settings/cursor-key` — `cursor_key_set` only; key AES-GCM in `opa.scm_secrets`

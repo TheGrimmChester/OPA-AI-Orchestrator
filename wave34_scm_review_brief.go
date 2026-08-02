@@ -38,6 +38,7 @@ Challenge assumptions. Hunt for: logic bugs, edge cases, regressions, security, 
 4. Require that tests prove the intended behavior.
 5. Résumé fields ("narrative", confidence, "human_review_priorities"): merge blockers only — not every finding. Optionally note the strongest aspect of the PR in one sentence inside "narrative".
 6. Sort findings by severity (blocker/high first). If no real issues: findings=[] and say why it looks safe.
+7. **Multi-pass / Auto-fix follow-up:** Recompute auto_merge_confidence for the *current* tree. Raise confidence and set verdict=approve when prior findings are gone and the change looks safe. Findings that disappeared will be closed on the PR; do not keep stale blockers in the résumé.
 `
 
 // Always-on method-optimization guidance; findings use rule "performance".

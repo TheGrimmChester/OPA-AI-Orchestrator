@@ -36,7 +36,7 @@ func scmJobsStateDir() string  { return filepath.Join(scmStateDir(), "jobs") }
 func scmStacksStateDir() string { return filepath.Join(scmStateDir(), "stacks") }
 
 func ensureSCMStateDirs() error {
-	for _, d := range []string{scmJobsStateDir(), scmStacksStateDir()} {
+	for _, d := range []string{scmJobsStateDir(), scmStacksStateDir(), scmWebhooksStateDir()} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return err
 		}
@@ -296,6 +296,20 @@ func scmJobFromCHRow(row map[string]interface{}) *scmJob {
 	if uid, _ := job.Summary["actor_user_id"].(string); strings.TrimSpace(uid) != "" {
 		job.ActorUserID = strings.TrimSpace(uid)
 	}
+	if k, _ := job.Summary["kind"].(string); strings.TrimSpace(k) != "" {
+		job.Kind = strings.TrimSpace(k)
+	}
+	if rid, _ := job.Summary["run_id"].(string); strings.TrimSpace(rid) != "" {
+		job.RunID = strings.TrimSpace(rid)
+	}
+	if pid, _ := job.Summary["parent_id"].(string); strings.TrimSpace(pid) != "" {
+		job.ParentID = strings.TrimSpace(pid)
+	}
+	if n, ok := job.Summary["attempt"].(float64); ok && int(n) > 0 {
+		job.Attempt = int(n)
+	} else if n, ok := job.Summary["attempt"].(int); ok && n > 0 {
+		job.Attempt = n
+	}
 	return job
 }
 
@@ -366,6 +380,8 @@ func hydrateSCMJobsAndStacksOnBoot() {
 	sc := hydrateSCMStacksFromCH()
 	log.Printf("[INFO] SCM job/stack hydrate: jobs file=%d ch=%d; stacks file=%d ch=%d; state_dir=%s",
 		nf, nc, sf, sc, scmStateDir())
+	rebuildSuccessfulAIReviewIndex()
+	hydrateSCMWebhooksOnBoot()
 	nRun, _ := recoverStuckRunningSCMJobs()
 	if nRun > 0 {
 		log.Printf("[INFO] SCM recovered %d stuck running job(s) after restart", nRun)

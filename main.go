@@ -3,16 +3,26 @@ package main
 import (
 	"log"
 	"net/http"
+	"os"
 	"time"
 )
 
 var (
-	queryClient *ClickHouseQuery
-	writer      *ClickHouseWriter
+	queryClient  *ClickHouseQuery
+	writer       *ClickHouseWriter
 	buildVersion = "orchestrator-dev"
 )
 
 func main() {
+	// Shared allowlist egress proxy (OPA_JOB_SANDBOX=docker). Runs as a separate
+	// container from the opa-egress-proxy image / this binary's egress-proxy mode.
+	if len(os.Args) >= 2 && os.Args[1] == "egress-proxy" {
+		if err := runEgressProxyCLI(os.Args[2:]); err != nil {
+			log.Fatalf("egress-proxy: %v", err)
+		}
+		return
+	}
+
 	addr := envOr("HTTP_ADDR", ":8091")
 	chURL := envOr("CLICKHOUSE_URL", "http://127.0.0.1:8123")
 
@@ -54,12 +64,14 @@ func main() {
 	registerWave33Mux(mux, authView, authAdmin)
 	registerWave34Mux(mux, authView, authAdmin)
 	registerAIMux(mux, authView, authAdmin)
+	registerWave35PrefsMux(mux, authView, authAdmin)
 	loadAISettingsFromFileOnBoot()
 
 	go func() {
 		// Give CH a moment, then hydrate SCM state (PATs, jobs, stacks).
 		time.Sleep(2 * time.Second)
 		hydrateSCMOnBoot()
+		bootSandboxMaintenance()
 		loadAISettingsFromFileOnBoot()
 	}()
 

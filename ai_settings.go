@@ -673,7 +673,17 @@ func handleAISettingsPut(w http.ResponseWriter, r *http.Request) {
 			doc.CLICursor.Model = strings.TrimSpace(body.CLICursor.Model)
 		}
 		if body.CLICursor.Bin != "" {
-			doc.CLICursor.Bin = strings.TrimSpace(body.CLICursor.Bin)
+			bin := strings.TrimSpace(body.CLICursor.Bin)
+			role := strings.TrimSpace(r.Header.Get("X-User-Role"))
+			if authEnforced && !hasPermission(role, "admin") {
+				http.Error(w, "forbidden: cli_cursor.bin requires admin", 403)
+				return
+			}
+			if err := validateAgentBin(bin); err != nil {
+				http.Error(w, "invalid cli_cursor.bin: "+err.Error(), 400)
+				return
+			}
+			doc.CLICursor.Bin = bin
 		}
 		if body.CLICursor.Force != nil {
 			doc.CLICursor.Force = *body.CLICursor.Force

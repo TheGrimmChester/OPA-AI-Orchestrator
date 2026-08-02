@@ -92,15 +92,48 @@ func TestInferLegacyScope(t *testing.T) {
 	}
 }
 
-func TestSCMSecretStorageKey(t *testing.T) {
-	if got := scmSecretStorageKey("cursor_api_key", credScopeAdmin, ""); got != "cursor_api_key#admin" {
-		t.Fatalf("admin key: %q", got)
+func TestCanSeeSCMJob(t *testing.T) {
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+
+	adminAll := credActor{Username: "root", Role: "admin", OrganizationID: ""}
+	adminNas := credActor{Username: "root", Role: "admin", OrganizationID: "nas"}
+	memberAll := credActor{Username: "alice", Role: "viewer", OrganizationID: ""}
+	memberNas := credActor{Username: "alice", Role: "viewer", OrganizationID: "nas"}
+
+	nasJob := &scmJob{ID: "1", OrganizationID: "nas", ActorUserID: "alice"}
+	defJob := &scmJob{ID: "2", OrganizationID: "default-org", ActorUserID: "bob"}
+	ownDef := &scmJob{ID: "3", OrganizationID: "default-org", ActorUserID: "alice"}
+	legacy := &scmJob{ID: "4", OrganizationID: "", ActorUserID: ""}
+
+	if !canSeeSCMJob(adminAll, nasJob) || !canSeeSCMJob(adminAll, defJob) {
+		t.Fatal("admin with All should see every org")
 	}
-	if got := scmSecretStorageKey("cursor_api_key", credScopeUser, "alice"); got != "cursor_api_key#user:alice" {
-		t.Fatalf("user key: %q", got)
+	if canSeeSCMJob(adminNas, defJob) {
+		t.Fatal("admin scoped to nas must not see default-org")
 	}
-	logical, scope, uid := parseSCMSecretStorageKey("cursor_api_key#user:alice")
-	if logical != "cursor_api_key" || scope != credScopeUser || uid != "alice" {
-		t.Fatalf("parse user: %q %q %q", logical, scope, uid)
+	if !canSeeSCMJob(adminNas, nasJob) {
+		t.Fatal("admin scoped to nas should see nas")
+	}
+	if canSeeSCMJob(memberAll, defJob) {
+		t.Fatal("member with All must not see others' jobs")
+	}
+	if !canSeeSCMJob(memberAll, ownDef) {
+		t.Fatal("member with All should see own queued jobs")
+	}
+	if !canSeeSCMJob(memberNas, nasJob) {
+		t.Fatal("member in nas should see nas jobs")
+	}
+	if canSeeSCMJob(memberNas, ownDef) {
+		t.Fatal("member in nas must not see default-org even if own actor")
+	}
+	// Legacy empty org counts as default-org when default-org selected.
+	if !canSeeSCMJob(credActor{Username: "x", Role: "viewer", OrganizationID: defaultOrgID}, legacy) {
+		t.Fatal("legacy empty org should match default-org filter")
+	}
+	authEnforced = false
+	if !canSeeSCMJob(credActor{OrganizationID: ""}, nasJob) {
+		t.Fatal("auth off + All should see all")
 	}
 }

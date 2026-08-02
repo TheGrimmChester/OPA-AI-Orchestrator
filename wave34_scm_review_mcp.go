@@ -19,8 +19,14 @@ type reviewMCPPlan struct {
 	VisualWhy      string   `json:"visual_why"`
 }
 
-// prepareOPAReviewMCP writes .cursor/mcp.json into the worktree (or copies
-// OPA_REVIEW_MCP_CONFIG) and reports whether browser visual validation can run.
+// mcpServerAllowlist is the only set of server names mergeable from
+// OPA_REVIEW_MCP_CONFIG. Anything else is dropped.
+var mcpServerAllowlist = map[string]bool{
+	"browser": true,
+}
+
+// prepareOPAReviewMCP writes mcp.json to a host-owned overlay (never into the
+// attacker-writable checkout) and reports whether browser visual validation can run.
 // Product copy never names the underlying agent vendor.
 func prepareOPAReviewMCP(checkoutRoot string, uiTouched bool, previewURL string) reviewMCPPlan {
 	plan := reviewMCPPlan{
@@ -45,6 +51,10 @@ func prepareOPAReviewMCP(checkoutRoot string, uiTouched bool, previewURL string)
 			}
 			if json.Unmarshal(raw, &base) == nil && len(base.MCPServers) > 0 {
 				for k, v := range base.MCPServers {
+					if !mcpServerAllowlist[k] {
+						LogWarn("prepareOPAReviewMCP: dropped non-allowlisted MCP server", map[string]interface{}{"name": k})
+						continue
+					}
 					servers[k] = v
 				}
 			}
@@ -56,9 +66,10 @@ func prepareOPAReviewMCP(checkoutRoot string, uiTouched bool, previewURL string)
 	if browserWanted {
 		if browserReady {
 			if _, exists := servers["browser"]; !exists {
+				// Pin the package version — never @latest at runtime.
 				servers["browser"] = map[string]interface{}{
 					"command": "npx",
-					"args":    []string{"-y", "@playwright/mcp@latest", "--headless"},
+					"args":    []string{"-y", "@playwright/mcp@0.0.39", "--headless"},
 				}
 			}
 			plan.BrowserEnabled = true
@@ -79,22 +90,18 @@ func prepareOPAReviewMCP(checkoutRoot string, uiTouched bool, previewURL string)
 	}
 
 	if len(servers) == 0 {
-		// Still create an empty mcp.json so the CLI has a predictable project config.
 		servers = map[string]interface{}{}
 	}
 	for name := range servers {
 		plan.Servers = append(plan.Servers, name)
 	}
 
-	cursorDir := filepath.Join(checkoutRoot, ".cursor")
-	_ = os.MkdirAll(cursorDir, 0o755)
-	outPath := filepath.Join(cursorDir, "mcp.json")
-	payload, _ := json.MarshalIndent(map[string]interface{}{"mcpServers": servers}, "", "  ")
-	if err := os.WriteFile(outPath, payload, 0o644); err != nil {
+	outPath, err := writeReviewMCPOverlay(checkoutRoot, servers)
+	if err != nil {
 		if plan.BrowserEnabled {
 			plan.BrowserEnabled = false
 			plan.VisualStatus = "skipped"
-			plan.VisualWhy = "visual MCP unavailable — could not write .cursor/mcp.json: " + err.Error()
+			plan.VisualWhy = "visual MCP unavailable — could not write mcp overlay: " + err.Error()
 		}
 		return plan
 	}
@@ -102,22 +109,63 @@ func prepareOPAReviewMCP(checkoutRoot string, uiTouched bool, previewURL string)
 	return plan
 }
 
+// writeReviewMCPOverlay writes mcp.json under scm-state, never into the PR tree.
+// A checkout whose .cursor is a symlink to scm-state must not be able to capture
+// ai-settings.json via TOCTOU on MkdirAll/WriteFile inside the worktree.
+func writeReviewMCPOverlay(checkoutRoot string, servers map[string]interface{}) (string, error) {
+	// Refuse to write through a symlinked .cursor in the checkout (defense in depth
+	// even though we no longer write there).
+	if checkoutRoot != "" {
+		cursorDir := filepath.Join(checkoutRoot, ".cursor")
+		if fi, err := os.Lstat(cursorDir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			LogWarn("prepareOPAReviewMCP: refusing checkout .cursor symlink", map[string]interface{}{
+				"path": cursorDir,
+			})
+		}
+	}
+
+	key := strings.ReplaceAll(strings.TrimSpace(checkoutRoot), string(os.PathSeparator), "_")
+	if key == "" {
+		key = "default"
+	}
+	if len(key) > 80 {
+		key = key[len(key)-80:]
+	}
+	overlayDir := filepath.Join(scmStateDir(), "mcp-overlay", key, ".cursor")
+	if err := os.MkdirAll(overlayDir, 0o700); err != nil {
+		return "", err
+	}
+	outPath := filepath.Join(overlayDir, "mcp.json")
+	payload, err := json.MarshalIndent(map[string]interface{}{"mcpServers": servers}, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	tmp := outPath + ".tmp"
+	if err := os.WriteFile(tmp, payload, 0o600); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, outPath); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	return outPath, nil
+}
+
 func probeBrowserMCPReady() (bool, string) {
 	if envOr("OPA_REVIEW_BROWSER_MCP", "1") == "0" {
 		return false, "OPA_REVIEW_BROWSER_MCP=0"
 	}
 	if _, err := exec.LookPath("npx"); err != nil {
-		return false, "npx not on PATH (install Node.js in the Agent image, or mount OPA_REVIEW_MCP_CONFIG)"
+		return false, "required missing: npx not on PATH (orchestrator image must include Node.js)"
 	}
 	if _, err := exec.LookPath("node"); err != nil {
-		return false, "node not on PATH"
+		return false, "required missing: node not on PATH"
 	}
-	// Playwright browsers are optional at probe time; @playwright/mcp downloads on first use
-	// when network is allowed. Headless Chromium deps may still be missing in slim images.
-	if envOr("OPA_REVIEW_BROWSER_DEPS_OK", "") == "0" {
-		return false, "OPA_REVIEW_BROWSER_DEPS_OK=0 (Chromium/system libs not provisioned)"
+	// Image must ship Chromium + system libs and set this to 1 (see Dockerfile).
+	if envOr("OPA_REVIEW_BROWSER_DEPS_OK", "0") != "1" {
+		return false, "required missing: OPA_REVIEW_BROWSER_DEPS_OK=1 (Playwright Chromium/system libs not provisioned)"
 	}
-	return true, "npx+node present"
+	return true, "node+npx+browser deps ready"
 }
 
 func formatVisualValidationLine(plan reviewMCPPlan) string {

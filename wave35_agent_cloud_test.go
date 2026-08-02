@@ -1,0 +1,141 @@
+package main
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func initTempGitRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "HOME="+dir)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, out)
+		}
+	}
+	run("init")
+	run("config", "user.email", "opa@test")
+	run("config", "user.name", "OPA Test")
+	if err := os.WriteFile(filepath.Join(dir, "readme.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "readme.txt")
+	run("commit", "-m", "init")
+	return dir
+}
+
+func TestCaptureAndApplyValidatedPatchCleanTree(t *testing.T) {
+	sandbox := initTempGitRepo(t)
+	clean := initTempGitRepo(t)
+
+	// Agent-like edit in sandbox only (poison file must not appear unless in patch).
+	if err := os.WriteFile(filepath.Join(sandbox, "fix.go"), []byte("package fix\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sandbox, "evil.txt"), []byte("should be in patch if staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	patch, err := captureValidatedPatch(sandbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(patch, "fix.go") {
+		t.Fatalf("patch missing fix.go: %s", patch)
+	}
+
+	// Mutate sandbox after capture — land must not see this.
+	_ = os.WriteFile(filepath.Join(sandbox, "post-gate-poison.go"), []byte("package poison\n"), 0o644)
+
+	if err := applyValidatedPatch(clean, patch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(clean, "fix.go")); err != nil {
+		t.Fatal("clean tree missing applied fix.go")
+	}
+	if _, err := os.Stat(filepath.Join(clean, "post-gate-poison.go")); err == nil {
+		t.Fatal("poison file from post-gate sandbox must not appear on clean tree")
+	}
+	if _, err := os.Stat(filepath.Join(clean, "evil.txt")); err != nil {
+		t.Fatal("evil.txt was in validated patch and should land")
+	}
+
+	sha, err := gitCommitAll(clean, "test land")
+	if err != nil || sha == "" {
+		t.Fatalf("commit clean tree: %v sha=%s", err, sha)
+	}
+}
+
+func TestGateDeniesBeforeCleanLand(t *testing.T) {
+	sandbox := initTempGitRepo(t)
+	_ = os.MkdirAll(filepath.Join(sandbox, ".github", "workflows"), 0o755)
+	_ = os.WriteFile(filepath.Join(sandbox, ".github", "workflows", "ci.yml"), []byte("on: push\n"), 0o644)
+	diff, err := gitUnifiedDiff(sandbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = gateCloudDiff(parseCloudDiffChanges(diff), nil, defaultCloudDiffCaps())
+	if err == nil || !strings.Contains(err.Error(), ".github") {
+		t.Fatalf("want .github deny, got %v", err)
+	}
+}
+
+func TestCloudMaxIterationsBound(t *testing.T) {
+	t.Setenv("OPA_CLOUD_MAX_ITERATIONS", "99")
+	if cloudMaxIterations() != 3 {
+		t.Fatalf("cap at 3, got %d", cloudMaxIterations())
+	}
+	t.Setenv("OPA_CLOUD_MAX_ITERATIONS", "0")
+	if cloudMaxIterations() != 1 {
+		t.Fatalf("floor at 1, got %d", cloudMaxIterations())
+	}
+	t.Setenv("OPA_CLOUD_MAX_ITERATIONS", "2")
+	if cloudMaxIterations() != 2 {
+		t.Fatalf("want 2 got %d", cloudMaxIterations())
+	}
+}
+
+func TestCloudIterationStopsOnGateDenied(t *testing.T) {
+	// Simulate the stop decision used by runCloudStages.
+	attemptOut := map[string]interface{}{
+		"status":  "gate_denied",
+		"honesty": "gateCloudDiff denied: .github/** denied",
+	}
+	status := strFromAny(attemptOut["status"])
+	stop := status == "gate_denied" || strings.Contains(strFromAny(attemptOut["honesty"]), "gateCloudDiff")
+	if !stop {
+		t.Fatal("gate_denied must stop iteration loop")
+	}
+	verifyFail := map[string]interface{}{"status": "verify_failed"}
+	if strFromAny(verifyFail["status"]) == "gate_denied" {
+		t.Fatal("verify_failed must not be treated as gate stop")
+	}
+}
+
+func TestAuthorizeReauthSkipsRate(t *testing.T) {
+	repo := "acme/reauth-rate"
+	conn := &opaConnector{ID: "conn-reauth", Kind: "github_app", InstallationID: "9", Status: "active"}
+	watchedLive.Store(conn.ID+"|"+repo, &opaWatchedRepo{ConnectorID: conn.ID, RepoFullName: repo})
+	defer watchedLive.Delete(conn.ID + "|" + repo)
+	ledger := []agentFinding{{Key: "k1", Severity: "high", File: "a.go", Message: "x"}}
+	prefs := agentPrefs{CloudEnabled: true, AutofixMode: "branch", AutofixSeverityThreshold: "high"}
+
+	if _, err := authorizeAutofixRequestAttempt(conn, prefs, repo, ledger, []string{"k1"}, true); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < autofixRateLimitMax()+2; i++ {
+		recordAutofixRate(repo)
+	}
+	if _, err := authorizeAutofixRequestAttempt(conn, prefs, repo, ledger, []string{"k1"}, false); err != nil {
+		t.Fatalf("re-auth without rate should pass: %v", err)
+	}
+	if _, err := authorizeAutofixRequestAttempt(conn, prefs, repo, ledger, []string{"k1"}, true); err == nil {
+		t.Fatal("recording auth should hit rate limit")
+	}
+}
