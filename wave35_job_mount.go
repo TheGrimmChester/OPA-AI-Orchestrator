@@ -7,31 +7,44 @@ import (
 	"strings"
 )
 
-// assertJobBindPath prefers the identity layout /opa-jobs/<id>/… so prompts and
-// container mounts agree when OPA_REVIEW_TMP=/opa-jobs.
+// assertJobBindPath requires hostAbs under this job's identity root only —
+// /opa-jobs/<id>/… or OPA_REVIEW_TMP/<id>/… (including related/). Soft-accepting
+// any path under OPA_REVIEW_TMP allowed cross-job binds.
 func assertJobBindPath(hostAbs, jobID string) error {
 	hostAbs = filepath.Clean(hostAbs)
 	if !filepath.IsAbs(hostAbs) {
 		return fmt.Errorf("bind path must be absolute")
 	}
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return fmt.Errorf("bind path requires job id")
+	}
 	id := sanitizeDockerName(jobID)
 	wantPrefix := filepath.Join(opaJobsContainerRoot, id)
-	// On the host the same identity path may be used when compose sets
-	// OPA_REVIEW_TMP=/opa-jobs.
-	if strings.HasPrefix(hostAbs, wantPrefix+string(os.PathSeparator)) || hostAbs == wantPrefix {
+	if pathUnder(hostAbs, wantPrefix) {
 		return nil
 	}
-	// Also accept OPA_REVIEW_TMP/{id}/primary layout (legacy + current default).
 	tmp := opaReviewTmpRoot()
-	legacy := filepath.Join(tmp, jobID)
-	if strings.HasPrefix(hostAbs, legacy+string(os.PathSeparator)) || hostAbs == legacy {
-		return nil
+	for _, leaf := range []string{jobID, id} {
+		if leaf == "" {
+			continue
+		}
+		legacy := filepath.Join(tmp, leaf)
+		if pathUnder(hostAbs, legacy) {
+			return nil
+		}
 	}
-	// Soft accept: any path under OPA_REVIEW_TMP (related checkouts, etc.).
-	if underOPAReviewTmp(hostAbs) {
-		return nil
+	return fmt.Errorf("bind path %s is outside identity layout (%s or %s/<id>)", hostAbs, wantPrefix, tmp)
+}
+
+func pathUnder(abs, root string) bool {
+	root = filepath.Clean(root)
+	abs = filepath.Clean(abs)
+	if abs == root {
+		return true
 	}
-	return fmt.Errorf("bind path %s is outside identity layout (%s or %s)", hostAbs, wantPrefix, legacy)
+	prefix := root + string(os.PathSeparator)
+	return strings.HasPrefix(abs, prefix)
 }
 
 func jobIdentityHostRoot(jobID string) string {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -34,6 +35,8 @@ type sandboxExecSpec struct {
 	// one-shot tools like gitleaks. OutHostDir is bind-mounted at /out (rw).
 	Ephemeral  bool
 	OutHostDir string
+	// NameSuffix disambiguates concurrent same-phase boxes; empty → random.
+	NameSuffix string
 }
 
 func getSandboxRunner() jobSandboxRunner {
@@ -94,9 +97,7 @@ func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([
 		return nil, fmt.Errorf("HostWorkDir must be absolute")
 	}
 	if err := assertJobBindPath(hostDir, jobID); err != nil {
-		if !underOPAReviewTmp(hostDir) && !strings.Contains(hostDir, "/opa-jobs/") {
-			return nil, err
-		}
+		return nil, err
 	}
 
 	envSpec := jobEnvSpec{
@@ -126,7 +127,7 @@ func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([
 	}
 	defer cleanup()
 
-	name := "opa-job-" + sanitizeDockerName(jobID) + "-" + string(spec.Phase)
+	name := sandboxContainerName(jobID, spec.Phase, spec.NameSuffix)
 	_ = dockerRmForce(ctx, name)
 
 	extraBinds := []string{}
@@ -171,11 +172,13 @@ func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([
 	defer func() { _ = dockerRmForce(context.Background(), name) }()
 
 	execArgv := []string{"exec"}
-	for k, v := range spec.Secrets {
-		if strings.TrimSpace(v) == "" {
-			continue
-		}
-		execArgv = append(execArgv, "--env", k+"="+v)
+	secFile, secCleanup, secErr := writeSandboxSecretsEnvFile(spec.Secrets)
+	if secErr != nil {
+		return nil, secErr
+	}
+	defer secCleanup()
+	if secFile != "" {
+		execArgv = append(execArgv, "--env-file", secFile)
 	}
 	execArgv = append(execArgv, name)
 	execArgv = append(execArgv, spec.Argv...)
@@ -292,6 +295,62 @@ func writeSandboxEnvFile(env []string) (path string, cleanup func(), err error) 
 	}
 	_ = f.Close()
 	return path, cleanup, nil
+}
+
+// writeSandboxSecretsEnvFile writes ONLY explicit secrets for `docker exec
+// --env-file` so values never appear on the orchestrator process argv.
+func writeSandboxSecretsEnvFile(secrets map[string]string) (path string, cleanup func(), err error) {
+	if len(secrets) == 0 {
+		return "", func() {}, nil
+	}
+	lines := make([]string, 0, len(secrets))
+	for k, v := range secrets {
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if k == "" || v == "" {
+			continue
+		}
+		if strings.ContainsAny(k, "=\n\r") || strings.ContainsAny(v, "\n\r") {
+			return "", func() {}, fmt.Errorf("secret env line contains illegal characters")
+		}
+		lines = append(lines, k+"="+v)
+	}
+	if len(lines) == 0 {
+		return "", func() {}, nil
+	}
+	sort.Strings(lines)
+	return writeSandboxEnvFileRaw(lines)
+}
+
+// writeSandboxEnvFileRaw writes KEY=VAL lines as-is (caller already filtered).
+func writeSandboxEnvFileRaw(lines []string) (path string, cleanup func(), err error) {
+	f, err := os.CreateTemp("", "opa-job-sec-*.env")
+	if err != nil {
+		return "", func() {}, err
+	}
+	path = f.Name()
+	cleanup = func() { _ = os.Remove(path) }
+	_ = os.Chmod(path, 0o600)
+	var b strings.Builder
+	for _, line := range lines {
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	if _, err := f.WriteString(b.String()); err != nil {
+		_ = f.Close()
+		cleanup()
+		return "", func() {}, err
+	}
+	_ = f.Close()
+	return path, cleanup, nil
+}
+
+func sandboxContainerName(jobID string, phase jobPhase, suffix string) string {
+	suf := strings.TrimSpace(suffix)
+	if suf == "" {
+		suf = newRandomHex(6)
+	}
+	return "opa-job-" + sanitizeDockerName(jobID) + "-" + string(phase) + "-" + sanitizeDockerName(suf)
 }
 
 func containerWorkPath(jobID, rel string) string {

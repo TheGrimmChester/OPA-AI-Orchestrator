@@ -113,7 +113,7 @@ func teardownCheckupJobContainers(ctx context.Context, jobID string) error {
 	for _, id := range strings.Fields(string(out)) {
 		nameOut, _ := dockerCmd(ctx, "inspect", "-f", "{{.Name}}", id)
 		name := strings.TrimPrefix(strings.TrimSpace(string(nameOut)), "/")
-		if strings.HasSuffix(name, "-checkup") || strings.Contains(name, "-svc-") {
+		if strings.Contains(name, "-checkup") || strings.Contains(name, "-svc-") {
 			_, _ = dockerCmd(ctx, "rm", "-fv", id)
 		}
 	}

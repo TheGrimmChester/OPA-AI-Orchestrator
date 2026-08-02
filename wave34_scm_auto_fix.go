@@ -444,7 +444,7 @@ func runOPAAutoFix(parent *scmJob, conn *opaConnector, fix *opaAutoFixJob) (*opa
 			fix.Status = "skipped"
 		}
 	} else {
-		if err := runAutoFixAgent(parent, absRoot, fix); err != nil {
+		if err := runAutoFixAgent(parent, absRoot, wtID, fix); err != nil {
 			fix.Status = "failed"
 			fix.Error = "agent: " + err.Error()
 			fix.Honesty = "Auto-fix agent failed"
@@ -629,16 +629,15 @@ func buildAutoFixPRBody(parent *scmJob, fix *opaAutoFixJob) string {
 	return b.String()
 }
 
-func runAutoFixAgent(parent *scmJob, checkoutRoot string, fix *opaAutoFixJob) error {
+func runAutoFixAgent(parent *scmJob, checkoutRoot, worktreeID string, fix *opaAutoFixJob) error {
 	key, agentBin, model, force := resolveCLICursorConfig(parent.OrganizationID, parent.ProjectID, parent.ActorUserID)
 	if key == "" {
 		return fmt.Errorf("CLI agent API key not set — save one under Account (personal or org)")
 	}
 	brief := packAutoFixBrief(parent, checkoutRoot, fix)
-	jobLabel := ""
+	jobLabel := resolveSandboxJobID(worktreeID, checkoutRoot)
 	cancelID := ""
 	if parent != nil {
-		jobLabel = nz(parent.RunID, parent.ID)
 		cancelID = parent.ID
 	}
 	promptPath, cleanupBrief, errBrief := writeAgentBrief(checkoutRoot, jobLabel, fmt.Sprintf("opa-autofix-%s.md", fix.ID), brief)
