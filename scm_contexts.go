@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// Wave 34 — per-repo reviewer contexts + link groups for multi-context AI packs.
+// Repo watch — per-repo reviewer contexts + link groups for multi-context AI packs.
 
 const (
 	reviewCtxPrimaryCap = 8000

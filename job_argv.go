@@ -91,8 +91,10 @@ func buildDockerRunArgv(spec dockerRunSpec) ([]string, error) {
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges",
 		"--read-only",
-		"--tmpfs", "/tmp:rw,nosuid,nodev,size=512m",
-		"--tmpfs", "/home/opa:rw,nosuid,nodev,size=128m",
+		// uid/gid required: default tmpfs is root:root 0755, so UID 65532 cannot
+		// mkdir under /home/opa (Cursor CLI → EACCES on ~/.cursor/projects/…).
+		"--tmpfs", "/tmp:rw,nosuid,nodev,uid=65532,gid=65532,mode=1777,size=1g",
+		"--tmpfs", "/home/opa:rw,nosuid,nodev,uid=65532,gid=65532,mode=1777,size=256m",
 		"--pids-limit", strconv.Itoa(pids),
 		"--memory", mem,
 		"--memory-swap", mem, // equal ⇒ swap disabled

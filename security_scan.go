@@ -18,7 +18,7 @@ import (
 //go:embed gitleaks.toml
 var embeddedGitleaksConfig []byte
 
-// Embedded lite/stub scanners for Wave 33 security runs (honesty: not full engines).
+// Embedded lite/stub scanners for Security runs (honesty: not full engines).
 
 var secretPatterns = []struct {
 	rule     string
@@ -273,7 +273,16 @@ func gitleaksSeverity(ruleID string) string {
 
 // isLikelySecretFalsePositive filters common UI FPs (object keys named key, React
 // key= props) that gitleaks generic-api-key still emits after config allowlists.
+// Also skips Go unit-test / testdata fixtures that intentionally embed example
+// credentials (e.g. AKIA… mask tests) — those are not production secrets.
 func isLikelySecretFalsePositive(rule, file, match, secret string) bool {
+	file = filepath.ToSlash(strings.TrimSpace(file))
+	base := filepath.Base(file)
+	if strings.HasSuffix(base, "_test.go") ||
+		strings.Contains(file, "/testdata/") ||
+		strings.HasPrefix(base, "mock_") {
+		return true
+	}
 	rule = strings.ToLower(strings.TrimSpace(rule))
 	if rule != "generic-api-key" && !strings.Contains(rule, "generic") {
 		return false

@@ -182,6 +182,12 @@ func sandboxMode() string {
 // executes inside review/autofix profiles. Precedence: OPA_CURSOR_AGENT_BIN
 // (allowlisted) → baked /opt/opa/agent → "agent" on PATH.
 func resolveAgentBin() string {
+	// Docker job boxes bake the agent at /opt/opa/agent. Host OPA_CURSOR_AGENT_BIN
+	// (often /usr/local/bin/agent on the orchestrator image) must not be copied
+	// into argv — that path does not exist inside opa-runner-ai.
+	if sandboxMode() == "docker" {
+		return "/opt/opa/agent"
+	}
 	if b := strings.TrimSpace(os.Getenv("OPA_CURSOR_AGENT_BIN")); b != "" {
 		if err := validateAgentBin(b); err == nil {
 			return b

@@ -2,14 +2,15 @@ package main
 
 import "strings"
 
-// scmRunSkipGate is the shared prologue skip logic for legacy and run-graph paths.
+// scmRunSkipGate is the shared prologue skip logic for run-graph and continuous paths.
 // Returns skip=true with a reason (and optional prior reviewed job id).
 func scmRunSkipGate(job *scmJob) (skip bool, reason, priorID string) {
 	if job == nil {
 		return true, "missing job", ""
 	}
-	// Defense-in-depth: never start AppSec/AI on an already-merged PR.
-	if shouldSkipSCMJobForMergedPR(job) {
+	// Defense-in-depth: never start AppSec/AI on an already-merged PR —
+	// unless ForceAI (explicit Retry / manual re-pass from the dashboard).
+	if !job.ForceAI && shouldSkipSCMJobForMergedPR(job) {
 		return true, "pull request is already merged", ""
 	}
 	if prior, ok := shouldSkipSCMJobForAlreadyReviewed(job); ok {
@@ -18,16 +19,9 @@ func scmRunSkipGate(job *scmJob) (skip bool, reason, priorID string) {
 	return false, "", ""
 }
 
-func agentsRunGraphEnabled() bool {
-	return envOr("OPA_AGENTS_RUN_GRAPH", "1") != "0"
-}
-
 // shouldEnqueuePRRun reports whether a new job should be a kind=run parent with
-// agent children. Stacks and non-PR continuous events stay on the legacy path.
+// agent children. Push/cron continuous events stay on the continuous path.
 func shouldEnqueuePRRun(event string, pr int) bool {
-	if !agentsRunGraphEnabled() {
-		return false
-	}
 	ev := strings.ToLower(strings.TrimSpace(event))
 	if strings.HasPrefix(ev, "push.") || strings.HasPrefix(ev, "cron.") {
 		return false

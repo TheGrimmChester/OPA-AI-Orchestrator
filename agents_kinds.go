@@ -14,14 +14,14 @@ import (
 type agentKind string
 
 const (
-	kindLegacy   agentKind = "" // pre-split row → processLegacySCMJob
-	kindRun      agentKind = "run"
-	kindPrepare  agentKind = "prepare"
-	kindSecurity agentKind = "security"
-	kindBugbot   agentKind = "bugbot"
-	kindApproval agentKind = "approval"
-	kindCloud    agentKind = "cloud"
-	kindCheckup  agentKind = "checkup"
+	kindContinuous agentKind = "continuous" // push/cron monolithic scan+review
+	kindRun        agentKind = "run"
+	kindPrepare    agentKind = "prepare"
+	kindSecurity   agentKind = "security"
+	kindBugbot     agentKind = "bugbot"
+	kindApproval   agentKind = "approval"
+	kindCloud      agentKind = "cloud"
+	kindCheckup    agentKind = "checkup"
 )
 
 var agentDependsOn = map[agentKind][]agentKind{

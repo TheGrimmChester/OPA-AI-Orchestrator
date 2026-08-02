@@ -1,4 +1,4 @@
-# OPA AI Orchestrator — Wave 33 runs + Wave 34 SCM / OPA Review
+# OPA AI Orchestrator — Security runs + Repo Watch / OPA Review
 FROM golang:1.25-alpine AS builder
 RUN apk --no-cache add git ca-certificates
 WORKDIR /app
@@ -115,8 +115,14 @@ RUN apt-get update \
  && mkdir -p /opt/opa /opt/ms-playwright /home/opa \
  && (NO_COLOR=1 curl -fsS https://cursor.com/install | bash \
       && test -x /root/.local/bin/agent \
-      && cp -a /root/.local/bin/agent /opt/opa/agent \
-      && cp -a /root/.local/bin/cursor-agent /opt/opa/cursor-agent 2>/dev/null || true \
+      && AGENT_REAL="$(readlink -f /root/.local/bin/agent)" \
+      && test -n "$AGENT_REAL" && test -x "$AGENT_REAL" \
+      && AGENT_DIR="$(dirname "$AGENT_REAL")" \
+      && rm -rf /opt/opa/cursor-agent-dist \
+      && cp -a "$AGENT_DIR" /opt/opa/cursor-agent-dist \
+      && ln -sfn /opt/opa/cursor-agent-dist/$(basename "$AGENT_REAL") /opt/opa/agent \
+      && ln -sfn /opt/opa/agent /opt/opa/cursor-agent \
+      && chmod -R a+rX /opt/opa/cursor-agent-dist \
       && chmod 0755 /opt/opa/agent \
       && test -x /opt/opa/agent) \
  || (echo "ERROR: Cursor Agent CLI required for opa-runner-ai" >&2; exit 1) \
@@ -126,7 +132,9 @@ RUN apt-get update \
       npx --yes "playwright@${PLAYWRIGHT_VERSION}" install chromium \
  && npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" \
  && chown -R 65532:65532 /home/opa /opt/ms-playwright \
- && rm -rf /root/.npm /tmp/* /root/.local
+ && rm -rf /root/.npm /tmp/* /root/.local \
+ && test -x /opt/opa/agent \
+ && /opt/opa/agent --help >/dev/null 2>&1 || /opt/opa/agent --version >/dev/null 2>&1 || true
 ENV PATH="/opt/opa:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
     NO_OPEN_BROWSER=1 \

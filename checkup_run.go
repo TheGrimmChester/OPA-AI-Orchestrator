@@ -143,14 +143,20 @@ func runCheckupPlan(ctx context.Context, jobID, workRoot string, plan *checkupPl
 		netName = svcRT.Network
 	}
 	if netName == "" && len(plan.Services) == 0 {
-		// Still isolate the job box on an internal network (no default route).
-		netName, err = createJobInternalNetwork(ctx, jobID)
-		if err != nil {
-			out.Status = "failed"
-			out.Honesty = "network: " + err.Error()
-			return out, nil
+		// Install/test steps need package registries (npm, proxy.golang.org). Use
+		// the shared allowlist egress proxy on an --internal net (same as AI).
+		// Without proxy, fall back to a sealed internal network (offline only).
+		if egressProxyEnabled() {
+			netName = networkModeInternalProxy
+		} else {
+			netName, err = createJobInternalNetwork(ctx, jobID)
+			if err != nil {
+				out.Status = "failed"
+				out.Honesty = "network: " + err.Error()
+				return out, nil
+			}
+			defer func() { _ = removeJobInternalNetwork(context.Background(), jobID) }()
 		}
-		defer func() { _ = removeJobInternalNetwork(context.Background(), jobID) }()
 	}
 
 	secrets := resolveCheckupSecrets(plan.Secrets)

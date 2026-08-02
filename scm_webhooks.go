@@ -266,9 +266,15 @@ func backfillSCMWebhooksFromJobs() int {
 			DeliveryID: "", Event: event, Action: action,
 			RepoFullName: job.RepoFullName, PRNumber: job.PRNumber, CommitSHA: job.CommitSHA,
 			OrganizationID: job.OrganizationID, ProjectID: job.ProjectID, ConnectorID: job.ConnectorID,
-			SignatureValid: true, Outcome: "queued", JobID: job.ID, StackID: stackID,
+			SignatureValid: true, JobID: job.ID, StackID: stackID,
 			Honesty:    "Backfilled from scm job — webhook receipt was not captured at receive time.",
 			HTTPStatus: 200, Source: "backfill",
+		}
+		if out, note, ok := jobTerminalWebhookOutcome(job); ok {
+			rec.Outcome = out
+			rec.Honesty = strings.TrimSpace(rec.Honesty + " " + note)
+		} else {
+			rec.Outcome = "queued"
 		}
 		persistSCMWebhook(rec)
 		n++
@@ -398,6 +404,69 @@ func finishWebhookReceipt(rec *scmWebhookReceipt, outcome, honesty string, statu
 	persistSCMWebhook(rec)
 }
 
+// jobTerminalWebhookOutcome maps a finished SCM job onto a webhook receipt outcome.
+// "queued" on a receipt only means "job was accepted" — once the job ends we advance
+// the receipt so the Webhooks tab does not look permanently stuck.
+func jobTerminalWebhookOutcome(job *scmJob) (outcome, honesty string, ok bool) {
+	if job == nil {
+		return "", "", false
+	}
+	switch strings.ToLower(strings.TrimSpace(job.Status)) {
+	case "completed":
+		return "ok", "Linked SCM job completed.", true
+	case "failed", "error":
+		return "error", "Linked SCM job failed.", true
+	case "cancelled":
+		return "skipped", "Linked SCM job cancelled.", true
+	case "skipped":
+		return "skipped", "Linked SCM job skipped.", true
+	default:
+		return "", "", false
+	}
+}
+
+// reconcileSCMWebhookWithJob advances Outcome=queued receipts when their job is terminal.
+func reconcileSCMWebhookWithJob(rec *scmWebhookReceipt) bool {
+	if rec == nil || strings.TrimSpace(rec.JobID) == "" {
+		return false
+	}
+	cur := strings.ToLower(strings.TrimSpace(rec.Outcome))
+	if cur != "queued" && cur != "" {
+		return false
+	}
+	job := getSCMJob(rec.JobID)
+	outcome, note, ok := jobTerminalWebhookOutcome(job)
+	if !ok {
+		return false
+	}
+	rec.Outcome = outcome
+	if strings.TrimSpace(rec.Honesty) == "" {
+		rec.Honesty = note
+	} else if !strings.Contains(rec.Honesty, "Linked SCM job") {
+		rec.Honesty = strings.TrimSpace(rec.Honesty + " " + note)
+	}
+	persistSCMWebhook(rec)
+	return true
+}
+
+// reconcileWebhooksForJob updates any webhook receipt pointing at this job.
+func reconcileWebhooksForJob(job *scmJob) {
+	if job == nil || strings.TrimSpace(job.ID) == "" {
+		return
+	}
+	if _, _, ok := jobTerminalWebhookOutcome(job); !ok {
+		return
+	}
+	scmWebhookLive.Range(func(_, v interface{}) bool {
+		rec, ok := v.(*scmWebhookReceipt)
+		if !ok || rec == nil || strings.TrimSpace(rec.JobID) != job.ID {
+			return true
+		}
+		_ = reconcileSCMWebhookWithJob(rec)
+		return true
+	})
+}
+
 func applyWebhookRepoMeta(rec *scmWebhookReceipt, repo string, pr int, sha string, installation int64, action string) {
 	if rec == nil {
 		return
@@ -423,9 +492,35 @@ func applyWebhookRepoMeta(rec *scmWebhookReceipt, repo string, pr int, sha strin
 // All+non-admin = only rows with matching org empty treated as default-org, no actor filter
 // since webhooks have no actor — non-admins with All see nothing unless they pick an org,
 // matching the honesty for webhook-origin jobs).
-func canSeeSCMWebhook(a credActor, r *scmWebhookReceipt) bool {
+//
+// When connectorFilter is set, deliveries for that connector are shown even if the
+// tenant picker points at another org (GitHub App installs often live on default-org
+// while the UI tenant is nas / All). Non-admins must still match the connector's org.
+func canSeeSCMWebhook(a credActor, r *scmWebhookReceipt, connectorFilter string) bool {
 	if r == nil {
 		return false
+	}
+	if cf := strings.TrimSpace(connectorFilter); cf != "" {
+		if strings.TrimSpace(r.ConnectorID) != cf {
+			return false
+		}
+		if !authEnforced || a.isAdmin() {
+			return true
+		}
+		conn := getConnector(cf)
+		connOrg := ""
+		if conn != nil {
+			connOrg = strings.TrimSpace(nz(conn.OrganizationID, defaultOrgID))
+		}
+		recOrg := strings.TrimSpace(r.OrganizationID)
+		if recOrg == "" {
+			recOrg = defaultOrgID
+		}
+		sel := strings.TrimSpace(a.OrganizationID)
+		if sel == "" {
+			return false
+		}
+		return sel == connOrg || sel == recOrg
 	}
 	org := strings.TrimSpace(r.OrganizationID)
 	if org == "" {
@@ -444,16 +539,65 @@ func canSeeSCMWebhook(a credActor, r *scmWebhookReceipt) bool {
 	return false
 }
 
+// resolveWebhookConnectorFilter maps a PAT connector_id to its sibling GitHub App
+// install (same account_login). App webhook deliveries attach to the App connector,
+// which may live on another org (e.g. default-org) than the tenant PAT (e.g. nas).
+func resolveWebhookConnectorFilter(requested string) (effective string, fromPAT string) {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		return "", ""
+	}
+	c := getConnector(requested)
+	if c == nil || !strings.EqualFold(strings.TrimSpace(c.Kind), "github_pat") {
+		return requested, ""
+	}
+	login := strings.ToLower(strings.TrimSpace(c.AccountLogin))
+	if login == "" {
+		return requested, ""
+	}
+	var sameOrg, anyApp *opaConnector
+	connectorLive.Range(func(_, v interface{}) bool {
+		oc, ok := v.(*opaConnector)
+		if !ok || oc == nil || oc.Status == "deleted" {
+			return true
+		}
+		if !strings.EqualFold(strings.TrimSpace(oc.Kind), "github_app") {
+			return true
+		}
+		if strings.ToLower(strings.TrimSpace(oc.AccountLogin)) != login {
+			return true
+		}
+		if anyApp == nil {
+			anyApp = oc
+		}
+		if strings.TrimSpace(oc.OrganizationID) == strings.TrimSpace(c.OrganizationID) {
+			sameOrg = oc
+			return false
+		}
+		return true
+	})
+	pick := sameOrg
+	if pick == nil {
+		pick = anyApp
+	}
+	if pick == nil {
+		return requested, ""
+	}
+	return pick.ID, requested
+}
+
 func handleSCMWebhooksList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
 	a := actorFromRequest(r)
+	requestedConnector := strings.TrimSpace(r.URL.Query().Get("connector_id"))
+	connectorFilter, resolvedFromPAT := resolveWebhookConnectorFilter(requestedConnector)
 	rawList := []*scmWebhookReceipt{}
 	scmWebhookLive.Range(func(_, v interface{}) bool {
 		rec, ok := v.(*scmWebhookReceipt)
-		if !ok || !canSeeSCMWebhook(a, rec) {
+		if !ok || !canSeeSCMWebhook(a, rec, connectorFilter) {
 			return true
 		}
 		rawList = append(rawList, rec)
@@ -473,6 +617,7 @@ func handleSCMWebhooksList(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
+		_ = reconcileSCMWebhookWithJob(rec)
 		list = append(list, rec)
 		st := strings.TrimSpace(rec.Outcome)
 		if st == "" {
@@ -490,19 +635,29 @@ func handleSCMWebhooksList(w http.ResponseWriter, r *http.Request) {
 	}
 	filter := "all"
 	honesty := "Showing webhook deliveries across organizations (tenant picker = All)."
-	if a.OrganizationID != "" {
+	if connectorFilter != "" {
+		filter = "connector:" + connectorFilter
+		honesty = "Filtered to connector " + connectorFilter + " (tenant org filter bypassed for this connector's delivery log)."
+		if resolvedFromPAT != "" && resolvedFromPAT != connectorFilter {
+			honesty = "PAT " + resolvedFromPAT + " does not receive App webhooks — showing sibling App install " + connectorFilter + " (tenant org filter bypassed)."
+		} else if c := getConnector(connectorFilter); c != nil && strings.EqualFold(c.Kind, "github_pat") {
+			honesty += " PAT connectors do not receive GitHub App webhooks — no sibling App install found for this account."
+		}
+	} else if a.OrganizationID != "" {
 		filter = a.OrganizationID
-		honesty = "Filtered to organization " + a.OrganizationID + "."
+		honesty = "Filtered to organization " + a.OrganizationID + ". App webhook traffic often lands on the org that owns the GitHub App install — use connector filter or tenant All if this list looks stale."
 	} else if authEnforced && !a.isAdmin() {
 		honesty = "Tenant picker is All — webhook deliveries require selecting an organization (they have no actor_user_id)."
 		filter = "none"
 	} else if authEnforced && a.isAdmin() {
-		honesty = "Tenant picker is All — admin-wide webhook list. Select an organization to narrow."
+		honesty = "Tenant picker is All — admin-wide webhook list. Select an organization or connector to narrow."
 	}
 	writeJSON(w, map[string]interface{}{
 		"webhooks": list, "total": total, "counts": counts, "limit": limit,
-		"organization_id": a.OrganizationID,
-		"tenant_filter":   filter,
+		"organization_id":        a.OrganizationID,
+		"connector_id":           connectorFilter,
+		"requested_connector_id": requestedConnector,
+		"tenant_filter":          filter,
 		"honesty":         honesty,
 	})
 }
@@ -524,13 +679,13 @@ func handleSCMWebhookSub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a := actorFromRequest(r)
-	if !canSeeSCMWebhook(a, rec) {
+	if !canSeeSCMWebhook(a, rec, "") && !canSeeSCMWebhook(a, rec, strings.TrimSpace(rec.ConnectorID)) {
 		http.Error(w, "not found", 404)
 		return
 	}
 	out := map[string]interface{}{"webhook": rec}
 	if rec.JobID != "" {
-		if job := getSCMJob(rec.JobID); job != nil && canSeeSCMJob(a, job) {
+		if job := getSCMJob(rec.JobID); job != nil && (canSeeSCMJob(a, job, "") || canSeeSCMJob(a, job, strings.TrimSpace(job.ConnectorID))) {
 			out["job"] = scmJobAPIView(job)
 		}
 	}

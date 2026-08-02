@@ -16,9 +16,9 @@ import (
 	"time"
 )
 
-// Wave 34 — GitHub Repo Watch connectors + settings.
+// Repo watch — GitHub Repo Watch connectors + settings.
 
-func registerWave34Mux(mux *http.ServeMux, authView, authAdmin func(string, http.HandlerFunc)) {
+func registerRepoWatchMux(mux *http.ServeMux, authView, authAdmin func(string, http.HandlerFunc)) {
 	authView("/api/connectors", handleConnectorsList)
 	authAdmin("/api/connectors/github/install-url", handleGitHubInstallURL)
 	mux.HandleFunc("/api/connectors/github/callback", handleGitHubCallback)
@@ -1257,7 +1257,7 @@ func hydrateSCMOnBoot() {
 	}
 	ensureCredentialScopeColumns()
 	ensureWatchedRepoReviewColumns()
-	ensureWave35Tables()
+	ensureAgentsTables()
 	n := 0
 	rows, err := queryClient.Query(`
 		SELECT id, organization_id, project_id, scope, user_id, kind, installation_id, account_login,

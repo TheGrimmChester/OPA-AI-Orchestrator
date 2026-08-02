@@ -444,7 +444,7 @@ func checkupImageAllowPatterns() []string {
 	raw := strings.TrimSpace(os.Getenv("OPA_JOB_IMAGE_ALLOW"))
 	if raw == "" {
 		return []string{
-			"mysql:8.4*", "redis:7*", "node:22*",
+			"mysql:8.4*", "redis:7*", "node:22*", "golang:1.25*",
 			"opa-runner-*", "hebabil/php-8.4-cli*",
 			"php:8.4*", "postgres:16*",
 		}

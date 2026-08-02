@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Wave 30 — heuristic IaC/container stub: Dockerfile FROM + terraform resource blocks.
+ * AppSec — heuristic IaC/container stub: Dockerfile FROM + terraform resource blocks.
  * POST to /v1/security/iac (kind=dockerfile|terraform|container). Not a full IaC scanner.
  *
  * Usage:

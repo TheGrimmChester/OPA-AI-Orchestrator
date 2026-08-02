@@ -443,7 +443,7 @@ func topLevelPackage(path string) string {
 	if len(parts) == 1 {
 		return "(root)"
 	}
-	// src/foo → src/foo, packages/ui → packages/ui, wave34_x.go → (root)
+	// src/foo → src/foo, packages/ui → packages/ui, example_x.go → (root)
 	if parts[0] == "src" || parts[0] == "pkg" || parts[0] == "internal" || parts[0] == "lib" || parts[0] == "app" || parts[0] == "packages" || parts[0] == "services" {
 		if len(parts) >= 2 {
 			return parts[0] + "/" + parts[1]
@@ -658,7 +658,7 @@ func confidenceLabelFromScore(n int) string {
 	}
 }
 
-// decideOPAReviewEvent lives in wave35_approval_policy.go (confidence veto-only).
+// decideOPAReviewEvent lives in approval_policy.go (confidence veto-only).
 
 func hasBlockerOrHighFinding(res aiReviewResult) bool {
 	for _, f := range res.Findings {

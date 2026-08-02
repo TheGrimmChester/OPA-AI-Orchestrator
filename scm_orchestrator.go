@@ -43,10 +43,10 @@ type scmJob struct {
 	// webhooks). Used for CLI key resolution: user → org → fail closed.
 	ActorUserID string `json:"actor_user_id,omitempty"`
 
-	// Kind/RunID/ParentID/Attempt are the run-graph fields. Empty Kind keeps the
-	// pre-split monolithic pipeline (processLegacySCMJob). Correctness also rides
-	// summary_json for older ClickHouse rows without ALTER columns.
-	Kind     string `json:"kind,omitempty"`      // run|prepare|security|bugbot|approval|cloud|""
+	// Kind/RunID/ParentID/Attempt are the run-graph fields. Continuous push/cron
+	// jobs use kind=continuous. Empty/unknown kinds fail closed at process time.
+	// Correctness also rides summary_json for older ClickHouse rows without ALTER columns.
+	Kind     string `json:"kind,omitempty"`      // run|prepare|security|bugbot|approval|cloud|checkup|continuous
 	RunID    string `json:"run_id,omitempty"`    // parent run id (children); self for kind=run
 	ParentID string `json:"parent_id,omitempty"` // same as RunID for children
 	Attempt  int    `json:"attempt,omitempty"`
@@ -292,12 +292,7 @@ func handlePRWebhook(w http.ResponseWriter, raw []byte, rec *scmWebhookReceipt) 
 		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "repo not watched", "repo": repo, "webhook_id": rec.ID})
 		return
 	}
-	var job *scmJob
-	if shouldEnqueuePRRun("pull_request."+action, pr) {
-		job = enqueuePRRun(wr, conn, repo, pr, payload.PR.Head.SHA, "pull_request."+action, payload.PR.Draft, payload.PR.Title, payload.PR.Body)
-	} else {
-		job = enqueueSCMJob(wr, conn, repo, pr, payload.PR.Head.SHA, "pull_request."+action, payload.PR.Draft, payload.PR.Title, payload.PR.Body)
-	}
+	job := enqueuePRRun(wr, conn, repo, pr, payload.PR.Head.SHA, "pull_request."+action, payload.PR.Draft, payload.PR.Title, payload.PR.Body)
 	rec.JobID = job.ID
 	rec.OrganizationID = job.OrganizationID
 	rec.ProjectID = job.ProjectID
@@ -376,8 +371,8 @@ func enqueueSCMJob(wr *opaWatchedRepo, conn *opaConnector, repo string, pr int, 
 	if conn != nil {
 		org, proj, connID = conn.OrganizationID, conn.ProjectID, conn.ID
 	}
-	// Legacy path: same cancel-and-supersede as run graph — only the latest
-	// received PR commit should run when multiple pushes land quickly.
+	// Continuous path: same cancel-and-supersede as run graph when a PR number
+	// is present (unusual for push/cron, but kept for safety).
 	if pr > 0 {
 		unlock := lockPREnqueue(repo, pr)
 		defer unlock()
@@ -388,6 +383,7 @@ func enqueueSCMJob(wr *opaWatchedRepo, conn *opaConnector, repo string, pr int, 
 	job := &scmJob{
 		ID: id, OrganizationID: org, ProjectID: proj, ConnectorID: connID,
 		RepoFullName: repo, PRNumber: pr, CommitSHA: sha, Event: event,
+		Kind: string(kindContinuous),
 		Status: "queued", CheckRunIDs: map[string]int64{}, Summary: map[string]interface{}{},
 		StartedAt: now, FinishedAt: now, Draft: draft, Title: title, Body: body,
 	}
@@ -425,6 +421,7 @@ func persistSCMJob(job *scmJob) {
 		job.Summary["attempt"] = job.Attempt
 	}
 	persistSCMJobFile(job)
+	reconcileWebhooksForJob(job)
 	if writer == nil {
 		return
 	}
@@ -743,11 +740,13 @@ func handleSCMJobsList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a := actorFromRequest(r)
+	requestedConnector := strings.TrimSpace(r.URL.Query().Get("connector_id"))
+	connectorFilter, resolvedFromPAT := resolveWebhookConnectorFilter(requestedConnector)
 	list := []*scmJob{}
 	counts := map[string]int{}
 	scmJobLive.Range(func(_, v interface{}) bool {
 		j, ok := v.(*scmJob)
-		if !ok || !canSeeSCMJob(a, j) {
+		if !ok || !canSeeSCMJob(a, j, connectorFilter) {
 			return true
 		}
 		list = append(list, j)
@@ -766,20 +765,28 @@ func handleSCMJobsList(w http.ResponseWriter, r *http.Request) {
 	}
 	filter := "all"
 	honesty := "Showing jobs across organizations (tenant picker = All)."
-	if a.OrganizationID != "" {
+	if connectorFilter != "" {
+		filter = "connector:" + connectorFilter
+		honesty = "Filtered to connector " + connectorFilter + " (tenant org filter bypassed for this connector's job log)."
+		if resolvedFromPAT != "" && resolvedFromPAT != connectorFilter {
+			honesty = "PAT " + resolvedFromPAT + " — showing sibling App install " + connectorFilter + " jobs (tenant org filter bypassed)."
+		}
+	} else if a.OrganizationID != "" {
 		filter = a.OrganizationID
-		honesty = "Filtered to organization " + a.OrganizationID + "."
+		honesty = "Filtered to organization " + a.OrganizationID + ". App webhook jobs often land on the org that owns the GitHub App install — pick a connector or tenant All if this list looks empty while reviews are running."
 	} else if authEnforced && !a.isAdmin() {
 		honesty = "Tenant picker is All — showing only jobs you queued. Select an organization to see that org's webhook/manual jobs."
 		filter = "actor"
 	} else if authEnforced && a.isAdmin() {
-		honesty = "Tenant picker is All — admin-wide job list. Select an organization to narrow."
+		honesty = "Tenant picker is All — admin-wide job list. Select an organization or connector to narrow."
 	}
 	writeJSON(w, map[string]interface{}{
 		"jobs": list, "total": total, "counts": counts, "limit": limit,
-		"organization_id": a.OrganizationID,
-		"tenant_filter":   filter,
-		"honesty":         honesty,
+		"organization_id":        a.OrganizationID,
+		"connector_id":           connectorFilter,
+		"requested_connector_id": requestedConnector,
+		"tenant_filter":          filter,
+		"honesty":                honesty,
 	})
 }
 
@@ -789,9 +796,33 @@ func handleSCMJobsList(w http.ResponseWriter, r *http.Request) {
 //   - Picker All + auth off → everything
 //   - Picker All + admin → everything (admin-wide view)
 //   - Picker All + non-admin → jobs this user queued (actor_user_id)
-func canSeeSCMJob(a credActor, j *scmJob) bool {
+//   - connectorFilter set → that connector's jobs even across org (admin), or if
+//     non-admin's selected org matches the job/connector org
+func canSeeSCMJob(a credActor, j *scmJob, connectorFilter string) bool {
 	if j == nil {
 		return false
+	}
+	if cf := strings.TrimSpace(connectorFilter); cf != "" {
+		if strings.TrimSpace(j.ConnectorID) != cf {
+			return false
+		}
+		if !authEnforced || a.isAdmin() {
+			return true
+		}
+		conn := getConnector(cf)
+		connOrg := ""
+		if conn != nil {
+			connOrg = strings.TrimSpace(nz(conn.OrganizationID, defaultOrgID))
+		}
+		jobOrg := strings.TrimSpace(j.OrganizationID)
+		if jobOrg == "" {
+			jobOrg = defaultOrgID
+		}
+		sel := strings.TrimSpace(a.OrganizationID)
+		if sel == "" {
+			return false
+		}
+		return sel == connOrg || sel == jobOrg
 	}
 	jobOrg := strings.TrimSpace(j.OrganizationID)
 	if jobOrg == "" {
@@ -841,7 +872,7 @@ func handleSCMJobSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a := actorFromRequest(r)
-		if !canSeeSCMJob(a, job) {
+		if !canSeeSCMJob(a, job, "") && !canSeeSCMJob(a, job, strings.TrimSpace(job.ConnectorID)) {
 			http.Error(w, "not found", 404)
 			return
 		}
@@ -854,11 +885,51 @@ func handleSCMJobSub(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not found", 404)
 			return
 		}
+		a := actorFromRequest(r)
+		if !canSeeSCMJob(a, job, "") && !canSeeSCMJob(a, job, strings.TrimSpace(job.ConnectorID)) {
+			http.Error(w, "not found", 404)
+			return
+		}
+		// Explicit Retry from the dashboard must re-run (bypass already-reviewed
+		// skip) and carry the signed-in user so personal CLI keys resolve.
+		if uid := strings.TrimSpace(a.Username); uid != "" {
+			job.ActorUserID = uid
+		}
+		job.ForceAI = true
+		// Legacy PR rows may lack kind=run — upgrade before re-dispatch.
+		if strings.TrimSpace(job.Kind) == "" && shouldEnqueuePRRun(job.Event, job.PRNumber) {
+			job.Kind = string(kindRun)
+			if strings.TrimSpace(job.RunID) == "" {
+				job.RunID = job.ID
+			}
+		}
+		if strings.TrimSpace(job.Kind) == "" {
+			ev := strings.ToLower(strings.TrimSpace(job.Event))
+			if strings.HasPrefix(ev, "push.") || strings.HasPrefix(ev, "cron.") {
+				job.Kind = string(kindContinuous)
+			}
+		}
 		job.Status = "queued"
 		job.Error = ""
+		job.FinishedAt = ""
+		if job.Summary == nil {
+			job.Summary = map[string]interface{}{}
+		}
+		if job.ActorUserID != "" {
+			job.Summary["actor_user_id"] = job.ActorUserID
+		}
+		delete(job.Summary, "skip_reason")
+		delete(job.Summary, "prior_reviewed_job_id")
 		persistSCMJob(job)
 		go processSCMJob(id)
-		writeJSON(w, map[string]interface{}{"ok": true, "job_id": id, "status": "queued"})
+		writeJSON(w, map[string]interface{}{
+			"ok": true, "job_id": id, "status": "queued",
+			"force_ai":       true,
+			"kind":           job.Kind,
+			"actor_user_id":  job.ActorUserID,
+			"cursor_key_set": resolveCursorAPIKey(job.OrganizationID, job.ProjectID, job.ActorUserID) != "",
+			"honesty":        "Retry stamps actor_user_id from the signed-in user, upgrades empty kind for legacy PR/push rows, and sets force_ai so already-reviewed SHAs re-run. Personal CLI keys apply; webhook-origin jobs without an actor still need an org key under Account → Organization.",
+		})
 		return
 	}
 	if len(parts) >= 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
@@ -1049,25 +1120,16 @@ func enqueueManualAIReview(repo string, pr int, connectorID, sha, title string, 
 	if aiOnly {
 		event = "manual.ai_only"
 	}
-	var job *scmJob
-	if shouldEnqueuePRRun(event, pr) {
-		job = enqueuePRRun(wr, conn, repo, pr, sha, event, draft, title, prBody)
-		job.ForceAI = force
-		job.AIOnly = aiOnly
-		job.ActorUserID = strings.TrimSpace(actorUserID)
-		persistSCMJob(job)
-		for _, c := range listRunChildren(job.ID) {
-			c.ForceAI = force
-			c.AIOnly = aiOnly
-			c.ActorUserID = job.ActorUserID
-			persistSCMJob(c)
-		}
-	} else {
-		job = enqueueSCMJob(wr, conn, repo, pr, sha, event, draft, title, prBody)
-		job.ForceAI = force
-		job.AIOnly = aiOnly
-		job.ActorUserID = strings.TrimSpace(actorUserID)
-		persistSCMJob(job)
+	job := enqueuePRRun(wr, conn, repo, pr, sha, event, draft, title, prBody)
+	job.ForceAI = force
+	job.AIOnly = aiOnly
+	job.ActorUserID = strings.TrimSpace(actorUserID)
+	persistSCMJob(job)
+	for _, c := range listRunChildren(job.ID) {
+		c.ForceAI = force
+		c.AIOnly = aiOnly
+		c.ActorUserID = job.ActorUserID
+		persistSCMJob(c)
 	}
 	return job, "", 0
 }
@@ -1108,12 +1170,7 @@ func handleSCMSimulate(w http.ResponseWriter, r *http.Request) {
 		wr.ServiceName = body.Service
 	}
 	os.Setenv("OPA_SCM_MOCK_GITHUB", "1")
-	var job *scmJob
-	if shouldEnqueuePRRun("simulate", body.PR) {
-		job = enqueuePRRun(wr, getConnector(connID), repo, body.PR, sha, "simulate", body.Draft, "simulated PR", "")
-	} else {
-		job = enqueueSCMJob(wr, getConnector(connID), repo, body.PR, sha, "simulate", body.Draft, "simulated PR", "")
-	}
+	job := enqueuePRRun(wr, getConnector(connID), repo, body.PR, sha, "simulate", body.Draft, "simulated PR", "")
 	go processSCMJob(job.ID)
 	resp := map[string]interface{}{"ok": true, "job_id": job.ID, "repo": repo, "sha": sha}
 	if job.Kind != "" {
@@ -1187,13 +1244,29 @@ func processSCMJob(jobID string) {
 	if job == nil {
 		return
 	}
+	// One-shot cutover: empty-kind rows from before the run/continuous split.
+	if strings.TrimSpace(job.Kind) == "" {
+		ev := strings.ToLower(strings.TrimSpace(job.Event))
+		if strings.HasPrefix(ev, "push.") || strings.HasPrefix(ev, "cron.") {
+			job.Kind = string(kindContinuous)
+			persistSCMJob(job)
+		} else if shouldEnqueuePRRun(job.Event, job.PRNumber) {
+			job.Kind = string(kindRun)
+			if strings.TrimSpace(job.RunID) == "" {
+				job.RunID = job.ID
+			}
+			persistSCMJob(job)
+		}
+	}
 	switch scmJobProcessor(agentKind(strings.TrimSpace(job.Kind))) {
 	case "run":
 		processPRRun(jobID)
 	case "agent":
 		processAgentChild(jobID)
+	case "continuous":
+		processContinuousSCMJob(jobID)
 	default:
-		processLegacySCMJob(jobID)
+		failClosedUnknownSCMJobKind(job)
 	}
 }
 
@@ -1205,13 +1278,15 @@ func scmJobProcessor(k agentKind) string {
 		return "run"
 	case isAgentChildKind(k):
 		return "agent"
+	case k == kindContinuous:
+		return "continuous"
 	default:
-		return "legacy"
+		return "unknown"
 	}
 }
 
 // isAgentChildKind reports kinds handled by processAgentChild (not the run
-// parent and not the legacy monolith).
+// parent and not the continuous monolith).
 func isAgentChildKind(k agentKind) bool {
 	switch k {
 	case kindPrepare, kindSecurity, kindBugbot, kindCheckup, kindApproval, kindCloud:
@@ -1221,7 +1296,36 @@ func isAgentChildKind(k agentKind) bool {
 	}
 }
 
-func processLegacySCMJob(jobID string) {
+// failClosedUnknownSCMJobKind marks empty/unknown kinds failed instead of
+// silently running the continuous pipeline.
+func failClosedUnknownSCMJobKind(job *scmJob) {
+	if job == nil {
+		return
+	}
+	switch job.Status {
+	case "cancelled", "completed", "failed", "error", "skipped":
+		return
+	}
+	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	kind := strings.TrimSpace(job.Kind)
+	if kind == "" {
+		job.Error = "empty job kind — run graph required for PR jobs; continuous scans must use kind=continuous"
+	} else {
+		job.Error = fmt.Sprintf("unknown job kind %q — refused", kind)
+	}
+	job.Status = "failed"
+	job.FinishedAt = now
+	if job.StartedAt == "" {
+		job.StartedAt = now
+	}
+	if job.Summary == nil {
+		job.Summary = map[string]interface{}{}
+	}
+	job.Summary["fail_reason"] = "unknown_kind"
+	persistSCMJob(job)
+}
+
+func processContinuousSCMJob(jobID string) {
 	if _, loaded := scmProcessing.LoadOrStore(jobID, struct{}{}); loaded {
 		return
 	}

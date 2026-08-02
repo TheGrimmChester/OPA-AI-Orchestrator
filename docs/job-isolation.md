@@ -8,7 +8,7 @@ Default remains `off` so existing smoke stays host-exec with curated `jobEnv`.
 
 ```bash
 ./rebuild-smoke-images.sh          # builds *:smoke — never *:nas
-./wave35-escape-smoke.sh           # every probe must FAIL inside the box
+./job-escape-smoke.sh           # every probe must FAIL inside the box
 
 export OPA_JOB_SANDBOX=docker
 # Egress proxy defaults ON in docker mode (OPA_JOB_EGRESS_PROXY=0 → old bridge fallback)
@@ -116,7 +116,7 @@ when present.
   `UNSANDBOXED: tools ran as root` — use only for break-glass debugging.
 - Chromium inside `opa-runner-ai` needs `--no-sandbox` inside an already
   hardened box; do not `--cap-add SYS_ADMIN` to “fix” that.
-- Escape smoke (`wave35-escape-smoke.sh`) is a local guardrail, not a proof of
+- Escape smoke (`job-escape-smoke.sh`) is a local guardrail, not a proof of
   isolation against a compromised orchestrator.
 - Cloud autofix lands by applying a **gateCloudDiff-validated** patch onto a
   fresh checkout (`cloud-land-*`), not by committing the agent-writable tree.
