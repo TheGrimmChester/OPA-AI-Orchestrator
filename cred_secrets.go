@@ -283,3 +283,64 @@ func loadSCMSecretPlainForActor(org, proj, userID, key string) string {
 		OrganizationID: org, ProjectID: proj, UserID: userID,
 	}, key).Plain
 }
+
+// ensureOrgWideCLICursorKeys copies project-scoped org CLI keys to org-wide
+// (empty project) rows when missing. Ciphertext is reused — no decrypt.
+// Safe to run on every boot; ClickHouse ReplacingMergeTree keeps the newest.
+func ensureOrgWideCLICursorKeys() int {
+	if queryClient == nil || writer == nil {
+		return 0
+	}
+	logical := scmCursorSecretKey
+	rows, err := queryClient.Query(fmt.Sprintf(`
+		SELECT organization_id, project_id, scope, user_id, ciphertext, deleted
+		FROM opa.scm_secrets
+		WHERE key = '%s'
+		ORDER BY updated_at DESC LIMIT 200`, escapeSQL(logical)))
+	if err != nil || len(rows) == 0 {
+		return 0
+	}
+	type cand struct {
+		org, ct string
+	}
+	haveWide := map[string]bool{}
+	var projectKeys []cand
+	for _, row := range rows {
+		rowOrg, _ := row["organization_id"].(string)
+		rowProj, _ := row["project_id"].(string)
+		rowScope, _ := row["scope"].(string)
+		rowUser, _ := row["user_id"].(string)
+		ct, _ := row["ciphertext"].(string)
+		if rowOrg == "" || ct == "" || rowDeletedFlag(row) {
+			continue
+		}
+		eff := inferLegacyScope(rowOrg, rowScope)
+		if eff == credScopeAdmin || eff == credScopeUser || strings.TrimSpace(rowUser) != "" {
+			continue
+		}
+		if rowProj == "" {
+			haveWide[rowOrg] = true
+			continue
+		}
+		projectKeys = append(projectKeys, cand{org: rowOrg, ct: ct})
+	}
+	n := 0
+	seeded := map[string]bool{}
+	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	for _, c := range projectKeys {
+		if haveWide[c.org] || seeded[c.org] {
+			continue
+		}
+		payload, _ := json.Marshal(map[string]interface{}{
+			"key": logical, "organization_id": c.org, "project_id": "",
+			"scope": credScopeOrg, "user_id": "",
+			"ciphertext": c.ct, "updated_at": now, "deleted": uint8(0),
+		})
+		writer.insert("scm_secrets", append(payload, '\n'))
+		seeded[c.org] = true
+		haveWide[c.org] = true
+		n++
+		log.Printf("[INFO] boot: seeded org-wide CLI agent key for org=%s from project-scoped ciphertext", c.org)
+	}
+	return n
+}

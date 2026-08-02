@@ -34,10 +34,10 @@ func actorFromRequest(r *http.Request) credActor {
 	org, proj := "", ""
 	if ctx != nil {
 		org, proj = ctx.OrganizationID, ctx.ProjectID
-		if org == tenantAll {
+		if strings.EqualFold(org, tenantAll) {
 			org = ""
 		}
-		if proj == tenantAll {
+		if strings.EqualFold(proj, tenantAll) {
 			proj = ""
 		}
 	}

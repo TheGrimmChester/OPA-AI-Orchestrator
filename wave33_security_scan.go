@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -50,10 +51,11 @@ var sastRules = []struct {
 	severity string
 	message  string
 }{
-	{"js-eval", regexp.MustCompile(`\beval\s*\(`), map[string]bool{".js": true, ".mjs": true, ".ts": true, ".tsx": true, ".jsx": true}, "high", "eval() call"},
+	// Messages avoid "name(" shapes so scanner sources do not self-match.
+	{"js-eval", regexp.MustCompile(`\beval\s*\(`), map[string]bool{".js": true, ".mjs": true, ".ts": true, ".tsx": true, ".jsx": true}, "high", "dynamic eval invocation"},
 	{"js-innerhtml", regexp.MustCompile(`\.innerHTML\s*=`), map[string]bool{".js": true, ".mjs": true, ".ts": true, ".tsx": true, ".jsx": true}, "medium", "innerHTML assignment"},
-	{"js-document-write", regexp.MustCompile(`document\.write\s*\(`), map[string]bool{".js": true, ".mjs": true, ".ts": true, ".tsx": true, ".jsx": true}, "medium", "document.write()"},
-	{"php-eval", regexp.MustCompile(`\beval\s*\(`), map[string]bool{".php": true}, "high", "PHP eval()"},
+	{"js-document-write", regexp.MustCompile(`document\.write\s*\(`), map[string]bool{".js": true, ".mjs": true, ".ts": true, ".tsx": true, ".jsx": true}, "medium", "document write call"},
+	{"php-eval", regexp.MustCompile(`\beval\s*\(`), map[string]bool{".php": true}, "high", "PHP eval invocation"},
 	// Go regexp has no backrefs — approximate quote+SQL+concat heuristics.
 	{"php-sql-concat", regexp.MustCompile(`(?i)['"]\s*(SELECT|INSERT|UPDATE|DELETE)\b[^'"]{0,120}['"]\s*\.`), map[string]bool{".php": true}, "high", "SQL string concatenation"},
 	{"php-sql-interp", regexp.MustCompile(`(?i)"(SELECT|INSERT|UPDATE|DELETE)\b[^"]*\$`), map[string]bool{".php": true}, "high", "SQL with variable interpolation"},
@@ -201,6 +203,11 @@ func walkScanFiles(root string, maxFiles int) []string {
 		}
 		ext := strings.ToLower(filepath.Ext(d.Name()))
 		name := d.Name()
+		// Skip in-tree lite scanners — their rule sources contain matching patterns.
+		switch name {
+		case "sast-lite.mjs", "secrets-lite.mjs", "iac-lite.mjs":
+			return nil
+		}
 		if !scanTextExt[ext] && name != ".env" && !strings.HasSuffix(name, ".env.example") &&
 			name != "Dockerfile" && !strings.HasPrefix(name, "Dockerfile.") {
 			return nil
@@ -307,8 +314,8 @@ func rememberSecretSeverity(runID, sev string) {
 	}
 	v, _ := secretSevByRun.LoadOrStore(runID, map[string]int{})
 	m := v.(map[string]int)
-	// map is not concurrent-safe for writes across goroutines, but scans are
-	// serialized by securityScanMu; still copy-on-store for safety.
+	// Per-run maps are only written from that run's goroutine; copy-on-store
+	// keeps the stored value immutable if another reader loads mid-update.
 	cp := map[string]int{}
 	for k, n := range m {
 		cp[k] = n
@@ -384,9 +391,11 @@ type gitleaksFinding struct {
 }
 
 // scanSecrets prefers the gitleaks CLI when present; otherwise embedded regex lite.
-func scanSecrets(runID, org, proj, service, root string) (int, string, error) {
+// scmJobID labels sandboxed boxes (opa.job) for cancel teardown; the checkout
+// LayoutID is always path-derived so srun-* security ids never fail bind checks.
+func scanSecrets(runID, org, proj, service, root, scmJobID string) (int, string, error) {
 	if bin := gitleaksBin(); bin != "" {
-		n, err := scanSecretsGitleaks(bin, runID, org, proj, service, root)
+		n, err := scanSecretsGitleaks(bin, runID, org, proj, service, root, scmJobID)
 		if err == nil {
 			return n, "gitleaks", nil
 		}
@@ -401,7 +410,7 @@ func scanSecrets(runID, org, proj, service, root string) (int, string, error) {
 	return n, "embedded-secret-scan", err
 }
 
-func scanSecretsGitleaks(bin, runID, org, proj, service, root string) (int, error) {
+func scanSecretsGitleaks(bin, runID, org, proj, service, root, scmJobID string) (int, error) {
 	report, err := os.CreateTemp("", "opa-gitleaks-*.json")
 	if err != nil {
 		return 0, err
@@ -413,6 +422,16 @@ func scanSecretsGitleaks(bin, runID, org, proj, service, root string) (int, erro
 	cfgPath, cfgCleanup := gitleaksConfigPath()
 	defer cfgCleanup()
 
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
+	defer cancel()
+
+	if sandboxMode() == "docker" {
+		if err := scanSecretsGitleaksSandboxed(ctx, scmJobID, root, reportPath); err != nil {
+			return 0, err
+		}
+		return ingestGitleaksReport(reportPath, runID, org, proj, service, root)
+	}
+
 	args := []string{
 		"detect",
 		"--source", root,
@@ -423,20 +442,91 @@ func scanSecretsGitleaks(bin, runID, org, proj, service, root string) (int, erro
 		"--exit-code", "0",
 		"--timeout", "120",
 	}
-	env := append(os.Environ(), "GITLEAKS_CONFIG=")
+	env := jobEnv(jobEnvSpec{
+		Phase: jobPhaseScan,
+		Extra: map[string]string{"GITLEAKS_CONFIG": ""},
+	})
 	if cfgPath != "" {
 		args = append(args, "--config", cfgPath)
 	}
-	cmd := exec.Command(bin, args...)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
+	out = redactJobOutput(out)
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return 0, fmt.Errorf("gitleaks detect: timeout")
+		}
 		msg := strings.TrimSpace(string(out))
 		if len(msg) > 240 {
 			msg = msg[:240]
 		}
 		return 0, fmt.Errorf("gitleaks detect: %w (%s)", err, msg)
 	}
+	return ingestGitleaksReport(reportPath, runID, org, proj, service, root)
+}
+
+// scanSecretsGitleaksSandboxed runs gitleaks inside opa-runner-scan with the
+// report written to a host-mounted /out directory (preserves detector=gitleaks).
+// scmJobID is the cancel label (opa.job); LayoutID/WorkRel come from the checkout
+// path so security srun-* ids never become bind identities.
+func scanSecretsGitleaksSandboxed(ctx context.Context, scmJobID, root, hostReport string) error {
+	root = filepath.Clean(root)
+	if !filepath.IsAbs(root) {
+		return fmt.Errorf("gitleaks sandbox requires absolute root")
+	}
+	// Path-derived layout identity: checkout lives under
+	// OPA_REVIEW_TMP/<scm-job-or-run-id>/{primary|sandbox}.
+	layoutID := resolveSandboxJobID("", root)
+	workRel := sandboxWorkRel(root)
+	// Cancel teardown targets opa.job=<scm child/job id>; fall back to layout.
+	jobID := resolveSandboxJobID(scmJobID, root)
+	outDir, err := os.MkdirTemp("", "opa-gitleaks-out-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(outDir)
+	argv := []string{
+		"gitleaks", "detect",
+		"--source", ".",
+		"--no-git",
+		"--no-banner",
+		"--report-format", "json",
+		"--report-path", "/out/report.json",
+		"--exit-code", "0",
+		"--timeout", "120",
+		"--config", "/etc/opa/gitleaks.toml",
+	}
+	out, err := runSandboxedArgv(ctx, sandboxExecSpec{
+		Phase:       jobPhaseScan,
+		JobID:       jobID,
+		LayoutID:    layoutID,
+		NetworkID:   layoutID,
+		HostWorkDir: root,
+		WorkRel:     workRel,
+		Argv:        argv,
+		ReadOnly:    true,
+		Network:     "none",
+		Image:       sandboxImageForPhase(jobPhaseScan),
+		Ephemeral:   true,
+		OutHostDir:  outDir,
+	})
+	if err != nil {
+		return fmt.Errorf("sandboxed gitleaks: %w (%s)", err, truncateStr(string(out), 200))
+	}
+	raw, err := os.ReadFile(filepath.Join(outDir, "report.json"))
+	if err != nil {
+		// Some gitleaks versions omit the report file when there are zero findings.
+		if os.IsNotExist(err) {
+			_ = os.WriteFile(hostReport, []byte("[]"), 0o600)
+			return nil
+		}
+		return fmt.Errorf("gitleaks report: %w", err)
+	}
+	return os.WriteFile(hostReport, raw, 0o600)
+}
+
+func ingestGitleaksReport(reportPath, runID, org, proj, service, root string) (int, error) {
 	raw, err := os.ReadFile(reportPath)
 	if err != nil {
 		return 0, err

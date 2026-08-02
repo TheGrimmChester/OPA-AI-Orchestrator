@@ -142,7 +142,7 @@ func prepareSCMWorktree(c *opaConnector, fullName, sha string, pr int, worktreeI
 		return absRoot, relPath, meta, nil
 	}
 
-	tok, terr := githubAccessToken(c)
+	tok, terr := githubAccessTokenFor(c, fullName, githubPermsCloneRead())
 	if terr != nil {
 		return absRoot, relPath, meta, fmt.Errorf("github token: %w", terr)
 	}
@@ -189,7 +189,10 @@ func prepareSCMWorktree(c *opaConnector, fullName, sha string, pr int, worktreeI
 	if out, aerr := add.CombinedOutput(); aerr != nil {
 		// Fallback: shallow clone into worktree path (URL has NO token).
 		_ = os.RemoveAll(absRoot)
-		cloneURL := fmt.Sprintf("https://github.com/%s.git", fullName)
+		cloneURL, uerr := githubHTTPSCloneURL(fullName)
+		if uerr != nil {
+			return absRoot, relPath, meta, uerr
+		}
 		clone := exec.Command("git", "clone", "--depth", "50", cloneURL, absRoot)
 		clone.Env = askEnv
 		if cout, cerr := clone.CombinedOutput(); cerr != nil {
@@ -226,7 +229,16 @@ func prepareSCMWorktree(c *opaConnector, fullName, sha string, pr int, worktreeI
 }
 
 func ensureBareMirror(bareAbs, fullName, tok string) error {
-	cloneURL := fmt.Sprintf("https://github.com/%s.git", fullName)
+	unlock, err := withBareMirrorLock(fullName)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	cloneURL, err := githubHTTPSCloneURL(fullName)
+	if err != nil {
+		return err
+	}
 	askEnv, cleanup, err := gitAskPassEnv(tok)
 	if err != nil {
 		return err
@@ -252,6 +264,36 @@ func ensureBareMirror(bareAbs, fullName, tok string) error {
 	return nil
 }
 
+// withBareMirrorLock serializes fetch/clone of a shared bare mirror across
+// concurrent jobs on the same repo. Lock files live beside the cache tree.
+func withBareMirrorLock(fullName string) (unlock func(), err error) {
+	rel := scmBareCacheRel(fullName)
+	if rel == "" {
+		return func() {}, nil
+	}
+	bareAbs, err := resolveSecurityScanPath(rel)
+	if err != nil {
+		return nil, err
+	}
+	lockDir := filepath.Dir(bareAbs)
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		return nil, err
+	}
+	lockPath := bareAbs + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := flockExclusive(f); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("bare mirror flock: %w", err)
+	}
+	return func() {
+		_ = flockUnlock(f)
+		_ = f.Close()
+	}, nil
+}
+
 // gitAskPassEnv installs a short-lived askpass helper so the PAT never appears in
 // the clone URL or git remote config. Token lives only in process env for the child.
 func gitAskPassEnv(tok string) (env []string, cleanup func(), err error) {
@@ -270,7 +312,7 @@ func gitAskPassEnv(tok string) (env []string, cleanup func(), err error) {
 		_ = os.RemoveAll(dir)
 		return nil, func() {}, err
 	}
-	env = append(os.Environ(),
+	env = hostToolEnv(
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ASKPASS="+script,
 		"SSH_ASKPASS="+script,

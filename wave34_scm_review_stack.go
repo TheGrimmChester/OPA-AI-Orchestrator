@@ -131,9 +131,13 @@ func handleOPAReviewStack(w http.ResponseWriter, r *http.Request) {
 		actorUID := actorFromRequest(r).Username
 		job, errMsg, code := enqueueManualAIReview(repo, pr, it.ConnectorID, "", "", false, force, body.AIOnly, true, actorUID)
 		if errMsg != "" {
+			st := "failed"
+			if code == 409 && (strings.Contains(errMsg, "already merged") || strings.Contains(errMsg, "already reviewed")) {
+				st = "skipped"
+			}
 			items = append(items, opaReviewStackItem{
 				RepoFullName: repo, PRNumber: pr, ConnectorID: it.ConnectorID,
-				Status: "failed", Error: fmt.Sprintf("%s (%d)", errMsg, code),
+				Status: st, Error: fmt.Sprintf("%s (%d)", errMsg, code),
 			})
 			continue
 		}
