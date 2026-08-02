@@ -10,7 +10,9 @@ COPY *.go ./
 COPY gitleaks.toml ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o opa-orchestrator .
 
-FROM debian:bookworm-slim
+# Default compose target — keep this stage named; later runner/egress stages must
+# not become the default image (docker build uses the last stage otherwise).
+FROM debian:bookworm-slim AS opa-orchestrator
 ARG TARGETARCH
 ARG GITLEAKS_VERSION=8.30.0
 ARG PLAYWRIGHT_VERSION=1.50.1
