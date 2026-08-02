@@ -466,11 +466,11 @@ func gatherWorktreeSeed(absRoot, apiSeed string) string {
 }
 
 func runCursorContextGenerate(apiKey, repo, seed, worktreeAbs string) (string, string, error) {
-	promptPath := filepath.Join(os.TempDir(), "opa-ctx-gen-"+newRandomHex(6)+".md")
 	wtHint := worktreeAbs
 	if wtHint == "" {
 		wtHint = "(no local worktree — seed from GitHub API only)"
 	}
+	jobLabel := resolveSandboxJobID("", worktreeAbs)
 	brief := fmt.Sprintf(`# Generate OPA reviewer context
 
 You are drafting a **senior-engineer reviewer context** for repository %s.
@@ -511,8 +511,24 @@ Do not commit or push. Do not invent vendor product names.
 ## Seed (hints only — verify against the tree)
 %s
 `, repo, wtHint, truncateStr(seed, 14000))
-	_ = os.WriteFile(promptPath, []byte(brief), 0o600)
-	defer os.Remove(promptPath)
+	promptPath := ""
+	cleanupBrief := func() {}
+	if worktreeAbs != "" {
+		var errBrief error
+		promptPath, cleanupBrief, errBrief = writeAgentBrief(worktreeAbs, jobLabel, "opa-ctx-gen-"+newRandomHex(6)+".md", brief)
+		if errBrief != nil {
+			return "", "", errBrief
+		}
+		defer cleanupBrief()
+		wtHint = agentVisibleWorkDir(worktreeAbs, jobLabel)
+	} else {
+		// No checkout to bind — fall back to host temp (host sandbox only).
+		promptPath = filepath.Join(os.TempDir(), "opa-ctx-gen-"+newRandomHex(6)+".md")
+		if err := os.WriteFile(promptPath, []byte(brief), 0o600); err != nil {
+			return "", "", err
+		}
+		defer os.Remove(promptPath)
+	}
 
 	agentBin, model := "", ""
 	force := false
@@ -529,7 +545,7 @@ Do not commit or push. Do not invent vendor product names.
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseContext, Args: args, Dir: worktreeAbs, WorktreeRoot: worktreeAbs,
 		APIKey: apiKey, Timeout: 900 * time.Second,
-		JobID: resolveSandboxJobID("", worktreeAbs),
+		JobID: jobLabel,
 	})
 	usage := string(out)
 	if err != nil {
@@ -570,19 +586,23 @@ func runOPAReviewUnderstandingPass(job *scmJob, key, agentBin string, baseArgs [
 	writeOPAReviewContextFields(&b, job, filterContextsForUI(applied, diffTouchesUI(diff)), opaReviewScopeFromDiff(diff), false)
 	fmt.Fprintf(&b, "## Diff (truncated)\n```\n%s\n```\n\n", truncateStr(diff, 20000))
 	b.WriteString("## Required JSON\n{\"understanding\":[\"data/control flow…\",\"assumptions…\",\"risk hotspots…\"],\"summary\":\"…\",\"verdict\":\"needs_context\",\"findings\":[]}\n")
-	promptPath := filepath.Join(os.TempDir(), fmt.Sprintf("opa-review-understand-%s.md", job.ID))
-	_ = os.WriteFile(promptPath, []byte(b.String()), 0o600)
-	defer os.Remove(promptPath)
-	prompt := fmt.Sprintf("%s Full PR tree at %s. Explore surrounding code as needed. Read %s. Output ONLY JSON with understanding (3-5 bullets covering data flow, control flow, assumptions) and summary. No findings yet — Step 2 will review aggressively.",
-		opaReviewCompactScaffold, checkoutRoot, promptPath)
-	args := append(append([]string{}, baseArgs...), prompt)
-	_ = agentBin
-	parent := context.Background()
 	jobID := ""
+	parent := context.Background()
+	jobKey := "anon"
 	if job != nil {
 		parent = scmJobContext(job.ID)
 		jobID = nz(job.RunID, job.ID)
+		jobKey = job.ID
 	}
+	promptPath, cleanupBrief, errBrief := writeAgentBrief(checkoutRoot, jobID, fmt.Sprintf("opa-review-understand-%s.md", jobKey), b.String())
+	if errBrief != nil {
+		return ""
+	}
+	defer cleanupBrief()
+	prompt := fmt.Sprintf("%s Full PR tree at %s. Explore surrounding code as needed. Read %s. Output ONLY JSON with understanding (3-5 bullets covering data flow, control flow, assumptions) and summary. No findings yet — Step 2 will review aggressively.",
+		opaReviewCompactScaffold, agentVisibleWorkDir(checkoutRoot, jobID), promptPath)
+	args := append(append([]string{}, baseArgs...), prompt)
+	_ = agentBin
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseContext, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
 		APIKey: key, Parent: parent, JobID: jobID,

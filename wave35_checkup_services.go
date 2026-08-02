@@ -81,20 +81,42 @@ func startCheckupServices(ctx context.Context, jobID string, services []checkupS
 	return rt, nil
 }
 
-// stopCheckupServices tears down by label via docker rm -fv (never --filter on rm).
+// stopCheckupServices removes checkup sidecars and the checkup job's own
+// boxes. Callers must pass the checkup *child* job id (not the shared RunID),
+// otherwise teardown would kill concurrent review/scan siblings.
 func stopCheckupServices(ctx context.Context, rt *checkupServiceRuntime) error {
 	if rt == nil {
 		return nil
 	}
+	for _, name := range rt.Names {
+		_ = dockerRmForce(ctx, name)
+	}
 	if rt.JobID != "" {
-		_ = teardownJobContainers(ctx, rt.JobID)
+		// Phase-scoped: only containers named …-checkup / …-svc-* for this id.
+		_ = teardownCheckupJobContainers(ctx, rt.JobID)
 		_ = removeJobInternalNetwork(ctx, rt.JobID)
-	} else {
-		for _, name := range rt.Names {
-			_ = dockerRmForce(ctx, name)
-		}
 	}
 	rt.Names = nil
+	return nil
+}
+
+// teardownCheckupJobContainers removes containers for one checkup child id
+// that are clearly checkup-owned (name suffix -checkup or -svc-).
+func teardownCheckupJobContainers(ctx context.Context, jobID string) error {
+	if sandboxMode() != "docker" {
+		return nil
+	}
+	out, err := dockerCmd(ctx, "ps", "-aq", "--filter", "label=opa.job="+sanitizeDockerName(jobID))
+	if err != nil {
+		return err
+	}
+	for _, id := range strings.Fields(string(out)) {
+		nameOut, _ := dockerCmd(ctx, "inspect", "-f", "{{.Name}}", id)
+		name := strings.TrimPrefix(strings.TrimSpace(string(nameOut)), "/")
+		if strings.HasSuffix(name, "-checkup") || strings.Contains(name, "-svc-") {
+			_, _ = dockerCmd(ctx, "rm", "-fv", id)
+		}
+	}
 	return nil
 }
 
