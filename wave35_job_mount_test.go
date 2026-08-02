@@ -31,6 +31,23 @@ func TestAssertJobBindPath(t *testing.T) {
 	}
 }
 
+func TestAssertJobBindPathRejectsEmptyAndRelative(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("OPA_REVIEW_TMP", tmp)
+	job := "job-abc"
+	if err := assertJobBindPath(filepath.Join(tmp, job, "primary"), ""); err == nil {
+		t.Fatal("empty job id must reject")
+	}
+	if err := assertJobBindPath("relative/path", job); err == nil {
+		t.Fatal("relative path must reject")
+	}
+	// Prefix sibling must not match job identity root.
+	evil := filepath.Join(tmp, job+"-evil", "primary")
+	if err := assertJobBindPath(evil, job); err == nil {
+		t.Fatalf("prefix sibling must reject: %s", evil)
+	}
+}
+
 func TestSandboxContainerNameUnique(t *testing.T) {
 	a := sandboxContainerName("run1", jobPhaseReview, "aaa111")
 	b := sandboxContainerName("run1", jobPhaseReview, "bbb222")

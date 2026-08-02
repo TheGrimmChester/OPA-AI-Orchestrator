@@ -1095,13 +1095,26 @@ func processSCMJob(jobID string) {
 	if job == nil {
 		return
 	}
-	switch k := agentKind(strings.TrimSpace(job.Kind)); {
-	case k == kindRun:
+	switch scmJobProcessor(agentKind(strings.TrimSpace(job.Kind))) {
+	case "run":
 		processPRRun(jobID)
-	case isAgentChildKind(k):
+	case "agent":
 		processAgentChild(jobID)
 	default:
 		processLegacySCMJob(jobID)
+	}
+}
+
+// scmJobProcessor selects which processor handles a job kind. Pure helper so
+// dispatch wiring is unit-testable without running agents.
+func scmJobProcessor(k agentKind) string {
+	switch {
+	case k == kindRun:
+		return "run"
+	case isAgentChildKind(k):
+		return "agent"
+	default:
+		return "legacy"
 	}
 }
 

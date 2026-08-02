@@ -116,6 +116,17 @@ func TestGateCloudDiffDenials(t *testing.T) {
 	}
 }
 
+func TestGateCloudDiffLineCap(t *testing.T) {
+	caps := cloudDiffCaps{MaxFiles: 10, MaxLines: 5}
+	err := gateCloudDiff([]cloudDiffChange{{Path: "src/a.go", Added: 4, Removed: 3}}, nil, caps)
+	if err == nil || !strings.Contains(err.Error(), "line cap") {
+		t.Fatalf("want line cap deny, got %v", err)
+	}
+	if err := gateCloudDiff([]cloudDiffChange{{Path: "src/a.go", Added: 2, Removed: 2}}, nil, caps); err != nil {
+		t.Fatalf("under cap should allow: %v", err)
+	}
+}
+
 func TestParseCloudDiffChangesModes(t *testing.T) {
 	diff := `diff --git a/bin/x b/bin/x
 old mode 100644

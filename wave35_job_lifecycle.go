@@ -53,6 +53,13 @@ func teardownJobContainersByRun(ctx context.Context, runID string) error {
 	return teardownContainersByLabel(ctx, "opa.run", runID)
 }
 
+// dockerLabelFilter builds a `docker ps --filter` label selector. Teardown
+// paths must use opa.run / opa.job through this helper so the filter shape
+// stays testable without a live docker daemon.
+func dockerLabelFilter(key, value string) string {
+	return "label=" + key + "=" + sanitizeDockerName(value)
+}
+
 func teardownContainersByLabel(ctx context.Context, key, value string) error {
 	if sandboxMode() != "docker" {
 		return nil
@@ -64,7 +71,7 @@ func teardownContainersByLabel(ctx context.Context, key, value string) error {
 	if _, err := dockerCmd(ctx, "version", "--format", "{{.Server.Version}}"); err != nil {
 		return nil
 	}
-	out, err := dockerCmd(ctx, "ps", "-aq", "--filter", "label="+key+"="+sanitizeDockerName(value))
+	out, err := dockerCmd(ctx, "ps", "-aq", "--filter", dockerLabelFilter(key, value))
 	if err != nil {
 		return err
 	}
