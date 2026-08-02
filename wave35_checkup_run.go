@@ -211,13 +211,16 @@ func runCheckupStep(ctx context.Context, jobID, workRoot, network, image string,
 		}
 	}
 
-	// Bind the leaf tree itself at /opa-jobs/<id>/<rel>. Mounting the parent
-	// job dir at …/sandbox would nest primary/sandbox/related under cwd.
+	// Bind leaf tree; layout id is the worktree parent (run id), while JobID is
+	// the checkup child so cancel/teardown cannot touch sibling boxes.
 	workRel := sandboxWorkRel(workRoot)
+	layoutID := resolveSandboxJobID("", workRoot)
 
 	out, err := runSandboxedArgv(stepCtx, sandboxExecSpec{
 		Phase:       jobPhaseCheckup,
 		JobID:       jobID,
+		LayoutID:    layoutID,
+		NetworkID:   jobID,
 		HostWorkDir: workRoot,
 		WorkRel:     workRel,
 		Argv:        step.Argv,

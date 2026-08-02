@@ -44,13 +44,27 @@ func reapOrphanJobContainers(ctx context.Context) (removed int, err error) {
 
 // teardownJobContainers removes every container for one job id.
 func teardownJobContainers(ctx context.Context, jobID string) error {
+	return teardownContainersByLabel(ctx, "opa.job", jobID)
+}
+
+// teardownJobContainersByRun removes containers labeled opa.run=<runID>
+// (children that shared the parent run's network/layout).
+func teardownJobContainersByRun(ctx context.Context, runID string) error {
+	return teardownContainersByLabel(ctx, "opa.run", runID)
+}
+
+func teardownContainersByLabel(ctx context.Context, key, value string) error {
 	if sandboxMode() != "docker" {
+		return nil
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
 		return nil
 	}
 	if _, err := dockerCmd(ctx, "version", "--format", "{{.Server.Version}}"); err != nil {
 		return nil
 	}
-	out, err := dockerCmd(ctx, "ps", "-aq", "--filter", "label=opa.job="+sanitizeDockerName(jobID))
+	out, err := dockerCmd(ctx, "ps", "-aq", "--filter", "label="+key+"="+sanitizeDockerName(value))
 	if err != nil {
 		return err
 	}
