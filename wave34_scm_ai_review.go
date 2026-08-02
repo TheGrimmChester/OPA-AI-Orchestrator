@@ -483,7 +483,7 @@ func reviewOneUnit(job *scmJob, key, agentBin, model string, baseArgs []string, 
 	_ = agentBin // resolveAgentBin inside launchAgentSandbox ignores settings bin
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseReview, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
-		APIKey: key, Extra: extra, Parent: scmJobContext(job.ID),
+		APIKey: key, Extra: extra, Parent: scmJobContext(job.ID), JobID: nz(job.RunID, job.ID),
 	})
 	if err != nil {
 		part.Fallback = true
@@ -957,7 +957,7 @@ func runOPAReviewSynthesis(job *scmJob, key, agentBin string, baseArgs []string,
 	_ = agentBin
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseReview, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
-		APIKey: key, Parent: scmJobContext(job.ID),
+		APIKey: key, Parent: scmJobContext(job.ID), JobID: nz(job.RunID, job.ID),
 	})
 	if err != nil {
 		return fallbackSynth

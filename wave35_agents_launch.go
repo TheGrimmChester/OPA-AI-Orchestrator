@@ -24,6 +24,9 @@ type agentLaunchSpec struct {
 	Extra        map[string]string
 	Timeout      time.Duration
 	Parent       context.Context
+	// JobID labels the sandbox container / network. Prefer scm job or run id —
+	// never derive solely from a "sandbox"/"primary" leaf (collision across jobs).
+	JobID string
 }
 
 func launchAgentSandbox(spec agentLaunchSpec) ([]byte, error) {
@@ -41,19 +44,13 @@ func launchAgentSandbox(spec agentLaunchSpec) ([]byte, error) {
 	bin := resolveAgentBin()
 	argv := append([]string{bin}, spec.Args...)
 	work := nz(spec.WorktreeRoot, spec.Dir)
-	jobID := ""
-	if work != "" {
-		// Best-effort: basename of parent of primary, or leaf.
-		jobID = filepath.Base(filepath.Clean(work))
-		if jobID == "primary" {
-			jobID = filepath.Base(filepath.Dir(work))
-		}
-	}
+	jobID := resolveSandboxJobID(spec.JobID, work)
+	workRel := sandboxWorkRel(work)
 	out, err := runSandboxedArgv(ctx, sandboxExecSpec{
 		Phase:       spec.Phase,
 		JobID:       jobID,
 		HostWorkDir: work,
-		WorkRel:     "primary",
+		WorkRel:     workRel,
 		Argv:        argv,
 		Secrets:     map[string]string{"CURSOR_API_KEY": spec.APIKey},
 		ExtraEnv:    spec.Extra,
@@ -73,6 +70,38 @@ func launchAgentSandbox(spec agentLaunchSpec) ([]byte, error) {
 		return out, err
 	}
 	return out, nil
+}
+
+// resolveSandboxJobID picks a stable per-job label. Explicit ids win; otherwise
+// walk up past layout leaves (primary|sandbox|related).
+func resolveSandboxJobID(explicit, work string) string {
+	if id := strings.TrimSpace(explicit); id != "" {
+		return id
+	}
+	work = filepath.Clean(work)
+	if work == "" || work == "." {
+		return "anon"
+	}
+	base := filepath.Base(work)
+	switch base {
+	case "primary", "sandbox", "related":
+		parent := filepath.Base(filepath.Dir(work))
+		if parent != "" && parent != "." && parent != string(filepath.Separator) {
+			return parent
+		}
+	}
+	return base
+}
+
+func sandboxWorkRel(work string) string {
+	switch filepath.Base(filepath.Clean(work)) {
+	case "sandbox":
+		return "sandbox"
+	case "related":
+		return "related"
+	default:
+		return "primary"
+	}
 }
 
 func networkForPhase(phase jobPhase) string {

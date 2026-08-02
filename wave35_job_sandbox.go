@@ -76,8 +76,9 @@ func (dockerSandboxRunner) Name() string { return "docker" }
 func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([]byte, error) {
 	if err := requireDockerCLI(); err != nil {
 		if allowHostExecFallback() {
+			stampSandboxHonesty(spec.JobID, "UNSANDBOXED: tools ran as root (OPA_JOB_ALLOW_HOST_EXEC=1)")
 			LogWarn("sandbox docker unavailable — OPA_JOB_ALLOW_HOST_EXEC=1 falling back to host", map[string]interface{}{
-				"error": err.Error(), "honesty": "UNSANDBOXED: tools ran as root",
+				"error": err.Error(), "honesty": "UNSANDBOXED: tools ran as root", "job_id": spec.JobID,
 			})
 			return hostSandboxRunner{}.RunOnce(ctx, spec)
 		}
@@ -217,6 +218,37 @@ func requireDockerCLI() error {
 
 func allowHostExecFallback() bool {
 	return strings.TrimSpace(os.Getenv("OPA_JOB_ALLOW_HOST_EXEC")) == "1"
+}
+
+func stampSandboxHonesty(jobID, honesty string) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" || honesty == "" {
+		return
+	}
+	// Sandbox JobID is often the run id (shared network label). Prefer that
+	// job; if missing, stamp any live child that shares RunID == jobID.
+	job := getSCMJob(jobID)
+	if job == nil {
+		scmJobLive.Range(func(_, v interface{}) bool {
+			j, ok := v.(*scmJob)
+			if !ok || j == nil {
+				return true
+			}
+			if j.RunID == jobID || j.ID == jobID {
+				job = j
+				return false
+			}
+			return true
+		})
+	}
+	if job == nil {
+		return
+	}
+	if job.Summary == nil {
+		job.Summary = map[string]interface{}{}
+	}
+	job.Summary["sandbox_honesty"] = honesty
+	persistSCMJob(job)
 }
 
 func dockerCmd(ctx context.Context, args ...string) ([]byte, error) {

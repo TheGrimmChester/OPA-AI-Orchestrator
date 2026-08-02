@@ -43,3 +43,26 @@ func TestRedactJobOutput(t *testing.T) {
 		t.Fatalf("got %q", out)
 	}
 }
+
+func TestResolveSandboxJobID(t *testing.T) {
+	if got := resolveSandboxJobID("run-abc", "/tmp/opa-review/run-abc/sandbox"); got != "run-abc" {
+		t.Fatalf("explicit wins: %s", got)
+	}
+	if got := resolveSandboxJobID("", "/tmp/opa-review/job99/sandbox"); got != "job99" {
+		t.Fatalf("sandbox leaf: %s", got)
+	}
+	if got := resolveSandboxJobID("", "/tmp/opa-review/job99/primary"); got != "job99" {
+		t.Fatalf("primary leaf: %s", got)
+	}
+	a := resolveSandboxJobID("", "/tmp/opa-review/aaa/sandbox")
+	b := resolveSandboxJobID("", "/tmp/opa-review/bbb/sandbox")
+	if a == b || a == "sandbox" || b == "sandbox" {
+		t.Fatalf("distinct jobs must not share leaf id: a=%s b=%s", a, b)
+	}
+	if sandboxWorkRel("/x/y/sandbox") != "sandbox" {
+		t.Fatal("workRel sandbox")
+	}
+	if sandboxWorkRel("/x/y/primary") != "primary" {
+		t.Fatal("workRel primary")
+	}
+}
