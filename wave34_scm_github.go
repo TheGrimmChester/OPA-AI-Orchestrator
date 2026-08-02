@@ -77,6 +77,11 @@ func githubAPI(c *opaConnector, method, path string, body io.Reader) ([]byte, in
 	if err != nil {
 		return nil, 0, err
 	}
+	return githubAPIWithToken(tok, method, path, body)
+}
+
+// githubAPIWithToken performs a GitHub REST call with an already-minted token.
+func githubAPIWithToken(tok, method, path string, body io.Reader) ([]byte, int, error) {
 	url := path
 	if !strings.HasPrefix(path, "http") {
 		url = "https://api.github.com" + path
@@ -98,6 +103,25 @@ func githubAPI(c *opaConnector, method, path string, body io.Reader) ([]byte, in
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	return raw, resp.StatusCode, nil
+}
+
+// githubAPIScoped mints a repo-scoped App token (or PAT) for the given perms
+// and performs the request. Used by write/publish call sites.
+func githubAPIScoped(c *opaConnector, owner, repo string, perms map[string]string, method, path string, body io.Reader) ([]byte, int, error) {
+	full := strings.Trim(owner+"/"+repo, "/")
+	tok, err := githubAccessTokenFor(c, full, perms)
+	if err != nil {
+		return nil, 0, err
+	}
+	return githubAPIWithToken(tok, method, path, body)
+}
+
+// githubWriteAPI is githubAPIScoped after authorizeGitHubWrite (fail closed for PAT).
+func githubWriteAPI(c *opaConnector, owner, repo string, perms map[string]string, method, path string, body io.Reader) ([]byte, int, error) {
+	if _, err := authorizeGitHubWrite(c); err != nil {
+		return nil, 0, err
+	}
+	return githubAPIScoped(c, owner, repo, perms, method, path, body)
 }
 
 // githubLooksLikeRealToken detects classic / fine-grained / OAuth GitHub tokens.
@@ -289,7 +313,7 @@ func githubCreateCheckRun(c *opaConnector, owner, repo, name, headSHA, status, c
 		}
 	}
 	payload, _ := json.Marshal(body)
-	raw, code, err := githubAPI(c, http.MethodPost, fmt.Sprintf("/repos/%s/%s/check-runs", owner, repo), strings.NewReader(string(payload)))
+	raw, code, err := githubWriteAPI(c, owner, repo, githubPermsChecksWrite(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/check-runs", owner, repo), strings.NewReader(string(payload)))
 	if err != nil {
 		return 0, err
 	}
@@ -304,7 +328,7 @@ func githubCreateCheckRun(c *opaConnector, owner, repo, name, headSHA, status, c
 }
 
 func githubUpdateCheckRun(c *opaConnector, owner, repo string, checkID int64, status, conclusion, title, summary, detailsURL string, annotations []map[string]interface{}) error {
-	if checkID == 0 || githubUseMockAPI(c) {
+	if checkID == 0 || githubUseMockAPI(c) || c != nil && c.Kind == "github_pat" && envOr("OPA_SCM_SKIP_CHECK_RUNS", "1") == "1" {
 		return nil
 	}
 	body := map[string]interface{}{
@@ -326,7 +350,7 @@ func githubUpdateCheckRun(c *opaConnector, owner, repo string, checkID int64, st
 		}
 	}
 	payload, _ := json.Marshal(body)
-	_, code, err := githubAPI(c, http.MethodPatch, fmt.Sprintf("/repos/%s/%s/check-runs/%d", owner, repo, checkID), strings.NewReader(string(payload)))
+	_, code, err := githubWriteAPI(c, owner, repo, githubPermsChecksWrite(), http.MethodPatch, fmt.Sprintf("/repos/%s/%s/check-runs/%d", owner, repo, checkID), strings.NewReader(string(payload)))
 	if err != nil {
 		return err
 	}
@@ -347,7 +371,7 @@ func githubPRCommentCreate(c *opaConnector, owner, repo string, pr int, body str
 		return 0, nil
 	}
 	payload, _ := json.Marshal(map[string]string{"body": body})
-	raw, code, err := githubAPI(c, http.MethodPost, fmt.Sprintf("/repos/%s/%s/issues/%d/comments", owner, repo, pr), strings.NewReader(string(payload)))
+	raw, code, err := githubWriteAPI(c, owner, repo, githubPermsPRWrite(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/issues/%d/comments", owner, repo, pr), strings.NewReader(string(payload)))
 	if err != nil {
 		return 0, err
 	}
@@ -366,7 +390,7 @@ func githubUpdateIssueComment(c *opaConnector, owner, repo string, commentID int
 		return nil
 	}
 	payload, _ := json.Marshal(map[string]string{"body": body})
-	raw, code, err := githubAPI(c, http.MethodPatch, fmt.Sprintf("/repos/%s/%s/issues/comments/%d", owner, repo, commentID), strings.NewReader(string(payload)))
+	raw, code, err := githubWriteAPI(c, owner, repo, githubPermsPRWrite(), http.MethodPatch, fmt.Sprintf("/repos/%s/%s/issues/comments/%d", owner, repo, commentID), strings.NewReader(string(payload)))
 	if err != nil {
 		return err
 	}
@@ -487,7 +511,7 @@ func githubUpdatePRReviewComment(c *opaConnector, owner, repo string, commentID 
 		return nil
 	}
 	payload, _ := json.Marshal(map[string]string{"body": body})
-	raw, code, err := githubAPI(c, http.MethodPatch, fmt.Sprintf("/repos/%s/%s/pulls/comments/%d", owner, repo, commentID), strings.NewReader(string(payload)))
+	raw, code, err := githubWriteAPI(c, owner, repo, githubPermsPRWrite(), http.MethodPatch, fmt.Sprintf("/repos/%s/%s/pulls/comments/%d", owner, repo, commentID), strings.NewReader(string(payload)))
 	if err != nil {
 		return err
 	}
@@ -509,7 +533,7 @@ func githubReplyPRReviewComment(c *opaConnector, owner, repo string, pr int, com
 		payload["commit_id"] = commitSHA
 	}
 	raw, _ := json.Marshal(payload)
-	resp, code, err := githubAPI(c, http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/comments", owner, repo, pr), strings.NewReader(string(raw)))
+	resp, code, err := githubWriteAPI(c, owner, repo, githubPermsPRWrite(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/comments", owner, repo, pr), strings.NewReader(string(raw)))
 	if err != nil {
 		return err
 	}
@@ -535,7 +559,7 @@ func githubPRInlineComment(c *opaConnector, owner, repo string, pr int, commitSH
 		"line":      line,
 		"side":      "RIGHT",
 	})
-	raw, code, err := githubAPI(c, http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/comments", owner, repo, pr), strings.NewReader(string(payload)))
+	raw, code, err := githubWriteAPI(c, owner, repo, githubPermsPRWrite(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/comments", owner, repo, pr), strings.NewReader(string(payload)))
 	if err != nil {
 		return err
 	}
@@ -580,7 +604,7 @@ func githubCreatePRReview(c *opaConnector, owner, repo string, pr int, commitSHA
 		}
 	}
 	raw, _ := json.Marshal(payload)
-	resp, code, err := githubAPI(c, http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews", owner, repo, pr), strings.NewReader(string(raw)))
+	resp, code, err := githubWriteAPI(c, owner, repo, githubPermsPRWrite(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews", owner, repo, pr), strings.NewReader(string(raw)))
 	if err != nil {
 		return err
 	}
@@ -600,7 +624,7 @@ func githubUpdatePullBody(c *opaConnector, owner, repo string, pr int, body stri
 		return nil
 	}
 	payload, _ := json.Marshal(map[string]string{"body": body})
-	resp, code, err := githubAPI(c, http.MethodPatch, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, pr), strings.NewReader(string(payload)))
+	resp, code, err := githubWriteAPI(c, owner, repo, githubPermsPRWrite(), http.MethodPatch, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, pr), strings.NewReader(string(payload)))
 	if err != nil {
 		return err
 	}
@@ -660,7 +684,7 @@ func githubRequestPRReviewersEx(c *opaConnector, owner, repo string, pr int, rev
 		payloadMap["team_reviewers"] = teams
 	}
 	payload, _ := json.Marshal(payloadMap)
-	resp, code, err := githubAPI(c, http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/requested_reviewers", owner, repo, pr), strings.NewReader(string(payload)))
+	resp, code, err := githubWriteAPI(c, owner, repo, githubPermsPRWrite(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/requested_reviewers", owner, repo, pr), strings.NewReader(string(payload)))
 	if err != nil {
 		return err
 	}
@@ -875,7 +899,7 @@ func githubCreatePullRequest(c *opaConnector, owner, repo, title, body, head, ba
 	payload, _ := json.Marshal(map[string]interface{}{
 		"title": title, "body": body, "head": head, "base": base, "draft": draft,
 	})
-	raw, code, err := githubAPI(c, http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls", owner, repo), strings.NewReader(string(payload)))
+	raw, code, err := githubWriteAPI(c, owner, repo, githubPermsCreatePR(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls", owner, repo), strings.NewReader(string(payload)))
 	if err != nil {
 		return 0, "", err
 	}

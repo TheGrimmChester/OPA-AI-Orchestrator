@@ -142,7 +142,7 @@ func prepareSCMWorktree(c *opaConnector, fullName, sha string, pr int, worktreeI
 		return absRoot, relPath, meta, nil
 	}
 
-	tok, terr := githubAccessToken(c)
+	tok, terr := githubAccessTokenFor(c, fullName, githubPermsCloneRead())
 	if terr != nil {
 		return absRoot, relPath, meta, fmt.Errorf("github token: %w", terr)
 	}

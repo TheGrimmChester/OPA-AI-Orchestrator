@@ -77,6 +77,43 @@ func TestAuthorizeGitPushRefusesPAT(t *testing.T) {
 	}
 }
 
+func TestAuthorizeGitHubWritePATGate(t *testing.T) {
+	app := &opaConnector{Kind: "github_app", InstallationID: "1"}
+	pat := &opaConnector{Kind: "github_pat", TokenRef: "ghp_fake_token_value_xx"}
+
+	honesty, err := authorizeGitHubWrite(app)
+	if err != nil || honesty != "" {
+		t.Fatalf("app want ok empty honesty: err=%v honesty=%q", err, honesty)
+	}
+
+	t.Setenv("OPA_AGENTS_ALLOW_PAT_WRITE", "0")
+	if _, err := authorizeGitHubWrite(pat); err == nil || !strings.Contains(err.Error(), "OPA_AGENTS_ALLOW_PAT_WRITE") {
+		t.Fatalf("PAT without flag want refuse, got %v", err)
+	}
+
+	t.Setenv("OPA_AGENTS_ALLOW_PAT_WRITE", "1")
+	honesty, err = authorizeGitHubWrite(pat)
+	if err != nil {
+		t.Fatalf("PAT with flag should allow: %v", err)
+	}
+	if !strings.Contains(honesty, "degraded") || !strings.Contains(honesty, "shared PAT") {
+		t.Fatalf("want degraded honesty, got %q", honesty)
+	}
+
+	job := &scmJob{ID: "j1", Summary: map[string]interface{}{}}
+	if err := ensureGitHubWriteAllowed(job, pat); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if strFromAny(job.Summary["capability_honesty"]) == "" {
+		t.Fatalf("expected capability_honesty on summary: %+v", job.Summary)
+	}
+
+	t.Setenv("OPA_AGENTS_ALLOW_PAT_WRITE", "0")
+	if err := ensureGitHubWriteAllowed(job, pat); err == nil {
+		t.Fatal("ensure should refuse when flag unset")
+	}
+}
+
 func TestGateCloudDiffDenials(t *testing.T) {
 	caps := cloudDiffCaps{MaxFiles: 10, MaxLines: 100}
 
