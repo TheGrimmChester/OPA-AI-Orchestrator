@@ -804,8 +804,18 @@ func enqueueAutoFixFollowUpReviews(parent *scmJob, fix *opaAutoFixJob) []string 
 	return ids
 }
 
+// gitAutofixCmd runs host-side git for autofix land/checkout with a curated
+// env (no JWT_SECRET / connector secrets) and hooks disabled so untrusted
+// worktree hooks cannot see service credentials.
+func gitAutofixCmd(root string, args ...string) *exec.Cmd {
+	full := append([]string{"-C", root, "-c", "core.hooksPath=/dev/null"}, args...)
+	cmd := exec.Command("git", full...)
+	cmd.Env = hostToolEnv()
+	return cmd
+}
+
 func gitCheckoutNewBranch(root, branch string) error {
-	cmd := exec.Command("git", "-C", root, "checkout", "-B", branch)
+	cmd := gitAutofixCmd(root, "checkout", "-B", branch)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%v (%s)", err, truncateStr(string(out), 160))
 	}
@@ -813,7 +823,7 @@ func gitCheckoutNewBranch(root, branch string) error {
 }
 
 func hasGitChanges(root string) bool {
-	cmd := exec.Command("git", "-C", root, "status", "--porcelain")
+	cmd := gitAutofixCmd(root, "status", "--porcelain")
 	out, err := cmd.Output()
 	if err != nil {
 		return false
@@ -822,15 +832,15 @@ func hasGitChanges(root string) bool {
 }
 
 func gitCommitAll(root, message string) (string, error) {
-	_ = exec.Command("git", "-C", root, "config", "user.email", "opa-review@localhost").Run()
-	_ = exec.Command("git", "-C", root, "config", "user.name", "OPA Review").Run()
-	if out, err := exec.Command("git", "-C", root, "add", "-A").CombinedOutput(); err != nil {
+	_ = gitAutofixCmd(root, "config", "user.email", "opa-review@localhost").Run()
+	_ = gitAutofixCmd(root, "config", "user.name", "OPA Review").Run()
+	if out, err := gitAutofixCmd(root, "add", "-A").CombinedOutput(); err != nil {
 		return "", fmt.Errorf("git add: %v (%s)", err, truncateStr(string(out), 120))
 	}
 	if !hasGitChanges(root) {
 		return "", fmt.Errorf("no changes to commit")
 	}
-	if out, err := exec.Command("git", "-C", root, "commit", "-m", message).CombinedOutput(); err != nil {
+	if out, err := gitAutofixCmd(root, "commit", "-m", message).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("git commit: %v (%s)", err, truncateStr(string(out), 160))
 	}
 	return gitRevParse(root), nil

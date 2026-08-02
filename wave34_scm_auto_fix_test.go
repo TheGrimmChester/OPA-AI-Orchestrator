@@ -82,3 +82,23 @@ func TestAutofixFindingAllowlistRequired(t *testing.T) {
 		t.Fatalf("outside allowlist must deny: %v", err)
 	}
 }
+
+func TestGitAutofixCmdEnvNoSecrets(t *testing.T) {
+	t.Setenv("JWT_SECRET", "jwt-leak")
+	t.Setenv("OPA_CONNECTOR_SECRET", "conn-leak")
+	t.Setenv("PATH", "/usr/bin")
+	cmd := gitAutofixCmd("/tmp/repo", "status", "--porcelain")
+	if cmd.Env == nil {
+		t.Fatal("gitAutofixCmd must set Env (not inherit process)")
+	}
+	joined := strings.Join(cmd.Env, "\n")
+	for _, leak := range []string{"JWT_SECRET=", "OPA_CONNECTOR_SECRET="} {
+		if strings.Contains(joined, leak) {
+			t.Fatalf("autofix git env leaked %s", leak)
+		}
+	}
+	args := strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "core.hooksPath=/dev/null") {
+		t.Fatalf("hooks must be disabled: %s", args)
+	}
+}

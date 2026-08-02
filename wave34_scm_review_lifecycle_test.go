@@ -188,6 +188,44 @@ func TestMidReviewRelatedUsesRunWorktreeID(t *testing.T) {
 	}
 }
 
+func TestRelatedCheckoutsForReviewFromPrepare(t *testing.T) {
+	runID := "run-rel-brief"
+	prep := &scmJob{
+		ID: "prep-" + runID, Kind: string(kindPrepare), RunID: runID, ParentID: runID, Status: "completed",
+		Summary: map[string]interface{}{
+			"related_checkouts": []relatedCheckout{{
+				RepoFullName: "acme/shared", Path: "/tmp/opa-review/" + runID + "/related/acme-shared", SHA: "abc", Source: "link",
+			}},
+		},
+	}
+	bot := &scmJob{
+		ID: "bot-" + runID, Kind: string(kindBugbot), RunID: runID, ParentID: runID, Status: "running",
+		Summary: map[string]interface{}{},
+	}
+	parent := &scmJob{
+		ID: runID, Kind: string(kindRun), RunID: runID, Status: "running",
+		Summary: map[string]interface{}{"child_ids": []string{prep.ID, bot.ID}},
+	}
+	scmJobLive.Store(prep.ID, prep)
+	scmJobLive.Store(bot.ID, bot)
+	scmJobLive.Store(parent.ID, parent)
+	t.Cleanup(func() {
+		scmJobLive.Delete(prep.ID)
+		scmJobLive.Delete(bot.ID)
+		scmJobLive.Delete(parent.ID)
+	})
+
+	got := relatedCheckoutsForReview(bot)
+	if len(got) != 1 || got[0].RepoFullName != "acme/shared" {
+		t.Fatalf("bugbot must read prepare related_checkouts, got %+v", got)
+	}
+	brief := formatRelatedCheckoutsForPromptWithJob(got, bot.ID)
+	if !strings.Contains(brief, "acme/shared") {
+		t.Fatalf("brief missing related: %s", brief)
+	}
+}
+
+
 
 func TestResolveRelatedReposForJob(t *testing.T) {
 	job := &scmJob{RepoFullName: "acme/primary", PRNumber: 1}
