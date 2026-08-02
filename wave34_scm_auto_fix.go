@@ -651,11 +651,11 @@ func runAutoFixAgent(parent *scmJob, checkoutRoot string, fix *opaAutoFixJob) er
 	_ = agentBin
 	jobID := ""
 	if parent != nil {
-		jobID = parent.ID
+		jobID = nz(parent.RunID, parent.ID)
 	}
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseAutofix, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
-		APIKey: key, Parent: scmJobContext(jobID), Timeout: 1200 * time.Second,
+		APIKey: key, Parent: scmJobContext(jobID), Timeout: 1200 * time.Second, JobID: jobID,
 	})
 	if err != nil {
 		return fmt.Errorf("%v (%s)", err, truncateStr(string(out), 300))

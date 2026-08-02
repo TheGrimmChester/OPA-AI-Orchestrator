@@ -465,10 +465,7 @@ func scanSecretsGitleaksSandboxed(ctx context.Context, runID, root, hostReport s
 	if !filepath.IsAbs(root) {
 		return fmt.Errorf("gitleaks sandbox requires absolute root")
 	}
-	jobID := runID
-	if jobID == "" {
-		jobID = filepath.Base(root)
-	}
+	jobID := resolveSandboxJobID(runID, root)
 	outDir, err := os.MkdirTemp("", "opa-gitleaks-out-*")
 	if err != nil {
 		return err

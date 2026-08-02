@@ -529,6 +529,7 @@ Do not commit or push. Do not invent vendor product names.
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseContext, Args: args, Dir: worktreeAbs, WorktreeRoot: worktreeAbs,
 		APIKey: apiKey, Timeout: 900 * time.Second,
+		JobID: resolveSandboxJobID("", worktreeAbs),
 	})
 	usage := string(out)
 	if err != nil {
@@ -577,12 +578,14 @@ func runOPAReviewUnderstandingPass(job *scmJob, key, agentBin string, baseArgs [
 	args := append(append([]string{}, baseArgs...), prompt)
 	_ = agentBin
 	parent := context.Background()
+	jobID := ""
 	if job != nil {
 		parent = scmJobContext(job.ID)
+		jobID = nz(job.RunID, job.ID)
 	}
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseContext, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
-		APIKey: key, Parent: parent,
+		APIKey: key, Parent: parent, JobID: jobID,
 	})
 	if err != nil {
 		return ""
