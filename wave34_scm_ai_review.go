@@ -99,7 +99,11 @@ func runCursorAIReview(job *scmJob, conn *opaConnector, wr *opaWatchedRepo, chec
 	res.Model = model
 	if key == "" {
 		res.Status = "skipped"
-		res.Summary = "OPA Review API key not set — save a CLI agent key under Account (personal or org)"
+		if strings.TrimSpace(job.ActorUserID) == "" {
+			res.Summary = "OPA Review API key not set — webhook jobs need an org CLI agent key under Account → Organization (personal keys are ignored when ActorUserID is empty)"
+		} else {
+			res.Summary = "OPA Review API key not set — save a CLI agent key under Account (personal or org)"
+		}
 		persistAIReview(job, res)
 		return res
 	}
