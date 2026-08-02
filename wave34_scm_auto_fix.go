@@ -635,6 +635,7 @@ func runAutoFixAgent(parent *scmJob, checkoutRoot, worktreeID string, fix *opaAu
 		return fmt.Errorf("CLI agent API key not set — save one under Account (personal or org)")
 	}
 	brief := packAutoFixBrief(parent, checkoutRoot, fix)
+	// Autofix checkouts live under their own worktree id (not the parent run).
 	jobLabel := resolveSandboxJobID(worktreeID, checkoutRoot)
 	cancelID := ""
 	if parent != nil {
@@ -658,7 +659,8 @@ func runAutoFixAgent(parent *scmJob, checkoutRoot, worktreeID string, fix *opaAu
 	_ = agentBin
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseAutofix, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
-		APIKey: key, Parent: scmJobContext(cancelID), Timeout: 1200 * time.Second, JobID: jobLabel,
+		APIKey: key, Parent: scmJobContext(cancelID), Timeout: 1200 * time.Second,
+		JobID: jobLabel, RunID: jobLabel,
 	})
 	if err != nil {
 		return fmt.Errorf("%v (%s)", err, truncateStr(string(out), 300))

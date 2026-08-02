@@ -24,9 +24,11 @@ type agentLaunchSpec struct {
 	Extra        map[string]string
 	Timeout      time.Duration
 	Parent       context.Context
-	// JobID labels the sandbox container / network. Prefer scm job or run id —
-	// never derive solely from a "sandbox"/"primary" leaf (collision across jobs).
+	// JobID labels the sandbox container (opa.job) for cancel teardown.
+	// Prefer the scm *child* id. RunID is the worktree/network identity when
+	// the checkout lives under the parent run (opa.run + bind layout).
 	JobID string
+	RunID string
 }
 
 func launchAgentSandbox(spec agentLaunchSpec) ([]byte, error) {
@@ -44,11 +46,14 @@ func launchAgentSandbox(spec agentLaunchSpec) ([]byte, error) {
 	bin := resolveAgentBin()
 	argv := append([]string{bin}, spec.Args...)
 	work := nz(spec.WorktreeRoot, spec.Dir)
-	jobID := resolveSandboxJobID(spec.JobID, work)
+	labelID := resolveSandboxJobID(spec.JobID, work)
+	layoutID := nz(strings.TrimSpace(spec.RunID), labelID)
 	workRel := sandboxWorkRel(work)
 	out, err := runSandboxedArgv(ctx, sandboxExecSpec{
 		Phase:       spec.Phase,
-		JobID:       jobID,
+		JobID:       labelID,
+		LayoutID:    layoutID,
+		NetworkID:   layoutID,
 		HostWorkDir: work,
 		WorkRel:     workRel,
 		Argv:        argv,

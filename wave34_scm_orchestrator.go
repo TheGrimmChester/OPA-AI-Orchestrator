@@ -517,12 +517,19 @@ func cancelSCMJobWithReason(id, reason string) (*scmJob, string, int) {
 				c()
 			}
 		}
-		go func(jobID string) {
+		go func(jobID, runID, kind string) {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			_ = teardownJobContainers(ctx, jobID)
 			_ = removeJobInternalNetwork(ctx, jobID)
-		}(id)
+			// Parent run cancel also reaps boxes labeled opa.run=<runID> (children
+			// that shared the run network/layout) and drops the shared network.
+			if agentKind(kind) == kindRun {
+				rid := nz(runID, jobID)
+				_ = teardownJobContainersByRun(ctx, rid)
+				_ = removeJobInternalNetwork(ctx, rid)
+			}
+		}(id, job.RunID, job.Kind)
 		refreshStacksForJob(id)
 		return job, "", 0
 	case "cancelled":

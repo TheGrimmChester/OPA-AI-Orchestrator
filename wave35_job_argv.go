@@ -14,6 +14,7 @@ type dockerRunSpec struct {
 	Name         string
 	Image        string
 	JobID        string
+	RunID        string // optional opa.run label (shared run teardown)
 	InstanceID   string
 	WorkHostPath string // host abs path bound at identity path
 	WorkRel      string // e.g. primary — container cwd is /opa-jobs/<id>/<WorkRel>
@@ -81,6 +82,11 @@ func buildDockerRunArgv(spec dockerRunSpec) ([]string, error) {
 		"--label", "opa.owner=opa-orchestrator",
 		"--label", "opa.instance="+instance,
 		"--label", "opa.job="+sanitizeDockerName(spec.JobID),
+	)
+	if rid := strings.TrimSpace(spec.RunID); rid != "" {
+		argv = append(argv, "--label", "opa.run="+sanitizeDockerName(rid))
+	}
+	argv = append(argv,
 		"--user", "65532:65532",
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges",

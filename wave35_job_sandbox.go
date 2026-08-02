@@ -25,7 +25,7 @@ type sandboxExecSpec struct {
 	HostWorkDir string // absolute host path of the tree to scan/review
 	WorkRel     string // primary|related/...
 	Argv        []string
-	Secrets     map[string]string // delivered only via docker exec --env
+	Secrets     map[string]string // delivered only via docker exec --env-file
 	ExtraEnv    map[string]string // non-secret → env-file / host env
 	ReadOnly    bool
 	Network     string
@@ -37,6 +37,12 @@ type sandboxExecSpec struct {
 	OutHostDir string
 	// NameSuffix disambiguates concurrent same-phase boxes; empty → random.
 	NameSuffix string
+	// LayoutID is the worktree identity used for bind-path checks (often the
+	// run id). Empty → JobID. NetworkID names the docker network (shared AI
+	// egress); empty → JobID. When LayoutID/NetworkID differ from JobID, boxes
+	// also get label opa.run=<id> so parent-run cancel can reap them.
+	LayoutID  string
+	NetworkID string
 }
 
 func getSandboxRunner() jobSandboxRunner {
@@ -91,12 +97,14 @@ func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([
 		return nil, fmt.Errorf("empty argv")
 	}
 	jobID := nz(spec.JobID, "anon")
+	layoutID := nz(spec.LayoutID, jobID)
+	networkID := nz(spec.NetworkID, jobID)
 	image := nz(spec.Image, sandboxImageForPhase(spec.Phase))
 	hostDir := filepath.Clean(spec.HostWorkDir)
 	if hostDir == "" || !filepath.IsAbs(hostDir) {
 		return nil, fmt.Errorf("HostWorkDir must be absolute")
 	}
-	if err := assertJobBindPath(hostDir, jobID); err != nil {
+	if err := assertJobBindPath(hostDir, layoutID); err != nil {
 		return nil, err
 	}
 
@@ -108,7 +116,7 @@ func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([
 
 	net := nz(spec.Network, "none")
 	if net == networkModeInternalProxy {
-		jobNet, err := prepareAIJobNetwork(ctx, jobID)
+		jobNet, err := prepareAIJobNetwork(ctx, networkID)
 		if err != nil {
 			return nil, fmt.Errorf("ai job network: %w", err)
 		}
@@ -140,9 +148,17 @@ func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([
 		extraBinds = append(extraBinds, outDir+":/out:rw")
 	}
 
+	runLabel := ""
+	if layoutID != jobID {
+		runLabel = layoutID
+	}
+	if networkID != jobID {
+		runLabel = networkID
+	}
+
 	if spec.Ephemeral {
 		runArgv, err := buildDockerRunArgv(dockerRunSpec{
-			Name: name, Image: image, JobID: jobID, InstanceID: opaInstanceID(),
+			Name: name, Image: image, JobID: jobID, RunID: runLabel, InstanceID: opaInstanceID(),
 			WorkHostPath: hostDir, WorkRel: nz(spec.WorkRel, "primary"),
 			ReadOnlyBind: spec.ReadOnly, Network: net,
 			EnvFile: envFile, PidsLimit: pidsForPhase(spec.Phase),
@@ -157,7 +173,7 @@ func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([
 	}
 
 	runArgv, err := buildDockerRunArgv(dockerRunSpec{
-		Name: name, Image: image, JobID: jobID, InstanceID: opaInstanceID(),
+		Name: name, Image: image, JobID: jobID, RunID: runLabel, InstanceID: opaInstanceID(),
 		WorkHostPath: hostDir, WorkRel: nz(spec.WorkRel, "primary"),
 		ReadOnlyBind: spec.ReadOnly, Network: net,
 		EnvFile: envFile, PidsLimit: pidsForPhase(spec.Phase),

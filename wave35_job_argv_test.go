@@ -8,7 +8,7 @@ import (
 func TestBuildDockerRunArgvHardening(t *testing.T) {
 	argv, err := buildDockerRunArgv(dockerRunSpec{
 		Name: "opa-job-test-scan", Image: "opa-runner-scan:smoke",
-		JobID: "testjob", WorkHostPath: "/tmp/opa-review/testjob/primary",
+		JobID: "child1", RunID: "run1", WorkHostPath: "/tmp/opa-review/run1/primary",
 		WorkRel: "primary", ReadOnlyBind: true, Network: "none",
 	})
 	if err != nil {
@@ -23,6 +23,8 @@ func TestBuildDockerRunArgvHardening(t *testing.T) {
 		"--network none",
 		"--memory-swap",
 		"opa.owner=opa-orchestrator",
+		"opa.job=child1",
+		"opa.run=run1",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing %q in %s", want, joined)

@@ -587,11 +587,13 @@ func runOPAReviewUnderstandingPass(job *scmJob, key, agentBin string, baseArgs [
 	fmt.Fprintf(&b, "## Diff (truncated)\n```\n%s\n```\n\n", truncateStr(diff, 20000))
 	b.WriteString("## Required JSON\n{\"understanding\":[\"data/control flow…\",\"assumptions…\",\"risk hotspots…\"],\"summary\":\"…\",\"verdict\":\"needs_context\",\"findings\":[]}\n")
 	jobID := ""
+	runID := ""
 	parent := context.Background()
 	jobKey := "anon"
 	if job != nil {
 		parent = scmJobContext(job.ID)
-		jobID = nz(job.RunID, job.ID)
+		jobID = job.ID
+		runID = nz(job.RunID, job.ID)
 		jobKey = job.ID
 	}
 	promptPath, cleanupBrief, errBrief := writeAgentBrief(checkoutRoot, jobID, fmt.Sprintf("opa-review-understand-%s.md", jobKey), b.String())
@@ -605,7 +607,7 @@ func runOPAReviewUnderstandingPass(job *scmJob, key, agentBin string, baseArgs [
 	_ = agentBin
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseContext, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
-		APIKey: key, Parent: parent, JobID: jobID,
+		APIKey: key, Parent: parent, JobID: jobID, RunID: runID,
 	})
 	if err != nil {
 		return ""
