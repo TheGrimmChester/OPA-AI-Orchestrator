@@ -635,13 +635,21 @@ func runAutoFixAgent(parent *scmJob, checkoutRoot string, fix *opaAutoFixJob) er
 		return fmt.Errorf("CLI agent API key not set — save one under Account (personal or org)")
 	}
 	brief := packAutoFixBrief(parent, checkoutRoot, fix)
-	promptPath := filepath.Join(os.TempDir(), fmt.Sprintf("opa-autofix-%s.md", fix.ID))
-	_ = os.WriteFile(promptPath, []byte(brief), 0o600)
-	defer os.Remove(promptPath)
+	jobLabel := ""
+	cancelID := ""
+	if parent != nil {
+		jobLabel = nz(parent.RunID, parent.ID)
+		cancelID = parent.ID
+	}
+	promptPath, cleanupBrief, errBrief := writeAgentBrief(checkoutRoot, jobLabel, fmt.Sprintf("opa-autofix-%s.md", fix.ID), brief)
+	if errBrief != nil {
+		return fmt.Errorf("brief write: %w", errBrief)
+	}
+	defer cleanupBrief()
 
 	prompt := fmt.Sprintf(
 		`You are applying OPA Auto-fix patches (cloud.patch). Working directory: %s. Read the brief at %s. Apply ONLY the minimal code changes needed to address the listed findings. Do not refactor unrelated code. Do not push, open PRs, run git remote, or babysit CI — only edit files on disk. The orchestrator will gate the diff and land. When done, summarize what you changed in one short paragraph.`,
-		checkoutRoot, promptPath,
+		agentVisibleWorkDir(checkoutRoot, jobLabel), promptPath,
 	)
 	args := []string{"-p", "--trust", "--output-format", "text", "--model", model}
 	if force {
@@ -649,13 +657,9 @@ func runAutoFixAgent(parent *scmJob, checkoutRoot string, fix *opaAutoFixJob) er
 	}
 	args = append(args, prompt)
 	_ = agentBin
-	jobID := ""
-	if parent != nil {
-		jobID = nz(parent.RunID, parent.ID)
-	}
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseAutofix, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
-		APIKey: key, Parent: scmJobContext(jobID), Timeout: 1200 * time.Second, JobID: jobID,
+		APIKey: key, Parent: scmJobContext(cancelID), Timeout: 1200 * time.Second, JobID: jobLabel,
 	})
 	if err != nil {
 		return fmt.Errorf("%v (%s)", err, truncateStr(string(out), 300))

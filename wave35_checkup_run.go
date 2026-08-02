@@ -211,19 +211,14 @@ func runCheckupStep(ctx context.Context, jobID, workRoot, network, image string,
 		}
 	}
 
-	hostDir := workRoot
-	workRel := "primary"
-	// If workRoot is .../sandbox or .../primary, bind parent job dir when possible.
-	base := filepath.Base(workRoot)
-	if base == "primary" || base == "sandbox" {
-		hostDir = filepath.Dir(workRoot)
-		workRel = base
-	}
+	// Bind the leaf tree itself at /opa-jobs/<id>/<rel>. Mounting the parent
+	// job dir at …/sandbox would nest primary/sandbox/related under cwd.
+	workRel := sandboxWorkRel(workRoot)
 
 	out, err := runSandboxedArgv(stepCtx, sandboxExecSpec{
 		Phase:       jobPhaseCheckup,
 		JobID:       jobID,
-		HostWorkDir: hostDir,
+		HostWorkDir: workRoot,
 		WorkRel:     workRel,
 		Argv:        step.Argv,
 		Secrets:     stepSecrets,
@@ -337,7 +332,9 @@ func runCheckupAgent(job *scmJob) error {
 	job.Summary["checkup_drops"] = policed.Drops
 
 	ctx := scmJobContext(job.ID)
-	result, anns := runCheckupPlan(ctx, nz(job.RunID, job.ID), absRoot, policed.Plan)
+	// Use the checkup child id — never the shared RunID — so stop/teardown
+	// cannot docker-rm sibling review/scan boxes labeled with the run.
+	result, anns := runCheckupPlan(ctx, job.ID, absRoot, policed.Plan)
 	result.Drops = policed.Drops
 	if note := phpstanNewErrorsHonesty(absRoot, policed.Plan); note != "" {
 		if result.Honesty != "" {

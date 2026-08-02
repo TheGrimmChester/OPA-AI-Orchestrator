@@ -104,6 +104,38 @@ func sandboxWorkRel(work string) string {
 	}
 }
 
+// agentVisibleWorkDir is the path the agent should see for the checkout.
+// In docker mode that is the identity mount (/opa-jobs/<id>/<rel>), not the host path.
+func agentVisibleWorkDir(checkoutRoot, jobID string) string {
+	checkoutRoot = filepath.Clean(checkoutRoot)
+	if sandboxMode() != "docker" {
+		return checkoutRoot
+	}
+	id := resolveSandboxJobID(jobID, checkoutRoot)
+	return containerWorkPath(id, sandboxWorkRel(checkoutRoot))
+}
+
+// writeAgentBrief stores a prompt packet under the checkout so docker binds
+// can read it. promptRef is the path to put in the agent prompt (visible cwd).
+func writeAgentBrief(checkoutRoot, jobID, filename, body string) (promptRef string, cleanup func(), err error) {
+	checkoutRoot = filepath.Clean(checkoutRoot)
+	filename = filepath.Base(strings.TrimSpace(filename))
+	if filename == "" || filename == "." || filename == string(filepath.Separator) {
+		return "", func() {}, fmt.Errorf("brief filename required")
+	}
+	dir := filepath.Join(checkoutRoot, ".opa-briefs")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", func() {}, err
+	}
+	hostPath := filepath.Join(dir, filename)
+	if err := os.WriteFile(hostPath, []byte(body), 0o600); err != nil {
+		return "", func() {}, err
+	}
+	promptRef = filepath.Join(agentVisibleWorkDir(checkoutRoot, jobID), ".opa-briefs", filename)
+	cleanup = func() { _ = os.Remove(hostPath) }
+	return promptRef, cleanup, nil
+}
+
 func networkForPhase(phase jobPhase) string {
 	switch phase {
 	case jobPhaseScan:

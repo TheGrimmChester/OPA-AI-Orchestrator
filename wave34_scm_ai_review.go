@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -455,9 +454,14 @@ func reviewOneUnit(job *scmJob, key, agentBin, model string, baseArgs []string, 
 		Findings: []map[string]interface{}{},
 	}
 	brief := packAIUnitContext(job, securityRunID, service, checkoutRoot, applied, unit, mcpPlan)
-	promptPath := filepath.Join(os.TempDir(), fmt.Sprintf("opa-review-%s-u%d.md", reviewID, idx))
-	_ = os.WriteFile(promptPath, []byte(brief), 0o600)
-	defer os.Remove(promptPath)
+	jobLabel := nz(job.RunID, job.ID)
+	promptPath, cleanupBrief, errBrief := writeAgentBrief(checkoutRoot, jobLabel, fmt.Sprintf("opa-review-%s-u%d.md", reviewID, idx), brief)
+	if errBrief != nil {
+		part.Fallback = true
+		part.Error = "brief write: " + errBrief.Error()
+		return part
+	}
+	defer cleanupBrief()
 
 	uiMode := ""
 	if unit.IsUI {
@@ -471,9 +475,10 @@ func reviewOneUnit(job *scmJob, key, agentBin, model string, baseArgs []string, 
 			uiMode += " Browser/visual MCP is unavailable — note that in findings if relevant, but still do a thorough code review."
 		}
 	}
+	workVisible := agentVisibleWorkDir(checkoutRoot, jobLabel)
 	prompt := fmt.Sprintf(
 		"%s Working directory is the full PR git tree at %s (OPA Review checkout). Step 2 — review aggressively: surrounding files, callers, interfaces, related tests — not the hunk alone.%s Focus unit %q (paths: %s). Read the brief at %s (full context packet) and produce ONLY the required JSON. Findings need severity blocker|high|medium|low, file, line, problem, why (production), concrete fix. human_review_priorities = merge blockers only. If clean, say why it looks safe. Do not commit, push, or call gh.",
-		opaReviewCompactScaffold, checkoutRoot, uiMode, unit.ID, strings.Join(unit.Paths, ", "), promptPath,
+		opaReviewCompactScaffold, workVisible, uiMode, unit.ID, strings.Join(unit.Paths, ", "), promptPath,
 	)
 	args := append(append([]string{}, baseArgs...), prompt)
 	extra := map[string]string{}
@@ -483,7 +488,7 @@ func reviewOneUnit(job *scmJob, key, agentBin, model string, baseArgs []string, 
 	_ = agentBin // resolveAgentBin inside launchAgentSandbox ignores settings bin
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseReview, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
-		APIKey: key, Extra: extra, Parent: scmJobContext(job.ID), JobID: nz(job.RunID, job.ID),
+		APIKey: key, Extra: extra, Parent: scmJobContext(job.ID), JobID: jobLabel,
 	})
 	if err != nil {
 		part.Fallback = true
@@ -946,18 +951,21 @@ func runOPAReviewSynthesis(job *scmJob, key, agentBin string, baseArgs []string,
 		return fallbackSynth
 	}
 	brief := packOPAReviewSynthesisBrief(job, res, understanding, gateStatus, contextTitles)
-	promptPath := filepath.Join(os.TempDir(), fmt.Sprintf("opa-review-synth-%s.md", nz(job.ID, res.ID)))
-	_ = os.WriteFile(promptPath, []byte(brief), 0o600)
-	defer os.Remove(promptPath)
+	jobLabel := nz(job.RunID, job.ID)
+	promptPath, cleanupBrief, errBrief := writeAgentBrief(checkoutRoot, jobLabel, fmt.Sprintf("opa-review-synth-%s.md", nz(job.ID, res.ID)), brief)
+	if errBrief != nil {
+		return fallbackSynth
+	}
+	defer cleanupBrief()
 	prompt := fmt.Sprintf(
 		"%s Synthesis for the OPA Review narrative résumé. Working directory is the PR checkout at %s. Read %s and output ONLY the required JSON (narrative, confidence, human_review_priorities as merge blockers only — max 5, verdict). Do not dump all findings. Do not commit, push, or call gh.",
-		opaReviewCompactScaffold, checkoutRoot, promptPath,
+		opaReviewCompactScaffold, agentVisibleWorkDir(checkoutRoot, jobLabel), promptPath,
 	)
 	args := append(append([]string{}, baseArgs...), prompt)
 	_ = agentBin
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseReview, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
-		APIKey: key, Parent: scmJobContext(job.ID), JobID: nz(job.RunID, job.ID),
+		APIKey: key, Parent: scmJobContext(job.ID), JobID: jobLabel,
 	})
 	if err != nil {
 		return fallbackSynth

@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestValidateGitHubRepoFullName(t *testing.T) {
 	ok := []string{"owner/repo", "Charge-Map/community-api", "a/b"}
@@ -64,5 +69,34 @@ func TestResolveSandboxJobID(t *testing.T) {
 	}
 	if sandboxWorkRel("/x/y/primary") != "primary" {
 		t.Fatal("workRel primary")
+	}
+}
+
+func TestWriteAgentBriefVisiblePath(t *testing.T) {
+	dir := t.TempDir()
+	checkout := filepath.Join(dir, "job1", "sandbox")
+	if err := os.MkdirAll(checkout, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPA_JOB_SANDBOX", "off")
+	ref, cleanup, err := writeAgentBrief(checkout, "job1", "unit.md", "# hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if !strings.HasSuffix(ref, filepath.Join("sandbox", ".opa-briefs", "unit.md")) &&
+		!strings.Contains(ref, ".opa-briefs/unit.md") &&
+		!strings.Contains(ref, ".opa-briefs"+string(filepath.Separator)+"unit.md") {
+		t.Fatalf("host mode ref: %s", ref)
+	}
+	t.Setenv("OPA_JOB_SANDBOX", "docker")
+	ref2, cleanup2, err := writeAgentBrief(checkout, "job1", "unit2.md", "# hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup2()
+	want := "/opa-jobs/job1/sandbox/.opa-briefs/unit2.md"
+	if ref2 != want {
+		t.Fatalf("docker visible path: got %s want %s", ref2, want)
 	}
 }
