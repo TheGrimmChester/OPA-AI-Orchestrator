@@ -21,6 +21,7 @@ type opaAutoFixJob struct {
 	ID            string                   `json:"id"`
 	ParentJobID   string                   `json:"parent_job_id"`
 	Status        string                   `json:"status"` // queued|running|completed|failed|skipped
+	Mode          string                   `json:"mode,omitempty"` // suggest|branch (from autofix_mode prefs)
 	CreatePR      bool                     `json:"create_pr"`
 	CommitDirect  bool                     `json:"commit_direct,omitempty"`
 	FindingKeys   []string                 `json:"finding_keys"`
@@ -283,15 +284,24 @@ func enqueueOPAAutoFix(parent *scmJob, findingKeys []string, createPR, commitDir
 		}
 		keys = append(keys, k)
 	}
-	// suggest mode never opens a land PR from this path.
-	if prefs.AutofixMode == "suggest" {
+	mode := prefs.AutofixMode
+	if mode != "suggest" && mode != "branch" {
+		mode = "branch"
+	}
+	// suggest mode never lands (push/PR) from this path — mirrors cloud.patch.
+	if mode == "suggest" {
 		createPR = false
 		commitDirect = false
+	}
+	honesty := "queued — Auto-fix patch → gateCloudDiff → land (no babysit)"
+	if mode == "suggest" {
+		honesty = "queued — Auto-fix patch → gateCloudDiff → suggest (no land)"
 	}
 	fix := &opaAutoFixJob{
 		ID:           "autofix-" + newRandomHex(10),
 		ParentJobID:  parent.ID,
 		Status:       "queued",
+		Mode:         mode,
 		CreatePR:     createPR,
 		CommitDirect: commitDirect,
 		FindingKeys:  keys,
@@ -299,7 +309,7 @@ func enqueueOPAAutoFix(parent *scmJob, findingKeys []string, createPR, commitDir
 		RepoFullName: parent.RepoFullName,
 		BasePRNumber: parent.PRNumber,
 		StartedAt:    time.Now().UTC().Format("2006-01-02 15:04:05.000"),
-		Honesty:      "queued — Auto-fix patch → gateCloudDiff → land (no babysit)",
+		Honesty:      honesty,
 	}
 	autoFixLive.Store(fix.ID, fix)
 	persistAutoFixOnParent(parent, fix)
@@ -478,13 +488,16 @@ func runOPAAutoFix(parent *scmJob, conn *opaConnector, fix *opaAutoFixJob) (*opa
 		fix.Error = "diff: " + derr.Error()
 		return fix, derr
 	}
-	allow := []string{}
+	allow := autofixFindingAllowlist(fix.Findings)
 	if !skippedAI && !githubUseMockAPI(conn) {
-		for _, f := range fix.Findings {
-			if p := strFromAny(f["file"]); p != "" {
-				allow = append(allow, p)
-			}
+		if len(allow) == 0 {
+			fix.Status = "failed"
+			fix.Error = "gateCloudDiff denied: empty finding allowlist"
+			fix.Honesty = "gateCloudDiff denied"
+			return fix, fmt.Errorf("%s", fix.Error)
 		}
+	} else {
+		allow = nil // mock/skipped: deny-list + caps only
 	}
 	if err := gateCloudDiff(parseCloudDiffChanges(diff), allow, defaultCloudDiffCaps()); err != nil {
 		fix.Status = "failed"
@@ -501,6 +514,15 @@ func runOPAAutoFix(parent *scmJob, conn *opaConnector, fix *opaAutoFixJob) (*opa
 	}
 	if strings.TrimSpace(validatedPatch) == "" {
 		fix.Honesty += "; no file changes after patch"
+		if fix.Status != "skipped" {
+			fix.Status = "completed"
+		}
+		return fix, nil
+	}
+
+	// suggest mode: proposal only — no clean-tree land / push / PR (mirrors cloud.patch).
+	if !autofixShouldLand(fix.Mode) {
+		fix.Honesty += "; suggest mode — proposal recorded, no land"
 		if fix.Status != "skipped" {
 			fix.Status = "completed"
 		}
@@ -566,7 +588,9 @@ func runOPAAutoFix(parent *scmJob, conn *opaConnector, fix *opaAutoFixJob) (*opa
 		return fix, err
 	}
 
-	if fix.CreatePR || !fix.CommitDirect {
+	// Open a PR only when CreatePR is set. (Do not use !CommitDirect — suggest
+	// sets both false and must never open a land PR; commit_direct pushes only.)
+	if fix.CreatePR {
 		title := fmt.Sprintf("OPA Review fix: %d finding(s)", len(fix.Findings))
 		if len(fix.Findings) == 1 {
 			msg := firstNonEmpty(strFromAny(fix.Findings[0]["problem"]), strFromAny(fix.Findings[0]["message"]))
@@ -621,6 +645,29 @@ func runOPAAutoFix(parent *scmJob, conn *opaConnector, fix *opaAutoFixJob) (*opa
 		fix.Status = "completed"
 	}
 	return fix, nil
+}
+
+// autofixShouldLand is false for suggest mode (proposal only; no push/PR).
+func autofixShouldLand(mode string) bool {
+	return strings.TrimSpace(mode) != "suggest"
+}
+
+// autofixFindingAllowlist collects unique finding file paths for gateCloudDiff.
+func autofixFindingAllowlist(findings []map[string]interface{}) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	for _, f := range findings {
+		p := filepath.ToSlash(strings.TrimSpace(strFromAny(f["file"])))
+		if p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out
 }
 
 func buildAutoFixPRBody(parent *scmJob, fix *opaAutoFixJob) string {

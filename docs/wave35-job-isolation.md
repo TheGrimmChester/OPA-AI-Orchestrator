@@ -64,16 +64,24 @@ fails the check. AI-authored phpstan steps are normalized the same way in
 
 ## Hardening (argv builder)
 
-`buildDockerRunArgv` is the only place that emits `docker run` flags. It always
-sets `--user 65532:65532`, `--cap-drop ALL`, `--security-opt no-new-privileges`,
+**Job boxes** go only through `buildDockerRunArgv`. That path always sets
+`--user 65532:65532`, `--cap-drop ALL`, `--security-opt no-new-privileges`,
 `--read-only`, equal `--memory`/`--memory-swap`, and rejects `--privileged`,
 `--cap-add`, `-p`, docker.sock mounts, and `-e` (non-secrets use `--env-file`;
-secrets only via `docker exec --env`).
+secrets only via `docker exec --env-file`).
 
-Scan uses `--network none`. Review/autofix/checkup AI phases use a per-job
-`--internal` network with the shared allowlist proxy attached (DNS alias
-`opa-egress-proxy`) and `HTTP(S)_PROXY` pointing at it. Checkup service sidecars
-share that `--internal` net without the Cursor allowlist (no default route).
+**Checkup service sidecars** use `buildDockerServiceArgv` (cap-drop /
+no-new-privileges / no publish / no docker.sock) but intentionally omit
+`--user` / `--read-only` so MySQL/Redis images can start as designed.
+
+**Shared egress proxy** (`ensureSharedEgressProxy`) is a trusted long-lived
+container with its own argv (including `-e`); it is not a job box.
+
+**Networks:** Scan uses `--network none`. Review/autofix AI phases use a
+per-job `--internal` network with the shared allowlist proxy attached (DNS
+alias `opa-egress-proxy`) and `HTTP(S)_PROXY` pointing at it. Checkup
+`runCheckupPlan` / sidecars create the same `--internal` job net but do **not**
+attach the Cursor allowlist proxy (no default route; no proxy env).
 
 ## Prepare → sandbox tree
 
@@ -95,6 +103,9 @@ when present.
   falls back to unrestricted `bridge` for AI (break-glass).
 - Prompt injection survives the container. Agent stdout can reach check runs /
   comments; masking is heuristic, not a boundary.
+- Checkup sidecars and the shared egress proxy are **not** under the job-box
+  non-root / read-only envelope; treat them as trusted helpers on the job
+  `--internal` network, not as untrusted agent sandboxes.
 - `OPA_JOB_ALLOW_HOST_EXEC=1` falls back to host exec and stamps
   `UNSANDBOXED: tools ran as root` — use only for break-glass debugging.
 - Chromium inside `opa-runner-ai` needs `--no-sandbox` inside an already

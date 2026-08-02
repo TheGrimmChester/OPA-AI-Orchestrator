@@ -461,11 +461,15 @@ func scanSecretsGitleaks(bin, runID, org, proj, service, root string) (int, erro
 // scanSecretsGitleaksSandboxed runs gitleaks inside opa-runner-scan with the
 // report written to a host-mounted /out directory (preserves detector=gitleaks).
 func scanSecretsGitleaksSandboxed(ctx context.Context, runID, root, hostReport string) error {
+	_ = runID // security srun-* must not become LayoutID — bind path is under the SCM checkout id.
 	root = filepath.Clean(root)
 	if !filepath.IsAbs(root) {
 		return fmt.Errorf("gitleaks sandbox requires absolute root")
 	}
-	jobID := resolveSandboxJobID(runID, root)
+	// Path-derived layout identity (not securityRunID): checkout lives under
+	// OPA_REVIEW_TMP/<scm-job-or-run-id>/{primary|sandbox}.
+	layoutID := resolveSandboxJobID("", root)
+	workRel := sandboxWorkRel(root)
 	outDir, err := os.MkdirTemp("", "opa-gitleaks-out-*")
 	if err != nil {
 		return err
@@ -484,9 +488,10 @@ func scanSecretsGitleaksSandboxed(ctx context.Context, runID, root, hostReport s
 	}
 	out, err := runSandboxedArgv(ctx, sandboxExecSpec{
 		Phase:       jobPhaseScan,
-		JobID:       jobID,
+		JobID:       layoutID,
+		LayoutID:    layoutID,
 		HostWorkDir: root,
-		WorkRel:     "primary",
+		WorkRel:     workRel,
 		Argv:        argv,
 		ReadOnly:    true,
 		Network:     "none",
@@ -499,9 +504,12 @@ func scanSecretsGitleaksSandboxed(ctx context.Context, runID, root, hostReport s
 	}
 	raw, err := os.ReadFile(filepath.Join(outDir, "report.json"))
 	if err != nil {
-		// Empty findings may omit the file depending on gitleaks version.
-		_ = os.WriteFile(hostReport, []byte("[]"), 0o600)
-		return nil
+		// Some gitleaks versions omit the report file when there are zero findings.
+		if os.IsNotExist(err) {
+			_ = os.WriteFile(hostReport, []byte("[]"), 0o600)
+			return nil
+		}
+		return fmt.Errorf("gitleaks report: %w", err)
 	}
 	return os.WriteFile(hostReport, raw, 0o600)
 }

@@ -269,6 +269,11 @@ func runOneCloudAttempt(job *scmJob, conn *opaConnector, auth autofixAuthOK, pre
 	gateAllow := allowlist
 	if skippedAI || githubUseMockAPI(conn) {
 		gateAllow = nil
+	} else if len(gateAllow) == 0 {
+		out["status"] = "gate_denied"
+		out["honesty"] = "gateCloudDiff denied: empty finding allowlist"
+		out["gate"] = "denied"
+		return out, fmt.Errorf("%s", out["honesty"])
 	}
 	if err := gateCloudDiff(changes, gateAllow, defaultCloudDiffCaps()); err != nil {
 		out["status"] = "gate_denied"
