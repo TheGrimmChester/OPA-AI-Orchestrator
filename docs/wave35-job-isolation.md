@@ -106,6 +106,12 @@ when present.
 - Checkup sidecars and the shared egress proxy are **not** under the job-box
   non-root / read-only envelope; treat them as trusted helpers on the job
   `--internal` network, not as untrusted agent sandboxes.
+- **Checkup has no package-registry egress.** Heuristic/AI `composer` /
+  `npm` / `yarn` install steps only succeed when `vendor/` / `node_modules`
+  (or an offline cache bind) is already in the tree — otherwise expect
+  refused/failed install. Checkup `--internal` nets do not attach the
+  allowlist proxy (no default route / proxy env). A future registry allowlist
+  would be an explicit product change, not break-glass bridge/host exec.
 - `OPA_JOB_ALLOW_HOST_EXEC=1` falls back to host exec and stamps
   `UNSANDBOXED: tools ran as root` — use only for break-glass debugging.
 - Chromium inside `opa-runner-ai` needs `--no-sandbox` inside an already

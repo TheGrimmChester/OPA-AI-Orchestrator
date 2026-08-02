@@ -345,6 +345,59 @@ func relatedCheckoutsFromJobSummary(job *scmJob) []relatedCheckout {
 	return nil
 }
 
+// relatedCheckoutsForReview returns sibling clones for AI briefs. Prepare owns
+// related_checkouts under the run graph; bugbot children must read prepare
+// (or the early-mirrored parent) — packing only the child summary yields empty
+// related sections until finalize.
+func relatedCheckoutsForReview(job *scmJob) []relatedCheckout {
+	if job == nil {
+		return nil
+	}
+	if got := relatedCheckoutsFromJobSummary(job); len(got) > 0 {
+		return got
+	}
+	runID := nz(job.RunID, job.ID)
+	if prep := childByKind(runID, kindPrepare); prep != nil && prep.ID != job.ID {
+		if got := relatedCheckoutsFromJobSummary(prep); len(got) > 0 {
+			return got
+		}
+	}
+	if parent := getSCMJob(runID); parent != nil && parent.ID != job.ID {
+		if got := relatedCheckoutsFromJobSummary(parent); len(got) > 0 {
+			return got
+		}
+	}
+	return nil
+}
+
+// persistRelatedCheckoutsOnRun writes related_checkouts onto the acting job and
+// mirrors to prepare + parent so mid-review clones stay visible to siblings.
+func persistRelatedCheckoutsOnRun(job *scmJob, related []relatedCheckout) {
+	if job == nil {
+		return
+	}
+	names := relatedRepoNames(related)
+	write := func(j *scmJob) {
+		if j == nil {
+			return
+		}
+		if j.Summary == nil {
+			j.Summary = map[string]interface{}{}
+		}
+		j.Summary["related_checkouts"] = related
+		j.Summary["related_repos"] = names
+		persistSCMJob(j)
+	}
+	write(job)
+	runID := nz(job.RunID, job.ID)
+	if prep := childByKind(runID, kindPrepare); prep != nil && prep.ID != job.ID {
+		write(prep)
+	}
+	if parent := getSCMJob(runID); parent != nil && parent.ID != job.ID {
+		write(parent)
+	}
+}
+
 func relatedRepoNames(related []relatedCheckout) []string {
 	out := []string{}
 	for _, r := range related {

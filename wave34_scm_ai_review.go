@@ -207,22 +207,22 @@ func runCursorAIReview(job *scmJob, conn *opaConnector, wr *opaWatchedRepo, chec
 			texts = append(texts, u)
 		}
 		extra := extractRelatedReposFromText(texts...)
-		already := relatedRepoNames(relatedCheckoutsFromJobSummary(job))
+		already := relatedRepoNames(relatedCheckoutsForReview(job))
 		more := resolveRelatedReposForJob(job, appliedAll, "", extra, already)
 		if len(more) > 0 {
 			srcMap := map[string]string{}
 			for _, n := range more {
 				srcMap[strings.ToLower(n)] = "mid_review"
 			}
+			// Clones land under the run worktree (RunID), not the bugbot child id.
 			added := prepareRelatedCheckouts(conn, nz(job.RunID, job.ID), more, srcMap)
+			prev := relatedCheckoutsForReview(job)
+			prev = append(prev, added...)
 			if job.Summary == nil {
 				job.Summary = map[string]interface{}{}
 			}
-			prev := relatedCheckoutsFromJobSummary(job)
-			prev = append(prev, added...)
-			job.Summary["related_checkouts"] = prev
-			job.Summary["related_repos"] = relatedRepoNames(prev)
 			job.Summary["related_mid_review"] = true
+			persistRelatedCheckoutsOnRun(job, prev)
 			usageParts = append(usageParts, fmt.Sprintf("needs_context: cloned %d additional related repo(s)", len(added)))
 			synth2 := runOPAReviewSynthesis(job, key, agentBin, baseArgs, checkoutRoot, res, understandingBullets, gateStatus, ctxTitles)
 			applyOPAReviewSynthesis(&res, synth2)
@@ -1015,7 +1015,7 @@ func packAIUnitContext(job *scmJob, securityRunID, service, checkoutRoot string,
 	if job != nil {
 		agentJob = job.ID
 	}
-	b.WriteString(formatRelatedCheckoutsForPromptWithJob(relatedCheckoutsFromJobSummary(job), agentJob))
+	b.WriteString(formatRelatedCheckoutsForPromptWithJob(relatedCheckoutsForReview(job), agentJob))
 	b.WriteString(opaReviewOutputSchema)
 	return b.String()
 }
@@ -1087,7 +1087,7 @@ func packAIContext(job *scmJob, wr *opaWatchedRepo, securityRunID, diff, checkou
 	if job != nil {
 		agentJob = job.ID
 	}
-	b.WriteString(formatRelatedCheckoutsForPromptWithJob(relatedCheckoutsFromJobSummary(job), agentJob))
+	b.WriteString(formatRelatedCheckoutsForPromptWithJob(relatedCheckoutsForReview(job), agentJob))
 	b.WriteString(opaReviewOutputSchema)
 	return b.String()
 }

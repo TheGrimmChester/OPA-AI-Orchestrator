@@ -285,6 +285,122 @@ func checkRunSummaryWithJobLink(summary, jobID string) string {
 	return summary + "\n\n" + link
 }
 
+// scmCancelReasonIsSupersede is true when a job was dropped because a newer PR
+// commit arrived (cancel-and-supersede), as opposed to manual/merge cancel.
+func scmCancelReasonIsSupersede(reason string) bool {
+	r := strings.ToLower(strings.TrimSpace(reason))
+	return strings.HasPrefix(r, "superseded by")
+}
+
+// githubCheckFieldsForCancelReason maps an internal cancel reason to a GitHub
+// Check Run conclusion. Superseded commits use "skipped" so the PR checks UI
+// shows Skipped rather than Cancelled / failure-looking red.
+func githubCheckFieldsForCancelReason(reason string) (conclusion, title, summary string) {
+	reason = strings.TrimSpace(reason)
+	if scmCancelReasonIsSupersede(reason) {
+		return "skipped", "Skipped", nz(reason, "Superseded by newer push")
+	}
+	return "cancelled", "Cancelled", nz(reason, "Job cancelled")
+}
+
+func githubCheckFieldsForJobCancel(job *scmJob) (conclusion, title, summary string) {
+	reason := ""
+	if job != nil {
+		if job.Summary != nil {
+			reason, _ = job.Summary["cancel_reason"].(string)
+		}
+		if reason == "" {
+			reason = job.Error
+		}
+	}
+	return githubCheckFieldsForCancelReason(reason)
+}
+
+// closeSCMJobGitHubChecks completes any Check Runs already opened for this job.
+// Best-effort: missing connector / mock / PAT-skip are no-ops.
+// When the cancel is a supersede and no checks exist yet (job still queued),
+// top-level jobs get completed/skipped stub checks so GitHub shows Skipped.
+func closeSCMJobGitHubChecks(job *scmJob, reason string) {
+	if job == nil {
+		return
+	}
+	conn := getOrHydrateConnector(job.ConnectorID)
+	if conn == nil {
+		_, conn = findWatched(job.RepoFullName)
+	}
+	if conn == nil {
+		return
+	}
+	owner, repo := splitOwnerRepo(job.RepoFullName)
+	if owner == "" || repo == "" {
+		return
+	}
+	conclusion, title, summary := githubCheckFieldsForCancelReason(reason)
+	dashID := nz(job.RunID, job.ID)
+	details := scmJobDashboardURL(dashID)
+	linkSum := checkRunSummaryWithJobLink(summary, dashID)
+
+	closed := 0
+	for _, checkID := range job.CheckRunIDs {
+		if checkID == 0 {
+			continue
+		}
+		_ = githubUpdateCheckRun(conn, owner, repo, checkID, "completed", conclusion, title, linkSum, details, nil)
+		closed++
+	}
+	if closed > 0 || !scmCancelReasonIsSupersede(reason) {
+		return
+	}
+	// Child agents: parent/cascade owns stub creation for the commit.
+	if strings.TrimSpace(job.ParentID) != "" {
+		return
+	}
+	if agentKind(job.Kind) == kindRun {
+		for _, c := range listRunChildren(job.ID) {
+			if c == nil {
+				continue
+			}
+			for _, checkID := range c.CheckRunIDs {
+				if checkID == 0 {
+					continue
+				}
+				_ = githubUpdateCheckRun(conn, owner, repo, checkID, "completed", conclusion, title, linkSum, details, nil)
+				closed++
+			}
+		}
+		if closed > 0 {
+			return
+		}
+	}
+	sha := strings.TrimSpace(job.CommitSHA)
+	if sha == "" || strings.HasPrefix(sha, "manual-") || strings.HasPrefix(sha, "cron-") {
+		return
+	}
+	// No checks were opened before supersede — post skipped stubs on this SHA.
+	if job.CheckRunIDs == nil {
+		job.CheckRunIDs = map[string]int64{}
+	}
+	if id, err := githubCreateCheckRun(conn, owner, repo, "OPA AppSec Gate", sha, "completed", conclusion, title, linkSum, details, nil); err == nil && id != 0 {
+		job.CheckRunIDs["appsec"] = id
+	}
+	if id, err := githubCreateCheckRun(conn, owner, repo, "OPA Review", sha, "completed", conclusion, title, linkSum, details, nil); err == nil && id != 0 {
+		job.CheckRunIDs["ai"] = id
+	}
+	persistSCMJob(job)
+}
+
+// githubCompleteCheckRunForCancel updates one check id using the job's cancel reason
+// (skipped for supersede, cancelled otherwise). Used by in-flight processors.
+func githubCompleteCheckRunForCancel(conn *opaConnector, owner, repo string, checkID int64, job *scmJob, detailsURL string) {
+	if checkID == 0 || job == nil {
+		return
+	}
+	conclusion, title, summary := githubCheckFieldsForJobCancel(job)
+	dashID := nz(job.RunID, job.ID)
+	_ = githubUpdateCheckRun(conn, owner, repo, checkID, "completed", conclusion, title,
+		checkRunSummaryWithJobLink(summary, dashID), detailsURL, nil)
+}
+
 func githubCreateCheckRun(c *opaConnector, owner, repo, name, headSHA, status, conclusion, title, summary, detailsURL string, annotations []map[string]interface{}) (int64, error) {
 	if c == nil || githubUseMockAPI(c) || c.Kind == "github_pat" && envOr("OPA_SCM_SKIP_CHECK_RUNS", "1") == "1" {
 		return time.Now().Unix(), nil // mock id

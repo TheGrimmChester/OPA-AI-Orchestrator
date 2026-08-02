@@ -530,6 +530,9 @@ func cancelSCMJobWithReason(id, reason string) (*scmJob, string, int) {
 		if agentKind(job.Kind) == kindRun {
 			cascadeCancelRunChildren(id, reason)
 		}
+		// Close open Check Runs immediately (skipped for supersede, cancelled otherwise).
+		// Snapshot ids — processors may still race a late update with the same fields.
+		go closeSCMJobGitHubChecks(job, reason)
 		go func(jobID, runID, kind string) {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
@@ -1364,10 +1367,10 @@ func processLegacySCMJob(jobID string) {
 	persistSCMJob(job)
 	if finishIfCancelled() {
 		if appSecID != 0 {
-			_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", "cancelled", "Cancelled", checkRunSummaryWithJobLink("Job cancelled", job.ID), jobDashURL, nil)
+			githubCompleteCheckRunForCancel(conn, owner, repoName, appSecID, job, jobDashURL)
 		}
 		if aiCheckID != 0 {
-			_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "cancelled", "Cancelled", checkRunSummaryWithJobLink("Job cancelled", job.ID), jobDashURL, nil)
+			githubCompleteCheckRunForCancel(conn, owner, repoName, aiCheckID, job, jobDashURL)
 		}
 		return
 	}
@@ -1472,10 +1475,10 @@ func processLegacySCMJob(jobID string) {
 	persistSCMJob(job)
 	if finishIfCancelled() {
 		if appSecID != 0 {
-			_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", "cancelled", "Cancelled", checkRunSummaryWithJobLink("Job cancelled", job.ID), jobDashURL, nil)
+			githubCompleteCheckRunForCancel(conn, owner, repoName, appSecID, job, jobDashURL)
 		}
 		if aiCheckID != 0 {
-			_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "cancelled", "Cancelled", checkRunSummaryWithJobLink("Job cancelled", job.ID), jobDashURL, nil)
+			githubCompleteCheckRunForCancel(conn, owner, repoName, aiCheckID, job, jobDashURL)
 		}
 		return
 	}
@@ -1489,10 +1492,10 @@ func processLegacySCMJob(jobID string) {
 	}
 	if finishIfCancelled() {
 		if appSecID != 0 {
-			_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", "cancelled", "Cancelled", checkRunSummaryWithJobLink("Job cancelled", job.ID), jobDashURL, nil)
+			githubCompleteCheckRunForCancel(conn, owner, repoName, appSecID, job, jobDashURL)
 		}
 		if aiCheckID != 0 {
-			_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "cancelled", "Cancelled", checkRunSummaryWithJobLink("Job cancelled", job.ID), jobDashURL, nil)
+			githubCompleteCheckRunForCancel(conn, owner, repoName, aiCheckID, job, jobDashURL)
 		}
 		return
 	}
@@ -1522,7 +1525,7 @@ func processLegacySCMJob(jobID string) {
 	if runAI {
 		if finishIfCancelled() {
 			if aiCheckID != 0 {
-				_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "cancelled", "Cancelled", checkRunSummaryWithJobLink("Job cancelled", job.ID), jobDashURL, nil)
+				githubCompleteCheckRunForCancel(conn, owner, repoName, aiCheckID, job, jobDashURL)
 			}
 			return
 		}

@@ -175,7 +175,7 @@ Legacy CI without Repo Watch can still call `harness/appsec-pr-check.sh` (tenant
   - `OPA_REVIEW_BROWSER_MCP` — `1` (default) enables browser MCP for UI-touched PRs; `0` disables
   - `OPA_REVIEW_BROWSER_DEPS_OK` — must be `1` when Chromium/deps are provisioned (image default); otherwise visual MCP is skipped as unmet requirement
   - `OPA_REVIEW_PREVIEW_URL` — optional preview URL for the agent to open
-  - `OPA_REVIEW_MCP_CONFIG` — optional path to extra `mcpServers` JSON merged into worktree `.cursor/mcp.json`
+  - `OPA_REVIEW_MCP_CONFIG` — optional host JSON of `mcpServers` merged into a host-owned overlay under `$OPA_SCM_STATE_DIR/mcp-overlay/.../.cursor/mcp.json` via `prepareOPAReviewMCP` / `writeReviewMCPOverlay` (never the PR worktree). Only allowlisted server names are accepted (currently `browser`); others are dropped.
 - `GET|POST /api/scm/contexts`, `GET|PATCH|DELETE /api/scm/contexts/{id}`, `POST /api/scm/contexts/generate`
 - `PUT /api/scm/context-links`
 - `GET /api/scm/settings`, `POST /api/scm/settings/cursor-key` — `cursor_key_set` only; key AES-GCM in `opa.scm_secrets`

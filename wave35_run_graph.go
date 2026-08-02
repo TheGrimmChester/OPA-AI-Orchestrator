@@ -429,7 +429,8 @@ func runPrepareAgent(job *scmJob) error {
 		job.Summary["related_repos"] = relatedRepoNames(related)
 	}
 	persistSCMJob(job)
-	// Mirror checkout onto parent early so siblings can read it if needed.
+	// Mirror checkout + related onto parent early so bugbot briefs can read
+	// sibling clones before finalize folds prepare summary.
 	if parent := getSCMJob(job.RunID); parent != nil && parent.ID != job.ID {
 		if parent.Summary == nil {
 			parent.Summary = map[string]interface{}{}
@@ -439,7 +440,7 @@ func runPrepareAgent(job *scmJob) error {
 		if analyzed != "" {
 			parent.CommitSHA = analyzed
 		}
-		for _, k := range []string{"analyzed_sha", "previous_analyzed_sha", "previous_analyzed_at", "previous_analyzed_job_id", "commits_since_previous", "new_commits_since_review", "sandbox_tree", "sandbox_file_count"} {
+		for _, k := range []string{"analyzed_sha", "previous_analyzed_sha", "previous_analyzed_at", "previous_analyzed_job_id", "commits_since_previous", "new_commits_since_review", "sandbox_tree", "sandbox_file_count", "related_checkouts", "related_repos"} {
 			if v, ok := job.Summary[k]; ok {
 				parent.Summary[k] = v
 			}

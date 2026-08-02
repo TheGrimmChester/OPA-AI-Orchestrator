@@ -143,6 +143,55 @@ func TestPruneSupersededInFlightPRRunsKeepsNewest(t *testing.T) {
 	}
 }
 
+func TestGitHubCheckFieldsForCancelReasonSupersede(t *testing.T) {
+	conc, title, sum := githubCheckFieldsForCancelReason("Superseded by deadbeef")
+	if conc != "skipped" || title != "Skipped" {
+		t.Fatalf("supersede want skipped/Skipped, got %s/%s", conc, title)
+	}
+	if !strings.Contains(sum, "deadbeef") {
+		t.Fatalf("summary should keep reason, got %q", sum)
+	}
+	conc, title, _ = githubCheckFieldsForCancelReason("pull request merged")
+	if conc != "cancelled" || title != "Cancelled" {
+		t.Fatalf("merge want cancelled, got %s/%s", conc, title)
+	}
+	if !scmCancelReasonIsSupersede("Superseded by abc") || scmCancelReasonIsSupersede("cancelled") {
+		t.Fatal("scmCancelReasonIsSupersede mismatch")
+	}
+}
+
+func TestSupersedeClosesGitHubChecksAsSkipped(t *testing.T) {
+	const repo = "acme/gh-skip-checks"
+	const pr = 88
+	shaOld := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	shaNew := "ffffffffffffffffffffffffffffffffffffffff"
+	prior := &scmJob{
+		ID: "prior-checks", RepoFullName: repo, PRNumber: pr, CommitSHA: shaOld,
+		Status: "running", Kind: string(kindRun), RunID: "prior-checks",
+		ConnectorID: "", Event: "pull_request.synchronize",
+		CheckRunIDs: map[string]int64{"appsec": 101, "ai": 102},
+		Summary:     map[string]interface{}{"child_ids": []string{}},
+		StartedAt:   "2026-08-01 10:00:00.000",
+	}
+	scmJobLive.Store(prior.ID, prior)
+	t.Cleanup(func() {
+		scmJobLive.Delete(prior.ID)
+		prRunIndexMu.Lock()
+		delete(prRunIndex, prRunIndexKey(repo, pr))
+		prRunIndexMu.Unlock()
+	})
+
+	ids := supersedeInFlightPRJobs(repo, pr, shaNew)
+	if len(ids) != 1 || getSCMJob(prior.ID).Status != "cancelled" {
+		t.Fatalf("prior must cancel, ids=%v status=%v", ids, getSCMJob(prior.ID).Status)
+	}
+	reason, _ := getSCMJob(prior.ID).Summary["cancel_reason"].(string)
+	conc, title, _ := githubCheckFieldsForCancelReason(reason)
+	if conc != "skipped" || title != "Skipped" {
+		t.Fatalf("supersede cancel must map to GitHub skipped, got %s/%s reason=%q", conc, title, reason)
+	}
+}
+
 func TestRebuildPRRunIndexFromLive(t *testing.T) {
 	const repo = "acme/rebuild-index"
 	const pr = 3
