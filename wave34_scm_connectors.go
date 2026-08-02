@@ -1260,12 +1260,18 @@ func hydrateSCMOnBoot() {
 	}
 	nw := hydrateWatchedReposOnBoot()
 	_ = hydrateAgentPrefsOnBoot()
+	nWide := ensureOrgWideCLICursorKeys()
 	hydrateCursorKeyFromCH("", "")
 	hydrateSCMJobsAndStacksOnBoot()
 	cursorKeyMu.Lock()
 	hasCursor := cursorKeyMem != ""
 	cursorKeyMu.Unlock()
-	log.Printf("[INFO] SCM hydrate: %d connector(s), %d watched repo(s) from ClickHouse; cursor_key_set=%v", n, nw, hasCursor)
+	// cursor_key_set here is legacy admin/mem hydrate (empty org) — per-tenant
+	// resolution uses scm_secrets via resolveCursorAPIKey. Prefer org keys.
+	orgKeyHint := nWide > 0 || resolveCursorAPIKey("default-org", "default-project", "") != "" ||
+		resolveCursorAPIKey("nas", "infra", "") != ""
+	log.Printf("[INFO] SCM hydrate: %d connector(s), %d watched repo(s) from ClickHouse; cursor_key_mem=%v org_cli_keys=%v org_wide_seeded=%d",
+		n, nw, hasCursor, orgKeyHint, nWide)
 }
 
 func ensureWatchedRepoReviewColumns() {

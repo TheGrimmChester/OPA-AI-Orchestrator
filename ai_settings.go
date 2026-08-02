@@ -363,6 +363,10 @@ func persistAISettings(doc aiSettingsDoc) error {
 	}
 	if doc.CLICursor.APIKey != "" {
 		_ = persistSCMSecretScoped(org, proj, scope, userID, aiSecretCLICursor, doc.CLICursor.APIKey, false)
+		// Webhook SCM jobs have empty ActorUserID and only resolve org keys.
+		// Personal-only saves historically left reviews skipped with
+		// "OPA Review API key not set". Seed org (+ org-wide) when missing.
+		seedOrgCLICursorKeyForWebhooks(org, proj, scope, doc.CLICursor.APIKey)
 	}
 	meta := aiSettingsFileDoc{
 		OrganizationID:  org,
@@ -812,6 +816,42 @@ func handleAISettingsTest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{
 		"ok": true, "provider": provider, "scope": scope, "model": model, "text": truncateStr(text, 200),
 	})
+}
+
+// seedOrgCLICursorKeyForWebhooks copies a freshly saved CLI agent key to org
+// scope when webhooks would otherwise fail closed.
+//
+// Resolution for jobs is user → org → empty. Manual runs may carry ActorUserID
+// (personal key works); GitHub webhooks do not — they need an org key.
+// Additionally, project-scoped org keys fall back only to org-wide (empty
+// project), not to sibling projects — so we seed org-wide when missing.
+func seedOrgCLICursorKeyForWebhooks(org, proj, scope, plaintext string) {
+	plaintext = strings.TrimSpace(plaintext)
+	org = strings.TrimSpace(org)
+	if plaintext == "" || org == "" || scope == credScopeAdmin {
+		return
+	}
+	if scope != credScopeUser && scope != credScopeOrg {
+		return
+	}
+	// Project-scoped org row (needed when only a personal key was saved).
+	if scope == credScopeUser {
+		if resolveSCMSecret(credResolveQuery{OrganizationID: org, ProjectID: proj}, aiSecretCLICursor).Plain == "" {
+			if err := persistSCMSecretScoped(org, proj, credScopeOrg, "", aiSecretCLICursor, plaintext, false); err != nil {
+				log.Printf("[WARN] seed org CLI key for %s/%s: %v", org, proj, err)
+			} else {
+				log.Printf("[INFO] seeded org CLI agent key for %s/%s from personal save (webhooks need org keys)", org, nz(proj, "(org-wide)"))
+			}
+		}
+	}
+	// Org-wide fallback so any project in the org can resolve the key.
+	if loadSCMSecretAtScope(org, "", credScopeOrg, "", aiSecretCLICursor).Plain == "" {
+		if err := persistSCMSecretScoped(org, "", credScopeOrg, "", aiSecretCLICursor, plaintext, false); err != nil {
+			log.Printf("[WARN] seed org-wide CLI key for %s: %v", org, err)
+		} else {
+			log.Printf("[INFO] seeded org-wide CLI agent key for org=%s (cross-project + webhook fallback)", org)
+		}
+	}
 }
 
 // setCLICursorKeyFromAlias updates unified settings from legacy cursor-key endpoint (org scope).
