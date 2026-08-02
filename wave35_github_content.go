@@ -78,7 +78,7 @@ func githubCompareDiff(c *opaConnector, owner, repo, base, head string) (string,
 	if githubUseMockAPI(c) {
 		return "diff --git a/example.js b/example.js\n+eval(userInput)\n", nil
 	}
-	tok, err := githubAccessToken(c)
+	tok, err := githubAccessTokenFor(c, owner+"/"+repo, githubPermsPRRead())
 	if err != nil {
 		return "", err
 	}

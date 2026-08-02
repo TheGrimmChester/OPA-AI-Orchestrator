@@ -316,7 +316,14 @@ func runCheckupAgent(job *scmJob) error {
 		return fmt.Errorf("checkup: no checkout path")
 	}
 	if !githubUseMockAPI(conn) {
-		_ = ensureGitHubWriteAllowed(job, conn)
+		if err := ensureGitHubWriteAllowed(job, conn); err != nil {
+			if job.Summary == nil {
+				job.Summary = map[string]interface{}{}
+			}
+			job.Summary["publish_refused"] = err.Error()
+			persistSCMJob(job)
+			return err
+		}
 	}
 
 	jobDashURL := scmJobDashboardURL(nz(job.RunID, job.ID))

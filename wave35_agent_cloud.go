@@ -45,7 +45,11 @@ func runCloudAgent(job *scmJob) error {
 
 	owner, repoName := splitOwnerRepo(job.RepoFullName)
 	if !githubUseMockAPI(conn) {
-		_ = ensureGitHubWriteAllowed(job, conn)
+		if err := ensureGitHubWriteAllowed(job, conn); err != nil {
+			job.Summary["publish_refused"] = err.Error()
+			persistSCMJob(job)
+			return err
+		}
 	}
 	jobDashURL := scmJobDashboardURL(nz(job.RunID, job.ID))
 	checkID, _ := githubCreateCheckRun(conn, owner, repoName, "OPA Auto-fix", job.CommitSHA, "in_progress", "",

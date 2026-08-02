@@ -383,7 +383,7 @@ func runSecurityScanJob(runID, org, proj, service, profile string, scanners []st
 		switch s {
 		case "secrets":
 			var det string
-			n, det, e = scanSecrets(runID, org, proj, service, root)
+			n, det, e = scanSecrets(runID, org, proj, service, root, scmJob)
 			secretsDetector = det
 			sev, fp := takeSecretSeverityCounts(runID)
 			if len(sev) > 0 {

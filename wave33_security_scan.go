@@ -385,9 +385,11 @@ type gitleaksFinding struct {
 }
 
 // scanSecrets prefers the gitleaks CLI when present; otherwise embedded regex lite.
-func scanSecrets(runID, org, proj, service, root string) (int, string, error) {
+// scmJobID labels sandboxed boxes (opa.job) for cancel teardown; the checkout
+// LayoutID is always path-derived so srun-* security ids never fail bind checks.
+func scanSecrets(runID, org, proj, service, root, scmJobID string) (int, string, error) {
 	if bin := gitleaksBin(); bin != "" {
-		n, err := scanSecretsGitleaks(bin, runID, org, proj, service, root)
+		n, err := scanSecretsGitleaks(bin, runID, org, proj, service, root, scmJobID)
 		if err == nil {
 			return n, "gitleaks", nil
 		}
@@ -402,7 +404,7 @@ func scanSecrets(runID, org, proj, service, root string) (int, string, error) {
 	return n, "embedded-secret-scan", err
 }
 
-func scanSecretsGitleaks(bin, runID, org, proj, service, root string) (int, error) {
+func scanSecretsGitleaks(bin, runID, org, proj, service, root, scmJobID string) (int, error) {
 	report, err := os.CreateTemp("", "opa-gitleaks-*.json")
 	if err != nil {
 		return 0, err
@@ -418,7 +420,7 @@ func scanSecretsGitleaks(bin, runID, org, proj, service, root string) (int, erro
 	defer cancel()
 
 	if sandboxMode() == "docker" {
-		if err := scanSecretsGitleaksSandboxed(ctx, runID, root, reportPath); err != nil {
+		if err := scanSecretsGitleaksSandboxed(ctx, scmJobID, root, reportPath); err != nil {
 			return 0, err
 		}
 		return ingestGitleaksReport(reportPath, runID, org, proj, service, root)
@@ -460,16 +462,19 @@ func scanSecretsGitleaks(bin, runID, org, proj, service, root string) (int, erro
 
 // scanSecretsGitleaksSandboxed runs gitleaks inside opa-runner-scan with the
 // report written to a host-mounted /out directory (preserves detector=gitleaks).
-func scanSecretsGitleaksSandboxed(ctx context.Context, runID, root, hostReport string) error {
-	_ = runID // security srun-* must not become LayoutID — bind path is under the SCM checkout id.
+// scmJobID is the cancel label (opa.job); LayoutID/WorkRel come from the checkout
+// path so security srun-* ids never become bind identities.
+func scanSecretsGitleaksSandboxed(ctx context.Context, scmJobID, root, hostReport string) error {
 	root = filepath.Clean(root)
 	if !filepath.IsAbs(root) {
 		return fmt.Errorf("gitleaks sandbox requires absolute root")
 	}
-	// Path-derived layout identity (not securityRunID): checkout lives under
+	// Path-derived layout identity: checkout lives under
 	// OPA_REVIEW_TMP/<scm-job-or-run-id>/{primary|sandbox}.
 	layoutID := resolveSandboxJobID("", root)
 	workRel := sandboxWorkRel(root)
+	// Cancel teardown targets opa.job=<scm child/job id>; fall back to layout.
+	jobID := resolveSandboxJobID(scmJobID, root)
 	outDir, err := os.MkdirTemp("", "opa-gitleaks-out-*")
 	if err != nil {
 		return err
@@ -488,8 +493,9 @@ func scanSecretsGitleaksSandboxed(ctx context.Context, runID, root, hostReport s
 	}
 	out, err := runSandboxedArgv(ctx, sandboxExecSpec{
 		Phase:       jobPhaseScan,
-		JobID:       layoutID,
+		JobID:       jobID,
 		LayoutID:    layoutID,
+		NetworkID:   layoutID,
 		HostWorkDir: root,
 		WorkRel:     workRel,
 		Argv:        argv,

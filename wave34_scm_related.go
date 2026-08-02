@@ -216,16 +216,11 @@ func prepareRelatedCheckouts(c *opaConnector, worktreeID string, repos []string,
 		}
 		rc.SHA = gitRevParse(cloneDir)
 		if _, err := materializeTreeWithCheckoutIndex(cloneDir, dest); err != nil {
-			// Fallback: leave the clone but strip remotes and stamp honesty.
+			// Fail closed: never leave a .git tree for agent-visible related checkouts.
 			_ = os.RemoveAll(dest)
-			if rerr := os.Rename(cloneDir, dest); rerr != nil {
-				rc.Error = truncateStr(err.Error()+"; rename: "+rerr.Error(), 200)
-				_ = os.RemoveAll(cloneDir)
-				out = append(out, rc)
-				continue
-			}
-			_ = exec.Command("git", "-C", dest, "remote", "remove", "origin").Run()
-			rc.Honesty = "materialize failed — left clone with remotes stripped: " + truncateStr(err.Error(), 120)
+			_ = os.RemoveAll(cloneDir)
+			rc.Error = truncateStr("materialize failed (refusing .git fallback): "+err.Error(), 200)
+			rc.Honesty = "related no-.git materialize failed — checkout omitted"
 			out = append(out, rc)
 			continue
 		}
