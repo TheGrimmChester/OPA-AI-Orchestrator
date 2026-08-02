@@ -4,6 +4,7 @@ import "testing"
 
 func TestCanSeeCredScope(t *testing.T) {
 	member := credActor{Username: "alice", Role: "viewer", OrganizationID: "org-a"}
+	memberNoOrg := credActor{Username: "alice", Role: "viewer", OrganizationID: ""}
 	otherOrg := credActor{Username: "bob", Role: "editor", OrganizationID: "org-b"}
 	adminInA := credActor{Username: "root", Role: "admin", OrganizationID: "org-a"}
 	adminNoOrg := credActor{Username: "root", Role: "admin", OrganizationID: ""}
@@ -23,10 +24,12 @@ func TestCanSeeCredScope(t *testing.T) {
 		{"org_other_denied", otherOrg, credScopeOrg, "", "org-a", false},
 		{"org_empty_owner_denied_member", member, credScopeOrg, "", "", false},
 		{"org_empty_owner_admin_ok", adminInA, credScopeOrg, "", "", true},
-		{"org_no_selected_org", adminNoOrg, credScopeOrg, "", "org-a", false},
+		{"org_all_admin_ok", adminNoOrg, credScopeOrg, "", "org-a", true},
+		{"org_all_member_denied", memberNoOrg, credScopeOrg, "", "org-a", false},
 		{"user_owner_ok", owner, credScopeUser, "alice", "org-a", true},
 		{"user_other_denied", otherOrg, credScopeUser, "alice", "org-a", false},
 		{"user_admin_no_peek", adminInA, credScopeUser, "alice", "org-a", false},
+		{"user_legacy_admin_opa_admin", credActor{Username: "opa-admin", Role: "admin", OrganizationID: "nas"}, credScopeUser, "admin", "nas", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
