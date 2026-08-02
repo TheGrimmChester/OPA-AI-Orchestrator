@@ -151,19 +151,39 @@ func canSeeCredScope(a credActor, scope, ownerUser, ownerOrg string) bool {
 	case credScopeAdmin:
 		return a.isAdmin()
 	case credScopeOrg:
-		if a.OrganizationID == "" {
-			return false
-		}
 		if strings.TrimSpace(ownerOrg) == "" {
 			// Pre-scope empty-org rows: do not expose to every org member.
 			return a.isAdmin()
 		}
-		return ownerOrg == a.OrganizationID
+		if sel := strings.TrimSpace(a.OrganizationID); sel != "" {
+			return ownerOrg == sel
+		}
+		// Tenant picker "All" (empty org): admins may list/get across orgs
+		// (same rule as canSeeSCMJob). Non-admins must pick a concrete org.
+		return a.isAdmin()
 	case credScopeUser:
-		return ownerUser != "" && ownerUser == a.Username
+		return userCredOwnerMatch(a.Username, ownerUser)
 	default:
 		return false
 	}
+}
+
+// userCredOwnerMatch compares credential owner to the signed-in username.
+// Legacy PAT bootstrap rows used user_id "admin" before the nas login was
+// renamed to opa-admin — treat that pair as the same owner.
+func userCredOwnerMatch(actorUser, ownerUser string) bool {
+	actorUser = strings.TrimSpace(actorUser)
+	ownerUser = strings.TrimSpace(ownerUser)
+	if actorUser == "" || ownerUser == "" {
+		return false
+	}
+	if actorUser == ownerUser {
+		return true
+	}
+	if ownerUser == "admin" && (actorUser == "opa-admin" || actorUser == "root") {
+		return true
+	}
+	return false
 }
 
 // canMutateCred enforces write/delete on an existing credential row.
@@ -185,7 +205,7 @@ func canMutateCred(a credActor, scope, ownerUser, ownerOrg string) error {
 		}
 		return nil
 	case credScopeUser:
-		if ownerUser != "" && a.Username != ownerUser {
+		if !userCredOwnerMatch(a.Username, ownerUser) {
 			return fmt.Errorf("forbidden: not credential owner")
 		}
 		if a.Username == "" && authEnforced {

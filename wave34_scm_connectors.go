@@ -548,7 +548,29 @@ func handleConnectorRepos(w http.ResponseWriter, r *http.Request, id string) {
 		})
 		return
 	}
-	if denyConnectorIfInvisible(w, r, c) {
+	if c.Status == "deleted" {
+		writeJSON(w, map[string]interface{}{
+			"repos": []interface{}{},
+			"error": "connector_not_found",
+			"note":  "Connector was deleted. Pick another connector or reconnect under Settings · Connectors.",
+		})
+		return
+	}
+	a := actorFromRequest(r)
+	scope := inferLegacyScope(c.OrganizationID, c.Scope)
+	if !canSeeCredScope(a, scope, c.UserID, c.OrganizationID) {
+		note := "Select the connector's organization in the tenant picker (top bar), then reload."
+		if c.OrganizationID != "" {
+			note = fmt.Sprintf("This connector belongs to organization %q. Select that org (or All, as admin) in the tenant picker, then reload.", c.OrganizationID)
+		}
+		if scope == credScopeUser && c.UserID != "" && a.Username != "" && c.UserID != a.Username {
+			note = fmt.Sprintf("This is a personal connector owned by %q (signed in as %q).", c.UserID, a.Username)
+		}
+		writeJSON(w, map[string]interface{}{
+			"repos": []interface{}{},
+			"error": "connector_org_mismatch",
+			"note":  note,
+		})
 		return
 	}
 	if c.Kind == "github_pat" && c.TokenRef == "" {
@@ -830,11 +852,20 @@ func hydrateConnectorFromCH(id string) *opaConnector {
 		return nil
 	}
 	rows, err := queryClient.Query(fmt.Sprintf(`
-		SELECT id, organization_id, project_id, kind, installation_id, account_login,
+		SELECT id, organization_id, project_id, scope, user_id, kind, installation_id, account_login,
 		       status, token_ref, meta_json, created_at, updated_at
 		FROM opa.connectors
 		WHERE id = '%s' AND status != 'deleted'
 		ORDER BY updated_at DESC LIMIT 1`, escapeSQL(id)))
+	if err != nil {
+		// Pre-migration schemas lack scope/user_id.
+		rows, err = queryClient.Query(fmt.Sprintf(`
+			SELECT id, organization_id, project_id, kind, installation_id, account_login,
+			       status, token_ref, meta_json, created_at, updated_at
+			FROM opa.connectors
+			WHERE id = '%s' AND status != 'deleted'
+			ORDER BY updated_at DESC LIMIT 1`, escapeSQL(id)))
+	}
 	if err != nil || len(rows) == 0 {
 		return nil
 	}
@@ -1229,11 +1260,20 @@ func hydrateSCMOnBoot() {
 	ensureWave35Tables()
 	n := 0
 	rows, err := queryClient.Query(`
-		SELECT id, organization_id, project_id, kind, installation_id, account_login,
+		SELECT id, organization_id, project_id, scope, user_id, kind, installation_id, account_login,
 		       status, token_ref, meta_json, created_at, updated_at
 		FROM opa.connectors
 		WHERE status != 'deleted'
 		ORDER BY updated_at DESC LIMIT 200`)
+	if err != nil {
+		// Pre-migration schemas lack scope/user_id.
+		rows, err = queryClient.Query(`
+			SELECT id, organization_id, project_id, kind, installation_id, account_login,
+			       status, token_ref, meta_json, created_at, updated_at
+			FROM opa.connectors
+			WHERE status != 'deleted'
+			ORDER BY updated_at DESC LIMIT 200`)
+	}
 	if err != nil {
 		log.Printf("[WARN] hydrateSCMOnBoot connectors: %v", err)
 	} else {

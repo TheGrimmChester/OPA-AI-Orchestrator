@@ -171,6 +171,9 @@ func githubExplainReposHTTP(code int, raw []byte) error {
 		return fmt.Errorf("github 403 forbidden — classic PAT needs `repo` scope; fine-grained needs Repository access + Metadata (and Contents to clone) (%s)", body)
 	case 404:
 		return fmt.Errorf("github 404 — token cannot see repos (wrong account or fine-grained resource owner) (%s)", body)
+	case 301, 302, 307, 308:
+		// Rare for api.github.com (client follows redirects); usually wrong API host / renamed org path.
+		return fmt.Errorf("github %d moved — API redirected (check enterprise host / renamed org; %s)", code, body)
 	default:
 		return fmt.Errorf("github repos %d: %s", code, body)
 	}
