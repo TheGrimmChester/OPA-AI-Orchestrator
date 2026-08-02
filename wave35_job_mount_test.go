@@ -7,6 +7,27 @@ import (
 	"testing"
 )
 
+func TestJobIdentityHostRootExactOpaJobsOnly(t *testing.T) {
+	t.Setenv("OPA_REVIEW_TMP", opaJobsContainerRoot)
+	got := jobIdentityHostRoot("Job_ABC")
+	want := filepath.Join(opaJobsContainerRoot, sanitizeDockerName("Job_ABC"))
+	if got != want {
+		t.Fatalf("exact /opa-jobs: got %s want %s", got, want)
+	}
+
+	// NAS-style path ending in /opa-jobs must NOT rewrite to /opa-jobs/<id>.
+	nas := "/mnt/Apps/config-docker/opa/opa-jobs"
+	t.Setenv("OPA_REVIEW_TMP", nas)
+	got = jobIdentityHostRoot("scmjob-abc")
+	want = filepath.Join(nas, sanitizeWorktreeID("scmjob-abc"))
+	if got != want {
+		t.Fatalf("nas suffix path: got %s want %s", got, want)
+	}
+	if strings.HasPrefix(got, opaJobsContainerRoot+"/") && !strings.HasPrefix(nas, opaJobsContainerRoot) {
+		t.Fatalf("must not rewrite onto %s: %s", opaJobsContainerRoot, got)
+	}
+}
+
 func TestAssertJobBindPath(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("OPA_REVIEW_TMP", tmp)

@@ -33,6 +33,13 @@ func TestBuildDockerRunArgvHardening(t *testing.T) {
 	if strings.Contains(joined, "--privileged") || strings.Contains(joined, "--cap-add") {
 		t.Fatal("privileged/cap-add leaked into argv")
 	}
+	// Layout root bind (not leaf-only) so /opa-jobs/<id> is writable.
+	if !strings.Contains(joined, "/tmp/opa-review/run1:/opa-jobs/child1:ro") {
+		t.Fatalf("want layout root bind, got %s", joined)
+	}
+	if !strings.Contains(joined, "-w /opa-jobs/child1/primary") {
+		t.Fatalf("want cwd under identity leaf, got %s", joined)
+	}
 	if err := validateDockerRunArgv(argv); err != nil {
 		t.Fatal(err)
 	}

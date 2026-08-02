@@ -48,10 +48,43 @@ func pathUnder(abs, root string) bool {
 }
 
 func jobIdentityHostRoot(jobID string) string {
-	// Prefer /opa-jobs when OPA_REVIEW_TMP points there; else OPA_REVIEW_TMP/{id}.
+	// Exact /opa-jobs ⇒ identity layout used for docker binds.
+	// Do NOT treat paths that merely *end with* "/opa-jobs" (e.g. NAS
+	// /mnt/Apps/.../opa-jobs) as /opa-jobs — that made docker-from-docker
+	// bind a non-existent host path while checkouts lived elsewhere.
 	tmp := opaReviewTmpRoot()
-	if tmp == opaJobsContainerRoot || strings.HasSuffix(tmp, opaJobsContainerRoot) {
+	if tmp == opaJobsContainerRoot {
 		return filepath.Join(opaJobsContainerRoot, sanitizeDockerName(jobID))
 	}
-	return filepath.Join(tmp, jobID)
+	return scmJobContainerAbs(jobID)
+}
+
+// ensureSandboxWorkWritable chowns the host work tree to the sandbox UID so
+// docker --user 65532:65532 can write (npm/composer/node_modules, etc.).
+// Best-effort: ignore errors on platforms that disallow chown.
+func ensureSandboxWorkWritable(hostDir string) {
+	hostDir = filepath.Clean(hostDir)
+	if hostDir == "" || hostDir == "/" || hostDir == "." {
+		return
+	}
+	const uid, gid = 65532, 65532
+	_ = filepath.Walk(hostDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
+		}
+		_ = os.Chown(path, uid, gid)
+		if info.IsDir() {
+			_ = os.Chmod(path, 0o775)
+		}
+		return nil
+	})
+	// Also fix the layout root (parent of primary|sandbox) when present.
+	base := filepath.Base(hostDir)
+	if base == "primary" || base == "sandbox" || base == "related" {
+		parent := filepath.Dir(hostDir)
+		if parent != "" && parent != "/" && underOPAReviewTmp(parent) {
+			_ = os.Chown(parent, uid, gid)
+			_ = os.Chmod(parent, 0o775)
+		}
+	}
 }
