@@ -386,6 +386,12 @@ func hydrateSCMJobsAndStacksOnBoot() {
 	if nRun > 0 {
 		log.Printf("[INFO] SCM recovered %d stuck running job(s) after restart", nRun)
 	}
+	if nPR := rebuildPRRunIndexFromLive(); nPR > 0 {
+		log.Printf("[INFO] SCM rebuilt PR run index for %d in-flight PR run(s)", nPR)
+	}
+	if nSuper := pruneSupersededInFlightPRRuns(); nSuper > 0 {
+		log.Printf("[INFO] SCM pruned %d superseded in-flight PR job(s) after restart", nSuper)
+	}
 	nOrphan := reconstructOrphanStacksFromJobs()
 	if nOrphan > 0 {
 		log.Printf("[INFO] SCM reconstructed %d orphan stack(s) from job summaries", nOrphan)
