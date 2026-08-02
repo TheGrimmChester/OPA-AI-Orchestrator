@@ -1,11 +1,11 @@
 package main
 
-// Wave 35 — child-process environments constructed from an EMPTY slice.
+// Agents — child-process environments constructed from an EMPTY slice.
 //
 // THIS FILE MUST NEVER CALL os.Environ(), AND NEITHER MAY ANY CALLER THAT
 // BUILDS A cmd.Env FOR AN UNTRUSTED TOOL.
 //
-// Before Wave 35 every tool child was launched with
+// Previously every tool child was launched with
 //
 //	cmd.Env = append(os.Environ(), "CURSOR_API_KEY="+key, ...)
 //
@@ -107,6 +107,23 @@ var jobEnvPassthrough = []string{
 var jobEnvDefaults = map[string]string{
 	"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 	"LANG": "C.UTF-8",
+}
+
+// dockerSandboxEnvOverrides force identity paths inside job boxes (UID 65532).
+// Orchestrator HOME is often /root; passing that through makes npm/composer
+// try /root/.npm and hit EACCES on the read-only rootfs.
+var dockerSandboxEnvOverrides = map[string]string{
+	"HOME":             "/home/opa",
+	"npm_config_cache": "/tmp/npm-cache",
+	"NPM_CONFIG_CACHE": "/tmp/npm-cache",
+	"XDG_CACHE_HOME":   "/tmp/xdg-cache",
+	"XDG_CONFIG_HOME":  "/home/opa/.config",
+	"XDG_DATA_HOME":    "/home/opa/.local/share",
+	"TMPDIR":           "/tmp",
+	// golang:* images default GOPATH/GOMODCACHE under /go (read-only rootfs).
+	"GOPATH":     "/tmp/go",
+	"GOMODCACHE": "/tmp/go-mod",
+	"GOCACHE":    "/tmp/go-cache",
 }
 
 // secretishFragments are substrings that mark a variable name as credential-
@@ -212,6 +229,15 @@ func jobEnv(spec jobEnvSpec) []string {
 			continue
 		}
 		out[k] = v
+	}
+
+	if sandboxMode() == "docker" {
+		for k, v := range dockerSandboxEnvOverrides {
+			out[k] = v
+		}
+		// Prefer the image PATH (golang includes /usr/local/go/bin). Forcing the
+		// orchestrator's host PATH drops toolchain dirs inside job boxes.
+		delete(out, "PATH")
 	}
 
 	return envSliceSorted(out)

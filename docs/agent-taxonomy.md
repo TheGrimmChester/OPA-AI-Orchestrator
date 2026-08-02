@@ -45,7 +45,7 @@ Optional verify: `"cloud_run_tests": true` with `OPA_JOB_SANDBOX=docker`.
 Requires a `github_app` connector — PAT push is refused.
 `OPA_CLOUD_MAX_ITERATIONS` defaults to 3 (clamped 1–3).
 
-See also [wave35-job-isolation.md](./wave35-job-isolation.md).
+See also [job-isolation.md](./job-isolation.md).
 
 ## Honesty / remaining gaps
 

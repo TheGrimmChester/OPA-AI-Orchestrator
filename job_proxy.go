@@ -29,11 +29,26 @@ const (
 var (
 	egressProxyMu       sync.Mutex
 	defaultAIAllowHosts = []string{"api.cursor.sh", "api2.cursor.sh"}
-	// npm registry hosts — off by default; enable with OPA_JOB_EGRESS_NPM=1 when
-	// browser MCP must fetch packages at runtime (prefer pinning in the image).
+	// npm registry hosts — off by default for AI; enable with OPA_JOB_EGRESS_NPM=1
+	// or OPA_JOB_EGRESS_CHECKUP=1 (checkup defaults ON so npm ci / go test work).
 	npmEgressAllowHosts = []string{
 		"registry.npmjs.org",
 		"registry.yarnpkg.com",
+	}
+	// Go module / checksum / VCS hosts for checkup `go test` / `go mod download`.
+	goEgressAllowHosts = []string{
+		"proxy.golang.org",
+		"sum.golang.org",
+		"storage.googleapis.com",
+		"github.com",
+		"objects.githubusercontent.com",
+		"codeload.github.com",
+		"proxy.golang.com",
+	}
+	// Composer / Packagist for PHP checkup install steps.
+	composerEgressAllowHosts = []string{
+		"repo.packagist.org",
+		"packagist.org",
 	}
 )
 
@@ -84,7 +99,19 @@ func normalizeAllowHost(h string) string {
 	return h
 }
 
-// aiEgressAllowlist returns hosts the shared proxy may dial for AI phases.
+// checkupEgressEnabled adds package-registry hosts to the shared proxy allowlist.
+// Default ON in docker sandbox so heuristic checkup (npm ci / go test / composer)
+// can reach registries; set OPA_JOB_EGRESS_CHECKUP=0 for sealed offline checkup.
+func checkupEgressEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("OPA_JOB_EGRESS_CHECKUP"))) {
+	case "0", "off", "false", "no":
+		return false
+	default:
+		return sandboxMode() == "docker"
+	}
+}
+
+// aiEgressAllowlist returns hosts the shared proxy may dial for AI / checkup phases.
 func aiEgressAllowlist() []string {
 	if v := strings.TrimSpace(os.Getenv("OPA_JOB_EGRESS_ALLOWLIST")); v != "" {
 		parsed := parseEgressAllowlist(v)
@@ -93,8 +120,12 @@ func aiEgressAllowlist() []string {
 		}
 	}
 	out := append([]string{}, defaultAIAllowHosts...)
-	if strings.TrimSpace(os.Getenv("OPA_JOB_EGRESS_NPM")) == "1" {
+	if strings.TrimSpace(os.Getenv("OPA_JOB_EGRESS_NPM")) == "1" || checkupEgressEnabled() {
 		out = append(out, npmEgressAllowHosts...)
+	}
+	if checkupEgressEnabled() {
+		out = append(out, goEgressAllowHosts...)
+		out = append(out, composerEgressAllowHosts...)
 	}
 	return out
 }

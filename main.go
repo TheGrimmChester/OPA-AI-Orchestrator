@@ -61,10 +61,10 @@ func main() {
 		})
 	})
 
-	registerWave33Mux(mux, authView, authAdmin)
-	registerWave34Mux(mux, authView, authAdmin)
+	registerSecurityRunsMux(mux, authView, authAdmin)
+	registerRepoWatchMux(mux, authView, authAdmin)
 	registerAIMux(mux, authView, authAdmin)
-	registerWave35PrefsMux(mux, authView, authAdmin)
+	registerAgentsPrefsMux(mux, authView, authAdmin)
 	loadAISettingsFromFileOnBoot()
 
 	go func() {

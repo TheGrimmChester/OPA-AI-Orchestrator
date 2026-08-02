@@ -244,7 +244,7 @@ func heuristicCheckupPlan(treeRoot string) *checkupPlan {
 			PostCondition: checkupPostCondition{Kind: "exit0"},
 			TimeoutSec:    1200,
 		})
-		p.Image = nz(os.Getenv("OPA_JOB_IMAGE_GO"), "opa-runner-git:smoke")
+		p.Image = defaultGoCheckupImage()
 	}
 	if len(p.Steps) == 0 {
 		// Empty plan is valid — runner records honesty "no checkup steps derived".
@@ -259,6 +259,14 @@ func defaultCheckupImage() string {
 	}
 	tag := nz(strings.TrimSpace(os.Getenv("OPA_JOB_IMAGE_TAG")), "smoke")
 	return "opa-runner-ai:" + tag
+}
+
+// defaultGoCheckupImage picks a Go toolchain image (opa-runner-git has git only).
+func defaultGoCheckupImage() string {
+	if v := strings.TrimSpace(os.Getenv("OPA_JOB_IMAGE_GO")); v != "" {
+		return v
+	}
+	return "golang:1.25"
 }
 
 // defaultPHPCheckupImage is the checkup box for composer/phpunit trees.

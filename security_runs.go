@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-func registerWave33Mux(mux *http.ServeMux, authView, authAdmin func(string, http.HandlerFunc)) {
+func registerSecurityRunsMux(mux *http.ServeMux, authView, authAdmin func(string, http.HandlerFunc)) {
 	authView("/api/security/profiles", handleSecurityProfiles)
 	authView("/api/security/runs", handleSecurityRuns)
 	mux.HandleFunc("/api/security/runs/", handleSecurityRunSub)

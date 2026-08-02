@@ -22,7 +22,7 @@ func TestAssertNoConfusedProfileRejectsUnion(t *testing.T) {
 
 func TestAgentDependsOnCoversAllNonRootKinds(t *testing.T) {
 	for _, s := range agentStageRegistry {
-		if s.Kind == kindLegacy || s.Kind == kindRun || s.Kind == "" {
+		if s.Kind == kindContinuous || s.Kind == kindRun || s.Kind == "" {
 			continue
 		}
 		if _, ok := agentDependsOn[s.Kind]; !ok {

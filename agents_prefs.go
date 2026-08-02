@@ -280,7 +280,7 @@ func boolToU8(v bool) uint8 {
 	return 0
 }
 
-func ensureWave35Tables() {
+func ensureAgentsTables() {
 	if queryClient == nil {
 		return
 	}
@@ -300,7 +300,7 @@ func ensureWave35Tables() {
 		`ALTER TABLE opa.review_contexts ADD COLUMN IF NOT EXISTS status LowCardinality(String) DEFAULT 'active'`,
 	} {
 		if err := queryClient.Execute(q); err != nil {
-			log.Printf("[WARN] ensureWave35Tables: %v", err)
+			log.Printf("[WARN] ensureAgentsTables: %v", err)
 		}
 	}
 }
@@ -363,7 +363,7 @@ func hydrateAgentPrefsOnBoot() int {
 	return n
 }
 
-func registerWave35PrefsMux(mux *http.ServeMux, authView, authAdmin func(string, http.HandlerFunc)) {
+func registerAgentsPrefsMux(mux *http.ServeMux, authView, authAdmin func(string, http.HandlerFunc)) {
 	_ = authAdmin
 	authView("/api/agents/prefs", handleAgentPrefs)
 }

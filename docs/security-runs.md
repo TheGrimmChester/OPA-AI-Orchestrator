@@ -1,4 +1,4 @@
-# Security runs (Wave 33)
+# Security runs
 
 First-class scan lifecycle — create a run from the Dashboard or API, Agent executes embedded lite/stub scanners against `OPA_SECURITY_WORKSPACE`, and findings are stamped with `security_run_id`.
 

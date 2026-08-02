@@ -29,13 +29,15 @@ func TestParseEgressAllowlist(t *testing.T) {
 func TestAIEgressAllowlistDefaults(t *testing.T) {
 	t.Setenv("OPA_JOB_EGRESS_ALLOWLIST", "")
 	t.Setenv("OPA_JOB_EGRESS_NPM", "")
+	t.Setenv("OPA_JOB_EGRESS_CHECKUP", "0")
+	t.Setenv("OPA_JOB_SANDBOX", "")
 	got := aiEgressAllowlist()
 	if len(got) < 2 || got[0] != "api.cursor.sh" || got[1] != "api2.cursor.sh" {
 		t.Fatalf("defaults: %v", got)
 	}
 	for _, h := range got {
-		if strings.Contains(h, "npm") {
-			t.Fatalf("npm must be off by default: %v", got)
+		if strings.Contains(h, "npm") || h == "proxy.golang.org" {
+			t.Fatalf("package registries must be off without checkup/npm flags: %v", got)
 		}
 	}
 	t.Setenv("OPA_JOB_EGRESS_NPM", "1")
@@ -48,6 +50,22 @@ func TestAIEgressAllowlistDefaults(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("npm gated on: %v", got)
+	}
+	t.Setenv("OPA_JOB_EGRESS_NPM", "")
+	t.Setenv("OPA_JOB_EGRESS_CHECKUP", "")
+	t.Setenv("OPA_JOB_SANDBOX", "docker")
+	got = aiEgressAllowlist()
+	foundNPM, foundGo := false, false
+	for _, h := range got {
+		if h == "registry.npmjs.org" {
+			foundNPM = true
+		}
+		if h == "proxy.golang.org" {
+			foundGo = true
+		}
+	}
+	if !foundNPM || !foundGo {
+		t.Fatalf("checkup docker defaults should allow npm+go: %v", got)
 	}
 	t.Setenv("OPA_JOB_EGRESS_ALLOWLIST", "only.example")
 	got = aiEgressAllowlist()

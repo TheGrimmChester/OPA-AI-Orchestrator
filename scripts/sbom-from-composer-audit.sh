@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Wave 30 — adapt composer audit JSON into OPA POST /v1/sbom.
+# AppSec — adapt composer audit JSON into OPA POST /v1/sbom.
 # Usage:
 #   composer audit --format=json | ./scripts/sbom-from-composer-audit.sh my-php-svc | curl -X POST "$OPA/v1/sbom" -d @-
 set -euo pipefail

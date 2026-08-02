@@ -8,11 +8,11 @@ import (
 func TestAllAgentChildKindsDispatched(t *testing.T) {
 	for k := range agentDependsOn {
 		if !isAgentChildKind(k) {
-			t.Fatalf("kind %q is in agentDependsOn but not isAgentChildKind — processSCMJob would send it to legacy", k)
+			t.Fatalf("kind %q is in agentDependsOn but not isAgentChildKind — processSCMJob would fail-closed", k)
 		}
 	}
-	if isAgentChildKind(kindRun) || isAgentChildKind(kindLegacy) {
-		t.Fatal("run/legacy must not be agent children")
+	if isAgentChildKind(kindRun) || isAgentChildKind(kindContinuous) {
+		t.Fatal("run/continuous must not be agent children")
 	}
 	if !isAgentChildKind(kindCheckup) {
 		t.Fatal("checkup must dispatch to processAgentChild")
@@ -34,20 +34,21 @@ func TestProcessSCMJobDispatchesAgentChildren(t *testing.T) {
 		{kindCheckup, "agent"},
 		{kindApproval, "agent"},
 		{kindCloud, "agent"},
-		{kindLegacy, "legacy"},
-		{agentKind("unknown"), "legacy"},
+		{kindContinuous, "continuous"},
+		{agentKind(""), "unknown"},
+		{agentKind("unknown"), "unknown"},
 	}
 	for _, tc := range cases {
 		if got := scmJobProcessor(tc.kind); got != tc.want {
 			t.Fatalf("scmJobProcessor(%q)=%q want %q", tc.kind, got, tc.want)
 		}
 	}
-	if scmJobProcessor(kindCheckup) == "legacy" {
-		t.Fatal("checkup must not route to legacy")
+	if scmJobProcessor(kindCheckup) == "continuous" || scmJobProcessor(kindCheckup) == "unknown" {
+		t.Fatal("checkup must not route to continuous/unknown")
 	}
 
 	// Runtime: call processSCMJob with incomplete deps so processAgentChild
-	// returns early (status stays queued). Legacy would mark the job running.
+	// returns early (status stays queued). Continuous would mark the job running.
 	runID := "dispatch-run-1"
 	parent := &scmJob{
 		ID: runID, Kind: string(kindRun), RunID: runID, Status: "running",
@@ -87,11 +88,91 @@ func TestProcessSCMJobDispatchesAgentChildren(t *testing.T) {
 	}
 
 	// Prepare has no deps — pre-mark cancelled so processAgentChild exits
-	// before runPrepareAgent without legacy side effects.
+	// before runPrepareAgent without continuous side effects.
 	jobs[kindPrepare].Status = "cancelled"
 	processSCMJob(jobs[kindPrepare].ID)
 	if got := getSCMJob(jobs[kindPrepare].ID); got == nil || got.Status != "cancelled" {
 		t.Fatalf("prepare cancelled path: got %#v", got)
+	}
+}
+
+func TestProcessSCMJobFailClosedUnknownKind(t *testing.T) {
+	t.Setenv("OPA_SCM_STATE_DIR", t.TempDir())
+	job := &scmJob{
+		ID: "fail-unknown-1", Kind: "", Event: "pull_request.opened", Status: "queued",
+		Summary: map[string]interface{}{},
+	}
+	scmJobLive.Store(job.ID, job)
+	defer scmJobLive.Delete(job.ID)
+
+	processSCMJob(job.ID)
+	got := getSCMJob(job.ID)
+	if got == nil || got.Status != "failed" {
+		t.Fatalf("empty kind PR job want failed, got %#v", got)
+	}
+	if got.Error == "" {
+		t.Fatal("want fail-closed error message")
+	}
+}
+
+func TestProcessSCMJobUpgradesEmptyPushToContinuous(t *testing.T) {
+	t.Setenv("OPA_SCM_STATE_DIR", t.TempDir())
+	// Skip gate will mark skipped for already-reviewed / missing connector —
+	// we only assert the kind upgrade happens before dispatch. Use cancelled
+	// so processContinuousSCMJob returns early after kind upgrade.
+	job := &scmJob{
+		ID: "upgrade-push-1", Kind: "", Event: "push.default", Status: "cancelled",
+		Summary: map[string]interface{}{},
+	}
+	scmJobLive.Store(job.ID, job)
+	defer func() {
+		scmJobLive.Delete(job.ID)
+		scmProcessing.Delete(job.ID)
+	}()
+
+	processSCMJob(job.ID)
+	got := getSCMJob(job.ID)
+	if got == nil || got.Kind != string(kindContinuous) {
+		t.Fatalf("empty push kind want continuous, got %#v", got)
+	}
+}
+
+func TestProcessSCMJobUpgradesEmptyPullRequestKindToRun(t *testing.T) {
+	job := &scmJob{
+		ID: "upgrade-pr-1", Kind: "", Event: "pull_request.synchronize", PRNumber: 7,
+		Status: "cancelled", Summary: map[string]interface{}{},
+	}
+	scmJobLive.Store(job.ID, job)
+	defer func() {
+		scmJobLive.Delete(job.ID)
+		scmProcessing.Delete(job.ID)
+	}()
+
+	processSCMJob(job.ID)
+	got := getSCMJob(job.ID)
+	if got == nil || got.Kind != string(kindRun) {
+		t.Fatalf("empty PR kind want run, got %#v", got)
+	}
+	if got.RunID != job.ID {
+		t.Fatalf("RunID want %s, got %q", job.ID, got.RunID)
+	}
+}
+
+func TestShouldEnqueuePRRun(t *testing.T) {
+	if !shouldEnqueuePRRun("pull_request.opened", 1) {
+		t.Fatal("PR events must enqueue run graph")
+	}
+	if shouldEnqueuePRRun("push.default", 0) {
+		t.Fatal("push must stay continuous")
+	}
+	if shouldEnqueuePRRun("cron.full", 0) {
+		t.Fatal("cron must stay continuous")
+	}
+	if !shouldEnqueuePRRun("simulate", 0) {
+		t.Fatal("simulate must enqueue run graph")
+	}
+	if !shouldEnqueuePRRun("manual.ai_review", 42) {
+		t.Fatal("manual with PR must enqueue run graph")
 	}
 }
 

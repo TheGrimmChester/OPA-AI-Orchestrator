@@ -98,7 +98,7 @@ func clampInt(n, lo, hi int) int {
 	return n
 }
 
-// loadID mirrors the Wave 29 helper used by SCM contexts/jobs.
+// loadID mirrors the Perf lab helper used by SCM contexts/jobs.
 func loadID(prefix string, parts ...string) string {
 	h := sha1.New()
 	h.Write([]byte(prefix))

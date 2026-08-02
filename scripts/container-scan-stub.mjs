@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Wave 30 — container/image scan stub (not Trivy/Grype).
+ * AppSec — container/image scan stub (not Trivy/Grype).
  * Emits JSON for POST /v1/security/containers.
  *
  * Usage:

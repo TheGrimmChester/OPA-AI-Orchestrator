@@ -25,6 +25,7 @@ func TestBuildDockerRunArgvHardening(t *testing.T) {
 		"opa.owner=opa-orchestrator",
 		"opa.job=child1",
 		"opa.run=run1",
+		"uid=65532,gid=65532,mode=1777",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing %q in %s", want, joined)

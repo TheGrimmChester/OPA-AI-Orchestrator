@@ -1,4 +1,4 @@
-# GitHub Repo Watch + AI PR checks (Wave 34)
+# GitHub Repo Watch + AI PR checks
 
 ## Today (no GitHub App yet)
 
@@ -181,4 +181,4 @@ Legacy CI without Repo Watch can still call `harness/appsec-pr-check.sh` (tenant
 - `GET /api/scm/settings`, `POST /api/scm/settings/cursor-key` — `cursor_key_set` only; key AES-GCM in `opa.scm_secrets`
 - `POST /v1/scm/github/webhook`
 - `POST /api/scm/simulate`
-- `POST /api/security/runs` (Wave 33 workspace scans)
+- `POST /api/security/runs` (Security runs workspace scans)
