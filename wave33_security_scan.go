@@ -51,10 +51,11 @@ var sastRules = []struct {
 	severity string
 	message  string
 }{
-	{"js-eval", regexp.MustCompile(`\beval\s*\(`), map[string]bool{".js": true, ".mjs": true, ".ts": true, ".tsx": true, ".jsx": true}, "high", "eval() call"},
+	// Messages avoid "name(" shapes so scanner sources do not self-match.
+	{"js-eval", regexp.MustCompile(`\beval\s*\(`), map[string]bool{".js": true, ".mjs": true, ".ts": true, ".tsx": true, ".jsx": true}, "high", "dynamic eval invocation"},
 	{"js-innerhtml", regexp.MustCompile(`\.innerHTML\s*=`), map[string]bool{".js": true, ".mjs": true, ".ts": true, ".tsx": true, ".jsx": true}, "medium", "innerHTML assignment"},
-	{"js-document-write", regexp.MustCompile(`document\.write\s*\(`), map[string]bool{".js": true, ".mjs": true, ".ts": true, ".tsx": true, ".jsx": true}, "medium", "document.write()"},
-	{"php-eval", regexp.MustCompile(`\beval\s*\(`), map[string]bool{".php": true}, "high", "PHP eval()"},
+	{"js-document-write", regexp.MustCompile(`document\.write\s*\(`), map[string]bool{".js": true, ".mjs": true, ".ts": true, ".tsx": true, ".jsx": true}, "medium", "document write call"},
+	{"php-eval", regexp.MustCompile(`\beval\s*\(`), map[string]bool{".php": true}, "high", "PHP eval invocation"},
 	// Go regexp has no backrefs — approximate quote+SQL+concat heuristics.
 	{"php-sql-concat", regexp.MustCompile(`(?i)['"]\s*(SELECT|INSERT|UPDATE|DELETE)\b[^'"]{0,120}['"]\s*\.`), map[string]bool{".php": true}, "high", "SQL string concatenation"},
 	{"php-sql-interp", regexp.MustCompile(`(?i)"(SELECT|INSERT|UPDATE|DELETE)\b[^"]*\$`), map[string]bool{".php": true}, "high", "SQL with variable interpolation"},
@@ -202,6 +203,11 @@ func walkScanFiles(root string, maxFiles int) []string {
 		}
 		ext := strings.ToLower(filepath.Ext(d.Name()))
 		name := d.Name()
+		// Skip in-tree lite scanners — their rule sources contain matching patterns.
+		switch name {
+		case "sast-lite.mjs", "secrets-lite.mjs", "iac-lite.mjs":
+			return nil
+		}
 		if !scanTextExt[ext] && name != ".env" && !strings.HasSuffix(name, ".env.example") &&
 			name != "Dockerfile" && !strings.HasPrefix(name, "Dockerfile.") {
 			return nil
