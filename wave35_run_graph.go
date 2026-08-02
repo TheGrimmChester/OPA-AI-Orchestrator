@@ -448,7 +448,14 @@ func runSecurityAgent(job *scmJob) error {
 
 	jobDashURL := scmJobDashboardURL(job.RunID)
 	if !githubUseMockAPI(conn) {
-		_ = ensureGitHubWriteAllowed(job, conn) // honesty when PAT allowed; write helpers fail closed
+		if err := ensureGitHubWriteAllowed(job, conn); err != nil {
+			if job.Summary == nil {
+				job.Summary = map[string]interface{}{}
+			}
+			job.Summary["publish_refused"] = err.Error()
+			persistSCMJob(job)
+			return err
+		}
 	}
 	appSecID, _ := githubCreateCheckRun(conn, owner, repoName, "OPA AppSec Gate", job.CommitSHA, "in_progress", "", "Scanning…", checkRunSummaryWithJobLink("Repo Watch scanners running", job.RunID), jobDashURL, nil)
 	if job.CheckRunIDs == nil {
@@ -457,7 +464,9 @@ func runSecurityAgent(job *scmJob) error {
 	job.CheckRunIDs["appsec"] = appSecID
 	persistSCMJob(job)
 
-	runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, profile, scanList, relPath, "", job.RepoFullName, job.PRNumber, job.CommitSHA, job.RunID)
+	// scmJob label = security child id so cancelSCMJob(teardown opa.job) hits scan boxes;
+	// checkout layout stays under the parent run (relPath already absolute).
+	runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, profile, scanList, relPath, "", job.RepoFullName, job.PRNumber, job.CommitSHA, job.ID)
 
 	gate := evaluateScopedGate(job.OrganizationID, runID, minSev)
 	if job.AIOnly {
@@ -517,7 +526,14 @@ func runBugbotAgent(job *scmJob) error {
 
 	jobDashURL := scmJobDashboardURL(job.RunID)
 	if !githubUseMockAPI(conn) {
-		_ = ensureGitHubWriteAllowed(job, conn)
+		if err := ensureGitHubWriteAllowed(job, conn); err != nil {
+			if job.Summary == nil {
+				job.Summary = map[string]interface{}{}
+			}
+			job.Summary["publish_refused"] = err.Error()
+			persistSCMJob(job)
+			return err
+		}
 	}
 	aiCheckID, _ := githubCreateCheckRun(conn, owner, repoName, "OPA Review", job.CommitSHA, "in_progress", "", "OPA reviewing…", checkRunSummaryWithJobLink("Running OPA Review", job.RunID), jobDashURL, nil)
 	if job.CheckRunIDs == nil {

@@ -114,6 +114,16 @@ func TestAuthorizeGitHubWritePATGate(t *testing.T) {
 	}
 }
 
+func TestGitHubPermsPRReadHasPullRequests(t *testing.T) {
+	m := githubPermsPRRead()
+	if m["pull_requests"] != "read" || m["contents"] != "read" {
+		t.Fatalf("pr read perms: %+v", m)
+	}
+	if _, ok := m["workflows"]; ok {
+		t.Fatal("workflows must not be requested")
+	}
+}
+
 func TestGateCloudDiffDenials(t *testing.T) {
 	caps := cloudDiffCaps{MaxFiles: 10, MaxLines: 100}
 

@@ -16,6 +16,15 @@ func githubPermsCloneRead() map[string]string {
 	return map[string]string{"contents": "read", "metadata": "read"}
 }
 
+// githubPermsPRRead is least-privilege for PR metadata / unified diffs / compare.
+func githubPermsPRRead() map[string]string {
+	return map[string]string{
+		"contents":      "read",
+		"pull_requests": "read",
+		"metadata":      "read",
+	}
+}
+
 func githubPermsChecksWrite() map[string]string {
 	return map[string]string{"checks": "write", "metadata": "read"}
 }

@@ -142,6 +142,29 @@ func TestPrepareRelatedCheckoutsNoGit(t *testing.T) {
 	}
 }
 
+func TestRelatedMaterializeFailClosedOmitsGit(t *testing.T) {
+	tmp := t.TempDir()
+	cloneDir := filepath.Join(tmp, "broken.gitclone")
+	dest := filepath.Join(tmp, "broken")
+	if err := os.MkdirAll(cloneDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(cloneDir, "README.md"), []byte("not a git repo\n"), 0o644)
+	_, err := materializeTreeWithCheckoutIndex(cloneDir, dest)
+	if err == nil {
+		t.Fatal("expected materialize to fail on non-git source")
+	}
+	// Mirrors prepareRelatedCheckouts fail-closed branch: never rename clone→dest.
+	_ = os.RemoveAll(dest)
+	_ = os.RemoveAll(cloneDir)
+	if _, err := os.Stat(filepath.Join(dest, ".git")); err == nil {
+		t.Fatal("fail-closed must not leave .git for agent-visible related trees")
+	}
+	if _, err := os.Stat(dest); err == nil {
+		t.Fatal("fail-closed must remove dest")
+	}
+}
+
 func TestResolveRelatedReposForJob(t *testing.T) {
 	job := &scmJob{RepoFullName: "acme/primary", PRNumber: 1}
 	applied := appliedReviewContexts{

@@ -97,6 +97,18 @@ func TestGitleaksSandboxBindUsesCheckoutLayout(t *testing.T) {
 	if err := assertJobBindPath(checkout, layoutID); err != nil {
 		t.Fatalf("path-derived layout must allow bind: %v", err)
 	}
+	// Cancel label (opa.job) is the security/SCM child id — may differ from layout.
+	secChild := "security-child-xyz"
+	jobLabel := resolveSandboxJobID(secChild, checkout)
+	if jobLabel != secChild {
+		t.Fatalf("cancel JobID want %s got %s", secChild, jobLabel)
+	}
+	if jobLabel == layoutID {
+		t.Fatal("gitleaks JobID (cancel) must differ from LayoutID (bind) when child ≠ checkout folder")
+	}
+	if err := assertJobBindPath(checkout, layoutID); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestAutofixSandboxLabelsSplitJobFromLayout(t *testing.T) {

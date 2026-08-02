@@ -8,6 +8,7 @@ import (
 func TestGitHubPermMapsNeverRequestWorkflows(t *testing.T) {
 	maps := []map[string]string{
 		githubPermsCloneRead(),
+		githubPermsPRRead(),
 		githubPermsChecksWrite(),
 		githubPermsPRWrite(),
 		githubPermsPush(),

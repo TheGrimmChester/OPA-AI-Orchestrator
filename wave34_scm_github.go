@@ -710,7 +710,7 @@ func githubPRDiff(c *opaConnector, owner, repo string, pr int) (string, error) {
 	if githubUseMockAPI(c) {
 		return "diff --git a/example.js b/example.js\n+eval(userInput)\n", nil
 	}
-	tok, err := githubAccessToken(c)
+	tok, err := githubAccessTokenFor(c, owner+"/"+repo, githubPermsPRRead())
 	if err != nil {
 		return "", err
 	}
