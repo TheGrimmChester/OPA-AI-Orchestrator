@@ -227,7 +227,7 @@ func runOneCloudAttempt(job *scmJob, conn *opaConnector, auth autofixAuthOK, pre
 		}
 	} else {
 		fixStub := &opaAutoFixJob{ID: fmt.Sprintf("%s-%d", job.ID, iteration), FindingKeys: keysFromFindings(auth.Findings), Findings: findings}
-		if err := runAutoFixAgent(job, absRoot, fixStub); err != nil {
+		if err := runAutoFixAgent(job, absRoot, patchWtID, fixStub); err != nil {
 			out["status"] = "failed"
 			out["honesty"] = "cloud.patch: " + err.Error()
 			return out, err
