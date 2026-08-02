@@ -86,3 +86,19 @@ func TestGitHubRepoShortName(t *testing.T) {
 		t.Fatal(githubRepoShortName("acme/demo"))
 	}
 }
+
+func TestGitHubInstallationTokenForRefusesEmptyRepo(t *testing.T) {
+	resetInstallationPermCacheForTest()
+	defer resetInstallationPermCacheForTest()
+	setInstallationPermCacheForTest("inst-1", map[string]string{
+		"contents": "read", "metadata": "read", "pull_requests": "read",
+	})
+	_, err := githubInstallationTokenFor("inst-1", "", githubPermsPRRead())
+	if err == nil || !strings.Contains(err.Error(), "requires owner/repo") {
+		t.Fatalf("want refuse empty repo, got %v", err)
+	}
+	_, err = githubInstallationTokenFor("inst-1", "   ", githubPermsCloneRead())
+	if err == nil || !strings.Contains(err.Error(), "requires owner/repo") {
+		t.Fatalf("want refuse blank repo, got %v", err)
+	}
+}

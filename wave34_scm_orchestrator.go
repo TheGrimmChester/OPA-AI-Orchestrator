@@ -252,6 +252,8 @@ func handlePRWebhook(w http.ResponseWriter, raw []byte, rec *scmWebhookReceipt) 
 		return
 	}
 	if priorID, already := lookupSuccessfulAIReviewForSHA(payload.Repository.FullName, payload.PR.Head.SHA, ""); already {
+		// Head is already reviewed — drop any stale in-flight work for older commits.
+		_ = supersedeInFlightPRJobs(payload.Repository.FullName, pr, payload.PR.Head.SHA)
 		finishWebhookReceipt(rec, "skipped", "Commit already had a successful OPA Review — SCM job not queued.", 200, "")
 		writeJSON(w, map[string]interface{}{
 			"ok": true, "skipped": "already_reviewed",
@@ -373,6 +375,13 @@ func enqueueSCMJob(wr *opaWatchedRepo, conn *opaConnector, repo string, pr int, 
 	}
 	if conn != nil {
 		org, proj, connID = conn.OrganizationID, conn.ProjectID, conn.ID
+	}
+	// Legacy path: same cancel-and-supersede as run graph — only the latest
+	// received PR commit should run when multiple pushes land quickly.
+	if pr > 0 {
+		unlock := lockPREnqueue(repo, pr)
+		defer unlock()
+		supersedeInFlightPRJobs(repo, pr, sha)
 	}
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
 	id := loadID("scmjob", org, proj, repo, sha, event, newRandomHex(6))
@@ -517,6 +526,10 @@ func cancelSCMJobWithReason(id, reason string) (*scmJob, string, int) {
 				c()
 			}
 		}
+		// Parent kind=run must cascade — otherwise approval/cloud keep mutating GitHub.
+		if agentKind(job.Kind) == kindRun {
+			cascadeCancelRunChildren(id, reason)
+		}
 		go func(jobID, runID, kind string) {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
@@ -539,17 +552,50 @@ func cancelSCMJobWithReason(id, reason string) (*scmJob, string, int) {
 	}
 }
 
+// cascadeCancelRunChildren cancels (or drains) every child of a kind=run parent.
+// Cloud mid-push drains like supersede — never hard-kill a land in flight.
+func cascadeCancelRunChildren(runID, reason string) {
+	for _, c := range listRunChildren(runID) {
+		if c == nil {
+			continue
+		}
+		if agentKind(c.Kind) == kindCloud && (c.Status == "running" || c.Status == "waiting") {
+			if c.Summary == nil {
+				c.Summary = map[string]interface{}{}
+			}
+			c.Summary["supersede_drain"] = true
+			c.Summary["cancel_drain"] = reason
+			persistSCMJob(c)
+			continue
+		}
+		switch c.Status {
+		case "queued", "waiting", "running":
+			_, _, _ = cancelSCMJobWithReason(c.ID, reason)
+		}
+	}
+}
+
 // cancelInFlightJobsForMergedPR cancels queued/waiting/running SCM jobs (and related
 // Auto-fix runs) for repo+PR when that pull request has been merged.
 func cancelInFlightJobsForMergedPR(repo string, pr int, reason string) []string {
+	if strings.TrimSpace(reason) == "" {
+		reason = "pull request merged"
+	}
+	return cancelInFlightJobsForPR(repo, pr, reason)
+}
+
+// cancelInFlightJobsForPR cancels every in-flight SCM job for repo+PR.
+// Top-level jobs (ParentID empty) are cancelled first so kind=run parents cascade
+// to children (cloud drains mid-push). Remaining orphan children are cancelled after.
+func cancelInFlightJobsForPR(repo string, pr int, reason string) []string {
 	repo = strings.TrimSpace(repo)
 	if repo == "" || pr <= 0 {
 		return nil
 	}
 	if strings.TrimSpace(reason) == "" {
-		reason = "pull request merged"
+		reason = "cancelled"
 	}
-	var ids []string
+	var topLevel, children []string
 	scmJobLive.Range(func(_, v interface{}) bool {
 		job, ok := v.(*scmJob)
 		if !ok || job == nil {
@@ -562,13 +608,56 @@ func cancelInFlightJobsForMergedPR(repo string, pr int, reason string) []string 
 		if st != "queued" && st != "waiting" && st != "running" {
 			return true
 		}
-		if _, errMsg, _ := cancelSCMJobWithReason(job.ID, reason); errMsg == "" {
-			ids = append(ids, job.ID)
+		if strings.TrimSpace(job.ParentID) != "" {
+			children = append(children, job.ID)
+		} else {
+			topLevel = append(topLevel, job.ID)
 		}
 		return true
 	})
+	var ids []string
+	for _, id := range topLevel {
+		if _, errMsg, _ := cancelSCMJobWithReason(id, reason); errMsg == "" {
+			ids = append(ids, id)
+		}
+	}
+	for _, id := range children {
+		j := getSCMJob(id)
+		if j == nil {
+			continue
+		}
+		st := strings.ToLower(j.Status)
+		if st != "queued" && st != "waiting" && st != "running" {
+			continue
+		}
+		// Orphan cloud mid-push: drain, don't hard-kill.
+		if agentKind(j.Kind) == kindCloud && (st == "running" || st == "waiting") {
+			if j.Summary == nil {
+				j.Summary = map[string]interface{}{}
+			}
+			j.Summary["supersede_drain"] = true
+			j.Summary["cancel_drain"] = reason
+			persistSCMJob(j)
+			ids = append(ids, id)
+			continue
+		}
+		if _, errMsg, _ := cancelSCMJobWithReason(id, reason); errMsg == "" {
+			ids = append(ids, id)
+		}
+	}
 	cancelInFlightAutoFixesForPR(repo, pr, reason)
 	return ids
+}
+
+// supersedeInFlightPRJobs cancels every in-flight job for repo+PR so only the
+// newly enqueued head commit runs. Used when synchronize (or any new enqueue)
+// lands while older commits are still queued/running.
+func supersedeInFlightPRJobs(repo string, pr int, newSHA string) []string {
+	reason := "Superseded by " + strings.TrimSpace(newSHA)
+	if reason == "Superseded by " {
+		reason = "Superseded by newer push"
+	}
+	return cancelInFlightJobsForPR(repo, pr, reason)
 }
 
 func cancelInFlightAutoFixesForPR(repo string, pr int, reason string) {

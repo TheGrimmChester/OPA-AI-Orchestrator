@@ -26,10 +26,15 @@ type agentLaunchSpec struct {
 	Parent       context.Context
 	// JobID labels the sandbox container (opa.job) for cancel teardown.
 	// Must be the SCM job/child id so cancelSCMJob(teardown by opa.job) hits
-	// the box. RunID is the worktree/network identity (LayoutID + opa.run)
-	// when the checkout lives under a different layout id (e.g. cloud-patch-*).
+	// the box.
 	JobID string
+	// RunID is opa.run + docker NetworkID (parent run id) so parent-run cancel
+	// reaps child boxes. Empty → JobID.
 	RunID string
+	// LayoutID is the worktree bind identity (assertJobBindPath). Use when the
+	// checkout lives under a different folder than RunID (e.g. cloud-patch-*).
+	// Empty → RunID → JobID.
+	LayoutID string
 }
 
 func launchAgentSandbox(spec agentLaunchSpec) ([]byte, error) {
@@ -48,13 +53,14 @@ func launchAgentSandbox(spec agentLaunchSpec) ([]byte, error) {
 	argv := append([]string{bin}, spec.Args...)
 	work := nz(spec.WorktreeRoot, spec.Dir)
 	labelID := resolveSandboxJobID(spec.JobID, work)
-	layoutID := nz(strings.TrimSpace(spec.RunID), labelID)
+	runLabel := nz(strings.TrimSpace(spec.RunID), labelID)
+	layoutID := nz(strings.TrimSpace(spec.LayoutID), runLabel)
 	workRel := sandboxWorkRel(work)
 	out, err := runSandboxedArgv(ctx, sandboxExecSpec{
 		Phase:       spec.Phase,
 		JobID:       labelID,
 		LayoutID:    layoutID,
-		NetworkID:   layoutID,
+		NetworkID:   runLabel,
 		HostWorkDir: work,
 		WorkRel:     workRel,
 		Argv:        argv,

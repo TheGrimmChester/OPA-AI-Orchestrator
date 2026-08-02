@@ -284,7 +284,7 @@ func enqueueOPAAutoFix(parent *scmJob, findingKeys []string, createPR, commitDir
 		}
 		keys = append(keys, k)
 	}
-	mode := prefs.AutofixMode
+	mode := strings.ToLower(strings.TrimSpace(prefs.AutofixMode))
 	if mode != "suggest" && mode != "branch" {
 		mode = "branch"
 	}
@@ -647,9 +647,9 @@ func runOPAAutoFix(parent *scmJob, conn *opaConnector, fix *opaAutoFixJob) (*opa
 	return fix, nil
 }
 
-// autofixShouldLand is false for suggest mode (proposal only; no push/PR).
+// autofixShouldLand is true only for branch mode (fail closed on empty/unknown).
 func autofixShouldLand(mode string) bool {
-	return strings.TrimSpace(mode) != "suggest"
+	return strings.ToLower(strings.TrimSpace(mode)) == "branch"
 }
 
 // autofixFindingAllowlist collects unique finding file paths for gateCloudDiff.
@@ -701,13 +701,18 @@ func runAutoFixAgent(parent *scmJob, checkoutRoot, scmJobID, worktreeID string, 
 		return fmt.Errorf("CLI agent API key not set — save one under Account (personal or org)")
 	}
 	brief := packAutoFixBrief(parent, checkoutRoot, fix)
-	// opa.job = SCM job/child id (cancel teardown); LayoutID/RunID = worktree id
-	// (bind path under cloud-patch-* / autofix worktree layout).
+	// opa.job = SCM job/child id (cancel teardown); LayoutID = worktree bind
+	// identity (cloud-patch-* / autofix-*); RunID = parent run for opa.run reap.
 	jobLabel := resolveSandboxJobID(scmJobID, checkoutRoot)
 	layoutLabel := resolveSandboxJobID(worktreeID, checkoutRoot)
+	runLabel := jobLabel
 	cancelID := ""
 	if parent != nil {
 		cancelID = parent.ID
+		runLabel = nz(parent.RunID, parent.ID)
+		if runLabel == "" {
+			runLabel = jobLabel
+		}
 	}
 	promptPath, cleanupBrief, errBrief := writeAgentBrief(checkoutRoot, jobLabel, fmt.Sprintf("opa-autofix-%s.md", fix.ID), brief)
 	if errBrief != nil {
@@ -728,7 +733,7 @@ func runAutoFixAgent(parent *scmJob, checkoutRoot, scmJobID, worktreeID string, 
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseAutofix, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
 		APIKey: key, Parent: scmJobContext(cancelID), Timeout: 1200 * time.Second,
-		JobID: jobLabel, RunID: layoutLabel,
+		JobID: jobLabel, RunID: runLabel, LayoutID: layoutLabel,
 	})
 	if err != nil {
 		return fmt.Errorf("%v (%s)", err, truncateStr(string(out), 300))

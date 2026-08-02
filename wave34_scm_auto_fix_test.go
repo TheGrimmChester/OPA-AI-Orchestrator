@@ -9,11 +9,17 @@ func TestAutofixShouldLandSuggestVsBranch(t *testing.T) {
 	if autofixShouldLand("suggest") {
 		t.Fatal("suggest must not land")
 	}
+	if autofixShouldLand("Suggest") {
+		t.Fatal("Suggest (cased) must not land")
+	}
 	if !autofixShouldLand("branch") {
 		t.Fatal("branch should land")
 	}
-	if !autofixShouldLand("") {
-		t.Fatal("empty mode defaults to land (caller sets branch)")
+	if autofixShouldLand("") {
+		t.Fatal("empty mode must fail closed (no land)")
+	}
+	if autofixShouldLand("off") {
+		t.Fatal("unknown mode must not land")
 	}
 }
 
@@ -36,6 +42,19 @@ func TestAutofixSuggestFlagsNeverOpenPR(t *testing.T) {
 	}
 	if direct.CreatePR {
 		t.Fatal("commit_direct must not open PR")
+	}
+}
+
+func TestAutofixModeCasingSuggestDoesNotBecomeBranch(t *testing.T) {
+	mode := strings.ToLower(strings.TrimSpace("Suggest"))
+	if mode != "suggest" {
+		t.Fatalf("got %q", mode)
+	}
+	if mode != "suggest" && mode != "branch" {
+		mode = "branch"
+	}
+	if autofixShouldLand(mode) {
+		t.Fatal("Suggest prefs must authorize as suggest and never land")
 	}
 }
 
