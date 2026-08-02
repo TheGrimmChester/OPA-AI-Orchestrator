@@ -18,8 +18,8 @@ Invariant enforced at init: no stage combines `capExecUntrusted` with
 
 Prefs freeze on run create (`Summary.prefs`). Kill switches:
 `OPA_AGENTS_RUN_GRAPH=0` → legacy monolith; `OPA_JOB_SANDBOX=off|docker`.
-Capability prefs (default off): `checkup_enabled`, `cloud_enabled`,
-`autofix_mode` (`off`\|`suggest`\|`branch`), `cloud_run_tests`.
+Capability prefs (default off): `checkup_enabled`, `cloud_run_tests`.
+`cloud_enabled` defaults on with `autofix_mode` `branch` (use `off` to disable; `suggest` for proposal-only).
 
 ## Status
 

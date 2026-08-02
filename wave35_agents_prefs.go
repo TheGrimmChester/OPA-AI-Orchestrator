@@ -53,7 +53,7 @@ func builtinAgentPrefs() agentPrefs {
 		ReviewDraftPRs:           true,
 		PRSummaries:              true,
 		PostPRRiskScore:          true,
-		AutofixMode:              "off",
+		AutofixMode:              "branch",
 		AutofixSeverityThreshold: "high",
 		IncrementalReview:        true,
 		SecurityAutoPRReviews:    true,
@@ -64,7 +64,7 @@ func builtinAgentPrefs() agentPrefs {
 		PolicyFilePath:           ".opa/approval-policy.json",
 		AIReviewerAware:          true,
 		BugbotMaxUnits:           10,
-		CloudEnabled:             false,
+		CloudEnabled:             true,
 		CloudRunTests:            false,
 		CheckupEnabled:           false,
 	}
@@ -389,7 +389,7 @@ func handleAgentPrefs(w http.ResponseWriter, r *http.Request) {
 func handleAgentPrefsGet(w http.ResponseWriter, r *http.Request) {
 	ctx, _ := ExtractTenantContext(r, queryClient)
 	org, proj := ctx.WriteTenant()
-	level := nz(r.URL.Query().Get("level"), "repo")
+	level := strings.ToLower(strings.TrimSpace(nz(r.URL.Query().Get("level"), "org")))
 	scope := strings.TrimSpace(r.URL.Query().Get("scope_key"))
 	connectorID := strings.TrimSpace(r.URL.Query().Get("connector_id"))
 	repo := strings.TrimSpace(r.URL.Query().Get("repo"))
@@ -399,9 +399,11 @@ func handleAgentPrefsGet(w http.ResponseWriter, r *http.Request) {
 			scope = org + "/" + proj
 		case "installation":
 			scope = connectorID
-		default:
+		case "repo":
 			scope = repo
-			level = "repo"
+		default:
+			level = "org"
+			scope = org + "/" + proj
 		}
 	}
 	effective, sources := resolveAgentPrefs(org, proj, connectorID, repo)
@@ -430,20 +432,33 @@ func handleAgentPrefsPut(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, _ := ExtractTenantContext(r, queryClient)
 	org, proj := ctx.WriteTenant()
-	level := nz(body.Level, "repo")
+	level := strings.ToLower(strings.TrimSpace(nz(body.Level, "org")))
+	switch level {
+	case "org", "installation", "repo":
+	default:
+		http.Error(w, "level must be org, installation, or repo", 400)
+		return
+	}
 	scope := strings.TrimSpace(body.ScopeKey)
 	if scope == "" {
 		switch level {
 		case "org":
 			scope = org + "/" + proj
 		case "installation":
-			scope = body.ConnectorID
+			scope = strings.TrimSpace(body.ConnectorID)
 		default:
-			scope = body.Repo
+			scope = strings.TrimSpace(body.Repo)
 		}
 	}
 	if scope == "" {
-		http.Error(w, "scope_key required", 400)
+		switch level {
+		case "org":
+			http.Error(w, "organization scope unavailable — tenant context missing", 400)
+		case "installation":
+			http.Error(w, "connector_id/scope_key required for installation level", 400)
+		default:
+			http.Error(w, "repo/scope_key required for repository level — use level=org for global prefs", 400)
+		}
 		return
 	}
 	// Merge onto existing blob so unspecified fields keep prior explicit values.
@@ -467,6 +482,8 @@ func handleAgentPrefsPut(w http.ResponseWriter, r *http.Request) {
 	}
 	effective, sources := resolveAgentPrefs(org, proj, body.ConnectorID, body.Repo)
 	writeJSON(w, map[string]interface{}{
-		"ok": true, "prefs": existing, "effective": effective, "sources": sources,
+		"ok": true, "level": level, "scope_key": scope,
+		"organization_id": org, "project_id": proj,
+		"prefs": existing, "effective": effective, "sources": sources,
 	})
 }
