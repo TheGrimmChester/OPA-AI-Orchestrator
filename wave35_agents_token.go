@@ -244,8 +244,11 @@ func githubInstallationTokenFor(installationID, repoFullName string, want map[st
 	}
 	want = stripWorkflowsPerm(want)
 	var repos []string
-	if short := githubRepoShortName(repoFullName); short != "" {
+	if short := strings.TrimSpace(githubRepoShortName(repoFullName)); short != "" {
 		repos = []string{short}
+	} else if len(want) > 0 {
+		// Never mint a permissions-only token across the whole installation.
+		return "", fmt.Errorf("repo-scoped token requires owner/repo (got %q)", repoFullName)
 	}
 	if len(want) > 0 {
 		filtered, err := requireGrantedPerms(installationID, want)

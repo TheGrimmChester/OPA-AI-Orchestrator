@@ -1,5 +1,7 @@
 package main
 
+import "fmt"
+
 // publishPRReview is the ONLY caller of githubCreatePRReview with comments or a
 // decision event. Bugbot records the plan and publishes its own immediate signals
 // (résumé + check run); approval (or the finalizer) calls this once so humans get
@@ -7,6 +9,9 @@ package main
 func publishPRReview(conn *opaConnector, owner, repo string, job *scmJob, body, event string, comments []githubPRReviewCommentSpec) error {
 	if job == nil || job.PRNumber <= 0 {
 		return nil
+	}
+	if scmJobIsCancelled(job.ID) || (job.RunID != "" && scmJobIsCancelled(job.RunID)) {
+		return fmt.Errorf("refusing publishPRReview: job/run cancelled")
 	}
 	if event == "" {
 		event = "COMMENT"

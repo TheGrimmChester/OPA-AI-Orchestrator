@@ -112,9 +112,10 @@ func TestGitleaksSandboxBindUsesCheckoutLayout(t *testing.T) {
 }
 
 func TestAutofixSandboxLabelsSplitJobFromLayout(t *testing.T) {
-	// Cloud patch worktrees are cloud-patch-<child>-N; cancel tears down opa.job=<child>.
+	// Cloud patch: opa.job=child, LayoutID=worktree (bind), RunID=parent run (opa.run).
 	scmJobID := "cloud-child-abc"
 	worktreeID := "cloud-patch-cloud-child-abc-1"
+	parentRunID := "run-parent-xyz"
 	checkout := "/tmp/opa-review/" + worktreeID + "/sandbox"
 	jobLabel := resolveSandboxJobID(scmJobID, checkout)
 	layoutLabel := resolveSandboxJobID(worktreeID, checkout)
@@ -122,16 +123,17 @@ func TestAutofixSandboxLabelsSplitJobFromLayout(t *testing.T) {
 		t.Fatalf("JobID (opa.job) want %s got %s", scmJobID, jobLabel)
 	}
 	if layoutLabel != worktreeID {
-		t.Fatalf("RunID/LayoutID want %s got %s", worktreeID, layoutLabel)
+		t.Fatalf("LayoutID want %s got %s", worktreeID, layoutLabel)
 	}
-	if jobLabel == layoutLabel {
-		t.Fatal("cloud patch JobID must differ from worktree layout id so cancel finds boxes")
-	}
-	spec := agentLaunchSpec{JobID: jobLabel, RunID: layoutLabel, WorktreeRoot: checkout}
+	spec := agentLaunchSpec{JobID: jobLabel, RunID: parentRunID, LayoutID: layoutLabel, WorktreeRoot: checkout}
 	labelID := resolveSandboxJobID(spec.JobID, spec.WorktreeRoot)
-	layoutID := nz(strings.TrimSpace(spec.RunID), labelID)
-	if labelID != scmJobID || layoutID != worktreeID {
-		t.Fatalf("launch spec resolution: job=%s layout=%s", labelID, layoutID)
+	runLabel := nz(strings.TrimSpace(spec.RunID), labelID)
+	layoutID := nz(strings.TrimSpace(spec.LayoutID), runLabel)
+	if labelID != scmJobID || layoutID != worktreeID || runLabel != parentRunID {
+		t.Fatalf("launch spec: job=%s layout=%s run=%s", labelID, layoutID, runLabel)
+	}
+	if runLabel == layoutID {
+		t.Fatal("opa.run (parent) must differ from LayoutID (cloud-patch worktree) so parent cancel reaps boxes")
 	}
 }
 

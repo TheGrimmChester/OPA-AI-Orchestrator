@@ -11,10 +11,21 @@ import (
 var (
 	prRunIndexMu sync.Mutex
 	prRunIndex   = map[string]string{}
+	// Serialize enqueue+supersede per PR so concurrent synchronize webhooks
+	// cannot both miss each other and leave two runs in flight.
+	prEnqueueMu sync.Map // prRunIndexKey → *sync.Mutex
 )
 
 func prRunIndexKey(repo string, pr int) string {
 	return strings.ToLower(strings.TrimSpace(repo)) + "#" + itoa(pr)
+}
+
+func lockPREnqueue(repo string, pr int) func() {
+	key := prRunIndexKey(repo, pr)
+	muI, _ := prEnqueueMu.LoadOrStore(key, &sync.Mutex{})
+	mu := muI.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 func rememberPRRun(repo string, pr int, runID string) {
@@ -32,6 +43,103 @@ func currentPRRun(repo string, pr int) string {
 	return prRunIndex[prRunIndexKey(repo, pr)]
 }
 
+// rebuildPRRunIndexFromLive scans in-flight kind=run parents and restores
+// prRunIndex after boot hydrate (index is process-memory only).
+func rebuildPRRunIndexFromLive() int {
+	best := map[string]*scmJob{}
+	scmJobLive.Range(func(_, v interface{}) bool {
+		j, ok := v.(*scmJob)
+		if !ok || j == nil || j.PRNumber <= 0 {
+			return true
+		}
+		if agentKind(j.Kind) != kindRun || strings.TrimSpace(j.ParentID) != "" {
+			return true
+		}
+		st := strings.ToLower(j.Status)
+		if st != "queued" && st != "waiting" && st != "running" {
+			return true
+		}
+		key := prRunIndexKey(j.RepoFullName, j.PRNumber)
+		if prev, ok := best[key]; ok && prev.StartedAt >= j.StartedAt {
+			return true
+		}
+		best[key] = j
+		return true
+	})
+	prRunIndexMu.Lock()
+	prRunIndex = map[string]string{}
+	for k, j := range best {
+		prRunIndex[k] = j.ID
+	}
+	n := len(prRunIndex)
+	prRunIndexMu.Unlock()
+	return n
+}
+
+// pruneSupersededInFlightPRRuns keeps only the newest top-level in-flight job
+// per repo+PR (by StartedAt) and cancels the rest. Covers restart residue and
+// any race that left intermediate commits still queued/running.
+func pruneSupersededInFlightPRRuns() int {
+	type group struct {
+		repo string
+		pr   int
+		jobs []*scmJob
+	}
+	byKey := map[string]*group{}
+	scmJobLive.Range(func(_, v interface{}) bool {
+		j, ok := v.(*scmJob)
+		if !ok || j == nil || j.PRNumber <= 0 {
+			return true
+		}
+		if strings.TrimSpace(j.ParentID) != "" {
+			return true
+		}
+		st := strings.ToLower(j.Status)
+		if st != "queued" && st != "waiting" && st != "running" {
+			return true
+		}
+		key := prRunIndexKey(j.RepoFullName, j.PRNumber)
+		g := byKey[key]
+		if g == nil {
+			g = &group{repo: j.RepoFullName, pr: j.PRNumber}
+			byKey[key] = g
+		}
+		g.jobs = append(g.jobs, j)
+		return true
+	})
+	cancelled := 0
+	for _, g := range byKey {
+		if len(g.jobs) < 2 {
+			if len(g.jobs) == 1 && agentKind(g.jobs[0].Kind) == kindRun {
+				rememberPRRun(g.repo, g.pr, g.jobs[0].ID)
+			}
+			continue
+		}
+		newest := g.jobs[0]
+		for _, j := range g.jobs[1:] {
+			if j.StartedAt >= newest.StartedAt {
+				newest = j
+			}
+		}
+		reason := "Superseded by " + strings.TrimSpace(newest.CommitSHA)
+		if reason == "Superseded by " {
+			reason = "Superseded by newer push"
+		}
+		for _, j := range g.jobs {
+			if j.ID == newest.ID {
+				continue
+			}
+			if _, errMsg, _ := cancelSCMJobWithReason(j.ID, reason); errMsg == "" {
+				cancelled++
+			}
+		}
+		if agentKind(newest.Kind) == kindRun {
+			rememberPRRun(g.repo, g.pr, newest.ID)
+		}
+	}
+	return cancelled
+}
+
 // enqueuePRRun creates a parent kind=run job and its agent children (queued).
 // Prefs are resolved once and frozen onto the parent summary.
 func enqueuePRRun(wr *opaWatchedRepo, conn *opaConnector, repo string, pr int, sha, event string, draft bool, title, body string) *scmJob {
@@ -44,11 +152,11 @@ func enqueuePRRun(wr *opaWatchedRepo, conn *opaConnector, repo string, pr int, s
 	}
 	prefs, sources := resolveAgentPrefs(org, proj, connID, repo)
 
-	// Cancel-and-supersede prior in-flight run for the same PR.
+	// Cancel every older in-flight job for this PR; only this head SHA should run.
 	if pr > 0 {
-		if prev := currentPRRun(repo, pr); prev != "" {
-			supersedePRRun(prev, sha)
-		}
+		unlock := lockPREnqueue(repo, pr)
+		defer unlock()
+		supersedeInFlightPRJobs(repo, pr, sha)
 	}
 
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
@@ -137,29 +245,18 @@ func supersedePRRun(runID, newSHA string) {
 	if job == nil {
 		return
 	}
+	// Prefer PR-wide supersede so intermediate commits (A running, B queued, C arrives)
+	// all get cancelled — not only the single indexed run.
+	if job.PRNumber > 0 && strings.TrimSpace(job.RepoFullName) != "" {
+		supersedeInFlightPRJobs(job.RepoFullName, job.PRNumber, newSHA)
+		return
+	}
 	reason := "Superseded by " + strings.TrimSpace(newSHA)
 	if reason == "Superseded by " {
 		reason = "Superseded by newer push"
 	}
+	// cancelSCMJobWithReason cascades children (cloud drains mid-push).
 	_, _, _ = cancelSCMJobWithReason(runID, reason)
-	for _, c := range listRunChildren(runID) {
-		if c == nil {
-			continue
-		}
-		// Cloud drains; never kill mid-push.
-		if agentKind(c.Kind) == kindCloud && (c.Status == "running" || c.Status == "waiting") {
-			if c.Summary == nil {
-				c.Summary = map[string]interface{}{}
-			}
-			c.Summary["supersede_drain"] = true
-			persistSCMJob(c)
-			continue
-		}
-		switch c.Status {
-		case "queued", "waiting", "running":
-			_, _, _ = cancelSCMJobWithReason(c.ID, reason)
-		}
-	}
 }
 
 func listRunChildren(runID string) []*scmJob {

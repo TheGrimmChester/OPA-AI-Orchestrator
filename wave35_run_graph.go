@@ -60,6 +60,9 @@ func processPRRun(jobID string) {
 	deadline := time.Now().Add(2 * time.Hour)
 	for time.Now().Before(deadline) {
 		if scmJobIsCancelled(jobID) {
+			// Cascade already cancelled children; wait briefly so approval cannot
+			// still APPROVE after finalize's COMMENT fallback.
+			waitRunChildrenTerminal(jobID, 30*time.Second)
 			finalizePRRun(jobID)
 			return
 		}
@@ -175,9 +178,10 @@ func finalizePRRun(runID string) {
 	}
 	// If approval failed/skipped/missing while bugbot left a pending decision,
 	// publish COMMENT so inline findings are never silently orphaned.
+	// Skip on cancelled runs — publishPRReview refuses cancelled jobs anyway.
 	approvalOK := approval != nil && (approval.Status == "completed" || approval.Status == "skipped") &&
 		approval.Summary != nil && approval.Summary["pending_decision"] == false
-	if pendingDecision && !approvalOK && bugbot != nil {
+	if pendingDecision && !approvalOK && bugbot != nil && !scmJobIsCancelled(runID) {
 		ensureFinalCOMMENTReview(job, bugbot)
 	}
 	folded := foldRunStatus(children, job.Status)
@@ -188,6 +192,38 @@ func finalizePRRun(runID string) {
 	job.FinishedAt = time.Now().UTC().Format("2006-01-02 15:04:05.000")
 	persistSCMJob(job)
 	go cleanupOldSCMWorktrees(securityWorkspaceRoot(), 24*time.Hour)
+}
+
+// waitRunChildrenTerminal blocks until every child is terminal or timeout elapses.
+// Used after parent cancel so finalize does not race a still-running approval.
+func waitRunChildrenTerminal(runID string, timeout time.Duration) {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		children := listRunChildren(runID)
+		allDone := true
+		for _, c := range children {
+			if c == nil {
+				continue
+			}
+			// Cloud drain intentionally stays non-terminal until land finishes.
+			if agentKind(c.Kind) == kindCloud && c.Summary != nil &&
+				(c.Summary["supersede_drain"] == true || c.Summary["cancel_drain"] != nil) &&
+				(c.Status == "running" || c.Status == "waiting") {
+				continue
+			}
+			if !jobTerminal(c.Status) {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // ensureFinalCOMMENTReview posts a decision-less COMMENT via the chokepoint when
@@ -610,6 +646,12 @@ func runApprovalAgent(job *scmJob) error {
 	sec := childByKind(job.RunID, kindSecurity)
 	if job.Summary == nil {
 		job.Summary = map[string]interface{}{}
+	}
+	if scmJobIsCancelled(job.ID) || (job.RunID != "" && scmJobIsCancelled(job.RunID)) {
+		job.Status = "cancelled"
+		job.Summary["skip_reason"] = "parent/run cancelled"
+		persistSCMJob(job)
+		return nil
 	}
 	if bugbot == nil || !jobTerminal(bugbot.Status) || sec == nil || !jobTerminal(sec.Status) {
 		return fmt.Errorf("approval requires terminal bugbot+security")
