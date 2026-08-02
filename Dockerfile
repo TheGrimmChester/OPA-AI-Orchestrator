@@ -19,9 +19,11 @@ ARG PLAYWRIGHT_VERSION=1.50.1
 
 # Runtime: git/curl + Cursor Agent CLI + Node/npx + Playwright Chromium
 # (required for OPA Review UI visual MCP via @playwright/mcp --headless).
+# docker.io = CLI client for OPA_JOB_SANDBOX=docker (daemon via mounted sock).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl wget git bash \
+      docker.io \
       nodejs npm \
       libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
       libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
@@ -30,6 +32,7 @@ RUN apt-get update \
       libxcb-shm0 libxshmfence1 libegl1 libxcursor1 libxi6 libxtst6 \
       fonts-liberation fonts-noto-color-emoji \
  && rm -rf /var/lib/apt/lists/* \
+ && command -v docker \
  && node -v && npm -v && command -v npx \
  && arch="$TARGETARCH" \
  && case "$arch" in amd64|x86_64) gl_arch=x64 ;; arm64|aarch64) gl_arch=arm64 ;; *) gl_arch=x64 ;; esac \
