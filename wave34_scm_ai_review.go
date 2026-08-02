@@ -210,7 +210,7 @@ func runCursorAIReview(job *scmJob, conn *opaConnector, wr *opaWatchedRepo, chec
 			for _, n := range more {
 				srcMap[strings.ToLower(n)] = "mid_review"
 			}
-			added := prepareRelatedCheckouts(conn, job.ID, more, srcMap)
+			added := prepareRelatedCheckouts(conn, nz(job.RunID, job.ID), more, srcMap)
 			if job.Summary == nil {
 				job.Summary = map[string]interface{}{}
 			}
@@ -1007,7 +1007,11 @@ func packAIUnitContext(job *scmJob, securityRunID, service, checkoutRoot string,
 	fmt.Fprintf(&b, "## Unit diff\n```\n%s\n```\n\n", unit.Diff)
 	fmt.Fprintf(&b, "## Security run\n- security_run_id: `%s`\n- service: `%s`\n\n", securityRunID, service)
 	fmt.Fprintf(&b, "## Worktree isolation\n- Absolute path: `%s`\n- This is the full PR branch tree under OPA_REVIEW_TMP. Only cite findings for files inside this primary checkout.\n- **Surrounding-code requirement:** open changed files, read callers/callees/interfaces/neighbors, and search for related tests/invariants — do not judge the hunk alone.\n\n", checkoutRoot)
-	b.WriteString(formatRelatedCheckoutsForPrompt(relatedCheckoutsFromJobSummary(job)))
+	agentJob := ""
+	if job != nil {
+		agentJob = job.ID
+	}
+	b.WriteString(formatRelatedCheckoutsForPromptWithJob(relatedCheckoutsFromJobSummary(job), agentJob))
 	b.WriteString(opaReviewOutputSchema)
 	return b.String()
 }
@@ -1075,7 +1079,11 @@ func packAIContext(job *scmJob, wr *opaWatchedRepo, securityRunID, diff, checkou
 		}
 	}
 	fmt.Fprintf(&b, "## Worktree isolation\n- Absolute path: `%s`\n- Full PR tree under OPA_REVIEW_TMP. Read surrounding code, callers, and related tests — not the hunk alone.\n\n", checkoutRoot)
-	b.WriteString(formatRelatedCheckoutsForPrompt(relatedCheckoutsFromJobSummary(job)))
+	agentJob := ""
+	if job != nil {
+		agentJob = job.ID
+	}
+	b.WriteString(formatRelatedCheckoutsForPromptWithJob(relatedCheckoutsFromJobSummary(job), agentJob))
 	b.WriteString(opaReviewOutputSchema)
 	return b.String()
 }

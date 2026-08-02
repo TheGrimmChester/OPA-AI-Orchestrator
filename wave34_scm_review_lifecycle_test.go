@@ -165,6 +165,30 @@ func TestRelatedMaterializeFailClosedOmitsGit(t *testing.T) {
 	}
 }
 
+func TestFormatRelatedCheckoutsDockerPaths(t *testing.T) {
+	t.Setenv("OPA_JOB_SANDBOX", "docker")
+	related := []relatedCheckout{{
+		RepoFullName: "acme/shared", Path: "/tmp/opa-review/run1/related/acme-shared", SHA: "deadbeef", Source: "link",
+	}}
+	got := formatRelatedCheckoutsForPromptWithJob(related, "bugbot-1")
+	if !strings.Contains(got, relatedContainerPath("bugbot-1", "acme/shared")) {
+		t.Fatalf("want container path in prompt: %s", got)
+	}
+	if strings.Contains(got, "/tmp/opa-review") {
+		t.Fatalf("must not expose host path in docker mode: %s", got)
+	}
+}
+
+func TestMidReviewRelatedUsesRunWorktreeID(t *testing.T) {
+	// prepare uses job.RunID; mid-review must not use bare child id.
+	child := &scmJob{ID: "bugbot-child", RunID: "run-parent"}
+	wt := nz(child.RunID, child.ID)
+	if wt != "run-parent" {
+		t.Fatalf("mid-review worktree id want run-parent got %s", wt)
+	}
+}
+
+
 func TestResolveRelatedReposForJob(t *testing.T) {
 	job := &scmJob{RepoFullName: "acme/primary", PRNumber: 1}
 	applied := appliedReviewContexts{

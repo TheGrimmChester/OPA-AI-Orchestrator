@@ -277,6 +277,12 @@ func shallowCloneRelated(c *opaConnector, fullName, dest string) error {
 }
 
 func formatRelatedCheckoutsForPrompt(related []relatedCheckout) string {
+	return formatRelatedCheckoutsForPromptWithJob(related, "")
+}
+
+// formatRelatedCheckoutsForPromptWithJob rewrites related paths to the docker
+// identity mount when agentJobID is set and OPA_JOB_SANDBOX=docker.
+func formatRelatedCheckoutsForPromptWithJob(related []relatedCheckout, agentJobID string) string {
 	ok := []relatedCheckout{}
 	for _, r := range related {
 		if r.Error == "" && r.Path != "" {
@@ -290,11 +296,15 @@ func formatRelatedCheckoutsForPrompt(related []relatedCheckout) string {
 	b.WriteString("## Related checkouts\n\n")
 	b.WriteString("Sibling clones for cross-repo context (read files here when contracts/APIs/shared packages matter). Findings must still cite paths in the **primary** PR checkout.\n\n")
 	for _, r := range ok {
+		path := r.Path
+		if sandboxMode() == "docker" && strings.TrimSpace(agentJobID) != "" {
+			path = relatedContainerPath(agentJobID, r.RepoFullName)
+		}
 		sha := r.SHA
 		if sha == "" {
 			sha = "—"
 		}
-		fmt.Fprintf(&b, "- `%s` → `%s` (sha `%s`, source=%s)\n", r.RepoFullName, r.Path, truncateStr(sha, 12), r.Source)
+		fmt.Fprintf(&b, "- `%s` → `%s` (sha `%s`, source=%s)\n", r.RepoFullName, path, truncateStr(sha, 12), r.Source)
 		if r.Honesty != "" {
 			fmt.Fprintf(&b, "  - honesty: %s\n", r.Honesty)
 		}

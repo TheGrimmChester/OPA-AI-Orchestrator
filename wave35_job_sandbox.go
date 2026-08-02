@@ -159,6 +159,9 @@ func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([
 		_ = os.MkdirAll(outDir, 0o755)
 		extraBinds = append(extraBinds, outDir+":/out:rw")
 	}
+	if relBind, ok := relatedROBind(hostDir, jobID, layoutID); ok {
+		extraBinds = append(extraBinds, relBind)
+	}
 
 	runLabel := ""
 	if layoutID != jobID {
@@ -384,6 +387,32 @@ func sandboxContainerName(jobID string, phase jobPhase, suffix string) string {
 func containerWorkPath(jobID, rel string) string {
 	rel = strings.Trim(nz(rel, "primary"), "/")
 	return opaJobsContainerRoot + "/" + sanitizeDockerName(jobID) + "/" + rel
+}
+
+// relatedROBind mounts {layout}/related read-only next to the agent cwd so
+// cross-repo context is reachable inside docker (leaf bind alone omits siblings).
+func relatedROBind(hostWork, jobID, layoutID string) (string, bool) {
+	hostWork = filepath.Clean(hostWork)
+	if hostWork == "" || jobID == "" {
+		return "", false
+	}
+	layoutRoot := filepath.Dir(hostWork)
+	relatedHost := filepath.Join(layoutRoot, "related")
+	st, err := os.Stat(relatedHost)
+	if err != nil || !st.IsDir() {
+		return "", false
+	}
+	if err := assertJobBindPath(relatedHost, layoutID); err != nil {
+		return "", false
+	}
+	cont := opaJobsContainerRoot + "/" + sanitizeDockerName(jobID) + "/related"
+	return relatedHost + ":" + cont + ":ro", true
+}
+
+// relatedContainerPath is the path agents should read for a related checkout
+// when OPA_JOB_SANDBOX=docker.
+func relatedContainerPath(jobID, repoFullName string) string {
+	return opaJobsContainerRoot + "/" + sanitizeDockerName(jobID) + "/related/" + sanitizeRelatedRepoDir(repoFullName)
 }
 
 // runSandboxedArgv is the shared entry used by gitleaks + agent launch.
