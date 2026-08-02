@@ -1095,13 +1095,24 @@ func processSCMJob(jobID string) {
 	if job == nil {
 		return
 	}
-	switch agentKind(strings.TrimSpace(job.Kind)) {
-	case kindRun:
+	switch k := agentKind(strings.TrimSpace(job.Kind)); {
+	case k == kindRun:
 		processPRRun(jobID)
-	case kindPrepare, kindSecurity, kindBugbot, kindApproval, kindCloud:
+	case isAgentChildKind(k):
 		processAgentChild(jobID)
 	default:
 		processLegacySCMJob(jobID)
+	}
+}
+
+// isAgentChildKind reports kinds handled by processAgentChild (not the run
+// parent and not the legacy monolith).
+func isAgentChildKind(k agentKind) bool {
+	switch k {
+	case kindPrepare, kindSecurity, kindBugbot, kindCheckup, kindApproval, kindCloud:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -2,6 +2,20 @@ package main
 
 import "testing"
 
+func TestAllAgentChildKindsDispatched(t *testing.T) {
+	for k := range agentDependsOn {
+		if !isAgentChildKind(k) {
+			t.Fatalf("kind %q is in agentDependsOn but not isAgentChildKind — processSCMJob would send it to legacy", k)
+		}
+	}
+	if isAgentChildKind(kindRun) || isAgentChildKind(kindLegacy) {
+		t.Fatal("run/legacy must not be agent children")
+	}
+	if !isAgentChildKind(kindCheckup) {
+		t.Fatal("checkup must dispatch to processAgentChild")
+	}
+}
+
 func TestReadyChildrenDerivedBarrier(t *testing.T) {
 	parent := &scmJob{
 		ID: "run-1", Kind: string(kindRun), RunID: "run-1", Status: "running",
