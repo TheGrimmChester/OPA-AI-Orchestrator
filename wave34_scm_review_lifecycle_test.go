@@ -41,7 +41,7 @@ func TestPlanOPAReviewCommentActions(t *testing.T) {
 		{ID: 1, Key: keyKeep, Path: "a.go", Line: 3, Body: embedOPAReviewFindingMarker("old body", keyKeep)},
 		{ID: 2, Key: keyGone, Path: "gone.go", Line: 1, Body: embedOPAReviewFindingMarker("gone", keyGone)},
 	}
-	plan := planOPAReviewCommentActions(findings, prior)
+	plan := planOPAReviewCommentActions(findings, prior, nil)
 	if len(plan.Create) != 1 {
 		t.Fatalf("expected 1 create, got %d", len(plan.Create))
 	}
@@ -57,7 +57,7 @@ func TestPlanRetargetOnLineMove(t *testing.T) {
 	f := map[string]interface{}{"file": "a.go", "line": 20, "severity": "high", "message": "x", "rule": "r"}
 	key := opaReviewFindingKey(f)
 	prior := []opaReviewPriorComment{{ID: 9, Key: key, Path: "a.go", Line: 3, Body: "old"}}
-	plan := planOPAReviewCommentActions([]map[string]interface{}{f}, prior)
+	plan := planOPAReviewCommentActions([]map[string]interface{}{f}, prior, nil)
 	if len(plan.Create) != 1 {
 		t.Fatalf("retarget should create new comment, got %d", len(plan.Create))
 	}
@@ -171,8 +171,8 @@ func TestFilterFindingsByKeys(t *testing.T) {
 		t.Fatalf("filter failed: %+v", got)
 	}
 	all := filterFindingsByKeys([]map[string]interface{}{f1, f2}, nil)
-	if len(all) != 2 {
-		t.Fatal("empty keys should return all")
+	if len(all) != 0 {
+		t.Fatal("empty keys must refuse fixing everything")
 	}
 }
 
@@ -184,5 +184,42 @@ func TestFixedReplyHasCheckEmoji(t *testing.T) {
 	sup := formatSupersededFindingBody("body", "abc123")
 	if !strings.Contains(sup, "♻️") {
 		t.Fatal("expected recycle emoji on superseded")
+	}
+}
+
+func TestPreferWatchedForChecksPrefersGitHubApp(t *testing.T) {
+	pat := &opaConnector{ID: "conn-pat", Kind: "github_pat", Status: "active"}
+	app := &opaConnector{ID: "conn-app", Kind: "github_app", InstallationID: "99", Status: "active"}
+	connectorLive.Store(pat.ID, pat)
+	connectorLive.Store(app.ID, app)
+	t.Cleanup(func() {
+		connectorLive.Delete(pat.ID)
+		connectorLive.Delete(app.ID)
+	})
+	cands := []*opaWatchedRepo{
+		{ConnectorID: pat.ID, RepoFullName: "o/r", Enabled: true, ChecksJSON: `["ai_review"]`, AutoRequestReviewer: true},
+		{ConnectorID: app.ID, RepoFullName: "o/r", Enabled: true, ChecksJSON: `["secrets","ai_review"]`},
+	}
+	got := preferWatchedForChecks(cands)
+	if got == nil || got.ConnectorID != app.ID {
+		t.Fatalf("expected github_app watch, got %+v", got)
+	}
+}
+
+func TestOPAReviewShouldPostResume(t *testing.T) {
+	if !opaReviewShouldPostResume(aiReviewResult{Status: "ok"}) {
+		t.Fatal("completed review should post résumé")
+	}
+	if !opaReviewShouldPostResume(aiReviewResult{Status: "findings"}) {
+		t.Fatal("findings review should post résumé")
+	}
+	if opaReviewShouldPostResume(aiReviewResult{
+		Status:  "skipped",
+		Summary: "OPA Review API key not set — save a CLI agent key under Account (personal or org)",
+	}) {
+		t.Fatal("skipped (no CLI key) must not post résumé")
+	}
+	if opaReviewShouldPostResume(aiReviewResult{Status: "skipped", Summary: "OPA Review skipped (SKIP_CURSOR_AI=1)"}) {
+		t.Fatal("skipped (SKIP_CURSOR_AI) must not post résumé")
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,13 +35,21 @@ type scmJob struct {
 	Draft          bool                   `json:"draft"`
 	Title          string                 `json:"title"`
 	Body           string                 `json:"body"`
-	// ForceAI runs OPA Review even when draft, and forces ai_review on.
+	// ForceAI runs OPA Review even when ai_review is off on the watched policy.
 	ForceAI bool `json:"force_ai,omitempty"`
 	// AIOnly skips AppSec scanners / gate; still checkouts + runs OPA Review.
 	AIOnly bool `json:"ai_only,omitempty"`
 	// ActorUserID is the Dashboard user who triggered a manual run (empty for
 	// webhooks). Used for CLI key resolution: user → org → fail closed.
 	ActorUserID string `json:"actor_user_id,omitempty"`
+
+	// Kind/RunID/ParentID/Attempt are the run-graph fields. Empty Kind keeps the
+	// pre-split monolithic pipeline (processLegacySCMJob). Correctness also rides
+	// summary_json for older ClickHouse rows without ALTER columns.
+	Kind     string `json:"kind,omitempty"`      // run|prepare|security|bugbot|approval|cloud|""
+	RunID    string `json:"run_id,omitempty"`    // parent run id (children); self for kind=run
+	ParentID string `json:"parent_id,omitempty"` // same as RunID for children
+	Attempt  int    `json:"attempt,omitempty"`
 }
 
 func handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
@@ -53,37 +62,160 @@ func handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "read error", 400)
 		return
 	}
+	deliveryID := strings.TrimSpace(r.Header.Get("X-GitHub-Delivery"))
+	event := r.Header.Get("X-GitHub-Event")
 	secret := strings.TrimSpace(os.Getenv("OPA_GITHUB_WEBHOOK_SECRET"))
-	if !verifyGitHubSignature(secret, raw, r.Header.Get("X-Hub-Signature-256")) {
+	sigOK := verifyGitHubSignature(secret, raw, r.Header.Get("X-Hub-Signature-256"))
+	rec := newSCMWebhookReceipt(deliveryID, event, sigOK)
+
+	if !sigOK {
+		finishWebhookReceipt(rec, "error", "Invalid X-Hub-Signature-256 (or webhook secret unset without OPA_SCM_ALLOW_UNSIGNED).", 401, "invalid signature")
 		http.Error(w, "invalid signature", 401)
 		return
 	}
-	event := r.Header.Get("X-GitHub-Event")
+	if deliveryID != "" {
+		if prev := findSCMWebhookByDelivery(deliveryID); prev != nil && prev.ID != rec.ID {
+			rec.RepoFullName = prev.RepoFullName
+			rec.Action = prev.Action
+			rec.PRNumber = prev.PRNumber
+			rec.CommitSHA = prev.CommitSHA
+			rec.InstallationID = prev.InstallationID
+			rec.OrganizationID = prev.OrganizationID
+			rec.ProjectID = prev.ProjectID
+			rec.ConnectorID = prev.ConnectorID
+			rec.JobID = prev.JobID
+			finishWebhookReceipt(rec, "duplicate", "Duplicate X-GitHub-Delivery — already processed as "+prev.ID+".", 200, "")
+			writeJSON(w, map[string]interface{}{"ok": true, "duplicate": true, "prior_id": prev.ID})
+			return
+		}
+	}
 	switch event {
 	case "ping":
-		writeJSON(w, map[string]interface{}{"ok": true, "pong": true})
+		finishWebhookReceipt(rec, "ping", "GitHub ping acknowledged.", 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "pong": true, "webhook_id": rec.ID})
 		return
 	case "pull_request":
-		handlePRWebhook(w, raw)
+		handlePRWebhook(w, raw, rec)
 	case "push":
-		handlePushWebhook(w, raw)
+		handlePushWebhook(w, raw, rec)
 	case "installation", "installation_repositories":
-		writeJSON(w, map[string]interface{}{"ok": true, "ignored": event})
+		handleInstallationWebhook(w, event, raw, rec)
 	default:
-		writeJSON(w, map[string]interface{}{"ok": true, "ignored": event})
+		finishWebhookReceipt(rec, "ignored", "Unhandled GitHub event type — no action taken.", 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "ignored": event, "webhook_id": rec.ID})
 	}
 }
 
-func handlePRWebhook(w http.ResponseWriter, raw []byte) {
+func handleInstallationWebhook(w http.ResponseWriter, event string, raw []byte, rec *scmWebhookReceipt) {
+	var payload struct {
+		Action       string `json:"action"`
+		Installation struct {
+			ID      int64 `json:"id"`
+			Account struct {
+				Login string `json:"login"`
+			} `json:"account"`
+		} `json:"installation"`
+		Repositories []struct {
+			FullName string `json:"full_name"`
+		} `json:"repositories"`
+		RepositoriesAdded []struct {
+			FullName string `json:"full_name"`
+		} `json:"repositories_added"`
+		RepositoriesRemoved []struct {
+			FullName string `json:"full_name"`
+		} `json:"repositories_removed"`
+	}
+	_ = json.Unmarshal(raw, &payload)
+	applyWebhookRepoMeta(rec, "", 0, "", payload.Installation.ID, payload.Action)
+
+	repos := make([]string, 0, 8)
+	for _, r := range payload.RepositoriesAdded {
+		if r.FullName != "" {
+			repos = append(repos, r.FullName)
+		}
+	}
+	for _, r := range payload.Repositories {
+		if r.FullName != "" {
+			repos = append(repos, r.FullName)
+		}
+	}
+	if len(repos) == 1 {
+		rec.RepoFullName = repos[0]
+	}
+
+	action := strings.ToLower(strings.TrimSpace(payload.Action))
+	inst := ""
+	if payload.Installation.ID != 0 {
+		inst = strconv.FormatInt(payload.Installation.ID, 10)
+	}
+
+	switch action {
+	case "deleted", "suspend":
+		finishWebhookReceipt(rec, "ignored", "Installation "+action+" recorded; watches left intact.", 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "ignored": event, "action": action, "webhook_id": rec.ID})
+		return
+	case "removed":
+		// repositories_removed — disable matching watches on this installation connector.
+		conn := findConnectorByInstallation(inst)
+		disabled := 0
+		if conn != nil {
+			for _, r := range payload.RepositoriesRemoved {
+				key := conn.ID + "|" + r.FullName
+				if v, ok := watchedLive.Load(key); ok {
+					if wr, ok := v.(*opaWatchedRepo); ok && wr.Enabled {
+						wr.Enabled = false
+						wr.UpdatedAt = time.Now().UTC().Format("2006-01-02 15:04:05.000")
+						persistWatched(wr)
+						disabled++
+					}
+				}
+			}
+		}
+		finishWebhookReceipt(rec, "ok", fmt.Sprintf("Disabled %d watch(es) after repository removal.", disabled), 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "disabled": disabled, "webhook_id": rec.ID})
+		return
+	}
+
+	// created / added / unsuspend / new_permissions_accepted — provision + auto-watch.
+	conn := ensureGitHubAppConnector(inst, payload.Installation.Account.Login)
+	watched := []string{}
+	if conn != nil {
+		for _, repo := range repos {
+			if wr := autoWatchInstalledRepo(conn, repo); wr != nil && wr.Enabled {
+				watched = append(watched, repo)
+			}
+		}
+	}
+	honesty := fmt.Sprintf("Installation %s: auto-watched %d repo(s) for automatic PR checks.", action, len(watched))
+	if conn == nil {
+		honesty = "Installation recorded but GitHub App env not configured — could not auto-watch."
+	}
+	finishWebhookReceipt(rec, "ok", honesty, 200, "")
+	writeJSON(w, map[string]interface{}{
+		"ok": true, "event": event, "action": action, "watched": watched,
+		"connector_id": func() string {
+			if conn != nil {
+				return conn.ID
+			}
+			return ""
+		}(),
+		"webhook_id": rec.ID,
+	})
+}
+
+func handlePRWebhook(w http.ResponseWriter, raw []byte, rec *scmWebhookReceipt) {
 	var payload struct {
 		Action string `json:"action"`
 		Number int    `json:"number"`
 		PR     struct {
-			Number int    `json:"number"`
-			Title  string `json:"title"`
-			Body   string `json:"body"`
-			Draft  bool   `json:"draft"`
-			Head   struct {
+			Number   int    `json:"number"`
+			Title    string `json:"title"`
+			Body     string `json:"body"`
+			Draft    bool   `json:"draft"`
+			State    string `json:"state"`
+			Merged   bool   `json:"merged"`
+			MergedAt string `json:"merged_at"`
+			Head     struct {
 				SHA string `json:"sha"`
 				Ref string `json:"ref"`
 			} `json:"head"`
@@ -96,32 +228,89 @@ func handlePRWebhook(w http.ResponseWriter, raw []byte) {
 		} `json:"installation"`
 	}
 	if json.Unmarshal(raw, &payload) != nil {
+		finishWebhookReceipt(rec, "error", "Failed to parse pull_request JSON body.", 400, "bad json")
 		http.Error(w, "bad json", 400)
 		return
 	}
 	action := payload.Action
-	if action != "opened" && action != "synchronize" && action != "reopened" && action != "ready_for_review" {
-		writeJSON(w, map[string]interface{}{"ok": true, "skipped": action})
-		return
-	}
-	repo := payload.Repository.FullName
-	wr, conn := findWatched(repo)
-	if wr == nil {
-		// Do not auto-watch on webhook — only explicitly watched repos run jobs.
-		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "repo not watched", "repo": repo})
-		return
-	}
-	_ = conn
 	pr := payload.PR.Number
 	if pr == 0 {
 		pr = payload.Number
 	}
-	job := enqueueSCMJob(wr, conn, repo, pr, payload.PR.Head.SHA, "pull_request."+action, payload.PR.Draft, payload.PR.Title, payload.PR.Body)
+	applyWebhookRepoMeta(rec, payload.Repository.FullName, pr, payload.PR.Head.SHA, payload.Installation.ID, action)
+	if scmPRIsMerged(payload.PR.Merged, payload.PR.MergedAt, payload.PR.State) {
+		cancelled := cancelInFlightJobsForMergedPR(payload.Repository.FullName, pr, "pull request merged")
+		msg := "Pull request is already merged — SCM job not queued."
+		if len(cancelled) > 0 {
+			msg = fmt.Sprintf("Pull request merged — cancelled %d in-flight job(s): %s", len(cancelled), strings.Join(cancelled, ", "))
+		}
+		finishWebhookReceipt(rec, "skipped", msg, 200, "")
+		writeJSON(w, map[string]interface{}{
+			"ok": true, "skipped": "merged", "reason": "pull request is already merged",
+			"cancelled_job_ids": cancelled, "webhook_id": rec.ID,
+		})
+		return
+	}
+	if priorID, already := lookupSuccessfulAIReviewForSHA(payload.Repository.FullName, payload.PR.Head.SHA, ""); already {
+		finishWebhookReceipt(rec, "skipped", "Commit already had a successful OPA Review — SCM job not queued.", 200, "")
+		writeJSON(w, map[string]interface{}{
+			"ok": true, "skipped": "already_reviewed",
+			"reason": "commit already reviewed successfully", "prior_job_id": priorID,
+			"commit_sha": payload.PR.Head.SHA, "webhook_id": rec.ID,
+		})
+		return
+	}
+	if action != "opened" && action != "synchronize" && action != "reopened" && action != "ready_for_review" {
+		finishWebhookReceipt(rec, "skipped", "PR action '"+action+"' is not actionable (only opened/synchronize/reopened/ready_for_review).", 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "skipped": action, "webhook_id": rec.ID})
+		return
+	}
+	repo := payload.Repository.FullName
+	wr, conn := findWatched(repo)
+	inst := ""
+	if payload.Installation.ID != 0 {
+		inst = strconv.FormatInt(payload.Installation.ID, 10)
+	}
+	// Prefer / provision GitHub App connector so Check Runs post as the bot.
+	if inst != "" && githubAppConfigured() {
+		if appConn := ensureGitHubAppConnector(inst, ""); appConn != nil {
+			if wrApp := autoWatchInstalledRepo(appConn, repo); wrApp != nil {
+				wr, conn = wrApp, appConn
+			}
+		}
+	}
+	if wr == nil {
+		conn = findConnectorByInstallation(inst)
+		if conn != nil {
+			wr = autoWatchInstalledRepo(conn, repo)
+		}
+	}
+	if wr == nil {
+		finishWebhookReceipt(rec, "ignored", "Repo not watched and no GitHub App connector — no job queued.", 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "repo not watched", "repo": repo, "webhook_id": rec.ID})
+		return
+	}
+	var job *scmJob
+	if shouldEnqueuePRRun("pull_request."+action, pr) {
+		job = enqueuePRRun(wr, conn, repo, pr, payload.PR.Head.SHA, "pull_request."+action, payload.PR.Draft, payload.PR.Title, payload.PR.Body)
+	} else {
+		job = enqueueSCMJob(wr, conn, repo, pr, payload.PR.Head.SHA, "pull_request."+action, payload.PR.Draft, payload.PR.Title, payload.PR.Body)
+	}
+	rec.JobID = job.ID
+	rec.OrganizationID = job.OrganizationID
+	rec.ProjectID = job.ProjectID
+	rec.ConnectorID = job.ConnectorID
+	if job.Summary != nil {
+		if sid, _ := job.Summary["stack_id"].(string); sid != "" {
+			rec.StackID = sid
+		}
+	}
+	finishWebhookReceipt(rec, "queued", "PR job queued.", 200, "")
 	go processSCMJob(job.ID)
-	writeJSON(w, map[string]interface{}{"ok": true, "job_id": job.ID, "status": "queued"})
+	writeJSON(w, map[string]interface{}{"ok": true, "job_id": job.ID, "status": "queued", "webhook_id": rec.ID})
 }
 
-func handlePushWebhook(w http.ResponseWriter, raw []byte) {
+func handlePushWebhook(w http.ResponseWriter, raw []byte, rec *scmWebhookReceipt) {
 	var payload struct {
 		Ref        string `json:"ref"`
 		After      string `json:"after"`
@@ -134,23 +323,34 @@ func handlePushWebhook(w http.ResponseWriter, raw []byte) {
 		} `json:"installation"`
 	}
 	if json.Unmarshal(raw, &payload) != nil {
+		finishWebhookReceipt(rec, "error", "Failed to parse push JSON body.", 400, "bad json")
 		http.Error(w, "bad json", 400)
 		return
 	}
+	applyWebhookRepoMeta(rec, payload.Repository.FullName, 0, payload.After, payload.Installation.ID, "push")
 	def := nz(payload.Repository.DefaultBranch, "main")
 	if payload.Ref != "refs/heads/"+def {
-		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "not default branch"})
+		rec.Action = "non_default"
+		finishWebhookReceipt(rec, "skipped", "Push to non-default branch ("+payload.Ref+") — ignored.", 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "not default branch", "webhook_id": rec.ID})
 		return
 	}
+	rec.Action = "default"
 	repo := payload.Repository.FullName
 	wr, conn := findWatched(repo)
 	if wr == nil {
-		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "repo not watched"})
+		finishWebhookReceipt(rec, "ignored", "Repo not watched — no job queued.", 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "repo not watched", "webhook_id": rec.ID})
 		return
 	}
 	job := enqueueSCMJob(wr, conn, repo, 0, payload.After, "push.default", false, "default-branch scan", "")
+	rec.JobID = job.ID
+	rec.OrganizationID = job.OrganizationID
+	rec.ProjectID = job.ProjectID
+	rec.ConnectorID = job.ConnectorID
+	finishWebhookReceipt(rec, "queued", "Default-branch push job queued.", 200, "")
 	go processSCMJob(job.ID)
-	writeJSON(w, map[string]interface{}{"ok": true, "job_id": job.ID})
+	writeJSON(w, map[string]interface{}{"ok": true, "job_id": job.ID, "webhook_id": rec.ID})
 }
 
 func findConnectorByInstallation(inst string) *opaConnector {
@@ -203,6 +403,18 @@ func persistSCMJob(job *scmJob) {
 	if uid := strings.TrimSpace(job.ActorUserID); uid != "" {
 		job.Summary["actor_user_id"] = uid
 	}
+	if k := strings.TrimSpace(job.Kind); k != "" {
+		job.Summary["kind"] = k
+	}
+	if rid := strings.TrimSpace(job.RunID); rid != "" {
+		job.Summary["run_id"] = rid
+	}
+	if pid := strings.TrimSpace(job.ParentID); pid != "" {
+		job.Summary["parent_id"] = pid
+	}
+	if job.Attempt > 0 {
+		job.Summary["attempt"] = job.Attempt
+	}
 	persistSCMJobFile(job)
 	if writer == nil {
 		return
@@ -240,17 +452,27 @@ func getSCMJob(id string) *scmJob {
 }
 
 var scmJobCancel sync.Map // jobID -> context.CancelFunc
+var scmJobCtx sync.Map    // jobID -> context.Context
 
 func scmJobIsCancelled(id string) bool {
 	job := getSCMJob(id)
 	return job != nil && job.Status == "cancelled"
 }
 
-func registerSCMJobCancel(id string) context.CancelFunc {
+func registerSCMJobCancel(id string) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
-	_ = ctx
 	scmJobCancel.Store(id, cancel)
-	return cancel
+	scmJobCtx.Store(id, ctx)
+	return ctx, cancel
+}
+
+func scmJobContext(id string) context.Context {
+	if v, ok := scmJobCtx.Load(id); ok {
+		if c, ok := v.(context.Context); ok && c != nil {
+			return c
+		}
+	}
+	return context.Background()
 }
 
 func clearSCMJobCancel(id string) {
@@ -260,30 +482,47 @@ func clearSCMJobCancel(id string) {
 			c()
 		}
 	}
+	scmJobCtx.Delete(id)
 }
 
 // cancelSCMJob marks a live job cancelled when it is still queued/waiting/running.
 // Running work is interrupted best-effort via the registered cancel func; stack drain
 // skips cancelled jobs so waiting items can proceed.
 func cancelSCMJob(id string) (*scmJob, string, int) {
+	return cancelSCMJobWithReason(id, "cancelled")
+}
+
+func cancelSCMJobWithReason(id, reason string) (*scmJob, string, int) {
 	job := getSCMJob(id)
 	if job == nil {
 		return nil, "not found", 404
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "cancelled"
 	}
 	switch job.Status {
 	case "queued", "waiting", "running":
 		now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
 		job.Status = "cancelled"
 		job.FinishedAt = now
-		if job.Error == "" {
-			job.Error = "cancelled"
+		job.Error = reason
+		if job.Summary == nil {
+			job.Summary = map[string]interface{}{}
 		}
+		job.Summary["cancel_reason"] = reason
 		persistSCMJob(job)
 		if v, ok := scmJobCancel.Load(id); ok {
 			if c, ok := v.(context.CancelFunc); ok {
 				c()
 			}
 		}
+		go func(jobID string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_ = teardownJobContainers(ctx, jobID)
+			_ = removeJobInternalNetwork(ctx, jobID)
+		}(id)
 		refreshStacksForJob(id)
 		return job, "", 0
 	case "cancelled":
@@ -291,6 +530,66 @@ func cancelSCMJob(id string) (*scmJob, string, int) {
 	default:
 		return job, "job not cancellable in status " + job.Status, 409
 	}
+}
+
+// cancelInFlightJobsForMergedPR cancels queued/waiting/running SCM jobs (and related
+// Auto-fix runs) for repo+PR when that pull request has been merged.
+func cancelInFlightJobsForMergedPR(repo string, pr int, reason string) []string {
+	repo = strings.TrimSpace(repo)
+	if repo == "" || pr <= 0 {
+		return nil
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "pull request merged"
+	}
+	var ids []string
+	scmJobLive.Range(func(_, v interface{}) bool {
+		job, ok := v.(*scmJob)
+		if !ok || job == nil {
+			return true
+		}
+		if job.PRNumber != pr || !strings.EqualFold(job.RepoFullName, repo) {
+			return true
+		}
+		st := strings.ToLower(job.Status)
+		if st != "queued" && st != "waiting" && st != "running" {
+			return true
+		}
+		if _, errMsg, _ := cancelSCMJobWithReason(job.ID, reason); errMsg == "" {
+			ids = append(ids, job.ID)
+		}
+		return true
+	})
+	cancelInFlightAutoFixesForPR(repo, pr, reason)
+	return ids
+}
+
+func cancelInFlightAutoFixesForPR(repo string, pr int, reason string) {
+	autoFixLive.Range(func(_, v interface{}) bool {
+		fix, ok := v.(*opaAutoFixJob)
+		if !ok || fix == nil {
+			return true
+		}
+		if !strings.EqualFold(fix.RepoFullName, repo) {
+			return true
+		}
+		if fix.BasePRNumber != pr && fix.PRNumber != pr {
+			return true
+		}
+		st := strings.ToLower(fix.Status)
+		if st != "queued" && st != "running" {
+			return true
+		}
+		fix.Status = "cancelled"
+		fix.Error = reason
+		fix.Honesty = strings.TrimSpace(fix.Honesty + "; cancelled — " + reason)
+		fix.FinishedAt = time.Now().UTC().Format("2006-01-02 15:04:05.000")
+		autoFixLive.Store(fix.ID, fix)
+		if parent := getSCMJob(fix.ParentJobID); parent != nil {
+			persistAutoFixOnParent(parent, fix)
+		}
+		return true
+	})
 }
 
 func refreshStacksForJob(jobID string) {
@@ -349,15 +648,7 @@ func handleSCMJobsList(w http.ResponseWriter, r *http.Request) {
 	counts := map[string]int{}
 	scmJobLive.Range(func(_, v interface{}) bool {
 		j, ok := v.(*scmJob)
-		if !ok {
-			return true
-		}
-		// Tenant filter: when auth is on (or an org is selected), hide other orgs' jobs.
-		if a.OrganizationID != "" && j.OrganizationID != "" && j.OrganizationID != a.OrganizationID {
-			return true
-		}
-		if authEnforced && a.OrganizationID == "" {
-			// No org selected under auth → no job leakage across tenants.
+		if !ok || !canSeeSCMJob(a, j) {
 			return true
 		}
 		list = append(list, j)
@@ -374,9 +665,50 @@ func handleSCMJobsList(w http.ResponseWriter, r *http.Request) {
 	if len(list) > limit {
 		list = list[:limit]
 	}
+	filter := "all"
+	honesty := "Showing jobs across organizations (tenant picker = All)."
+	if a.OrganizationID != "" {
+		filter = a.OrganizationID
+		honesty = "Filtered to organization " + a.OrganizationID + "."
+	} else if authEnforced && !a.isAdmin() {
+		honesty = "Tenant picker is All — showing only jobs you queued. Select an organization to see that org's webhook/manual jobs."
+		filter = "actor"
+	} else if authEnforced && a.isAdmin() {
+		honesty = "Tenant picker is All — admin-wide job list. Select an organization to narrow."
+	}
 	writeJSON(w, map[string]interface{}{
 		"jobs": list, "total": total, "counts": counts, "limit": limit,
+		"organization_id": a.OrganizationID,
+		"tenant_filter":   filter,
+		"honesty":         honesty,
 	})
+}
+
+// canSeeSCMJob applies tenant visibility for SCM / PR jobs.
+//
+//   - Concrete org selected → that org only (legacy empty-org rows count as default-org)
+//   - Picker All + auth off → everything
+//   - Picker All + admin → everything (admin-wide view)
+//   - Picker All + non-admin → jobs this user queued (actor_user_id)
+func canSeeSCMJob(a credActor, j *scmJob) bool {
+	if j == nil {
+		return false
+	}
+	jobOrg := strings.TrimSpace(j.OrganizationID)
+	if jobOrg == "" {
+		jobOrg = defaultOrgID
+	}
+	if sel := strings.TrimSpace(a.OrganizationID); sel != "" {
+		return jobOrg == sel
+	}
+	if !authEnforced {
+		return true
+	}
+	if a.isAdmin() {
+		return true
+	}
+	uid := strings.TrimSpace(a.Username)
+	return uid != "" && strings.TrimSpace(j.ActorUserID) == uid
 }
 
 // handleSCMJobsResume POST /api/scm/jobs/resume — one-shot kick after recreate/stall:
@@ -410,15 +742,11 @@ func handleSCMJobSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a := actorFromRequest(r)
-		if a.OrganizationID != "" && job.OrganizationID != "" && job.OrganizationID != a.OrganizationID {
+		if !canSeeSCMJob(a, job) {
 			http.Error(w, "not found", 404)
 			return
 		}
-		if authEnforced && a.OrganizationID == "" {
-			http.Error(w, "not found", 404)
-			return
-		}
-		writeJSON(w, scmJobAPIView(job))
+		writeJSON(w, runPRRunAPIView(job))
 		return
 	}
 	if len(parts) >= 2 && parts[1] == "retry" && r.Method == http.MethodPost {
@@ -592,6 +920,9 @@ func enqueueManualAIReview(repo string, pr int, connectorID, sha, title string, 
 	owner, repoName := splitOwnerRepo(repo)
 	prBody := ""
 	if meta, err := githubGetPull(conn, owner, repoName, pr); err == nil && meta != nil {
+		if scmPRIsMerged(meta.Merged, meta.MergedAt, meta.State) {
+			return nil, "pull request is already merged — review skipped", 409
+		}
 		if sha == "" {
 			sha = meta.HeadSHA
 		}
@@ -604,6 +935,13 @@ func enqueueManualAIReview(repo string, pr int, connectorID, sha, title string, 
 	if sha == "" {
 		sha = "manual-" + newRandomHex(8)
 	}
+	// Force (manual / Auto-fix follow-up) may re-review the same SHA so
+	// comments can close, auto_merge_confidence refresh, and APPROVE fire.
+	if !force {
+		if priorID, already := lookupSuccessfulAIReviewForSHA(repo, sha, ""); already {
+			return nil, fmt.Sprintf("commit already reviewed successfully — review skipped (prior job %s)", priorID), 409
+		}
+	}
 	if title == "" {
 		title = fmt.Sprintf("Manual OPA Review PR #%d", pr)
 	}
@@ -612,11 +950,26 @@ func enqueueManualAIReview(repo string, pr int, connectorID, sha, title string, 
 	if aiOnly {
 		event = "manual.ai_only"
 	}
-	job := enqueueSCMJob(wr, conn, repo, pr, sha, event, draft, title, prBody)
-	job.ForceAI = force
-	job.AIOnly = aiOnly
-	job.ActorUserID = strings.TrimSpace(actorUserID)
-	persistSCMJob(job)
+	var job *scmJob
+	if shouldEnqueuePRRun(event, pr) {
+		job = enqueuePRRun(wr, conn, repo, pr, sha, event, draft, title, prBody)
+		job.ForceAI = force
+		job.AIOnly = aiOnly
+		job.ActorUserID = strings.TrimSpace(actorUserID)
+		persistSCMJob(job)
+		for _, c := range listRunChildren(job.ID) {
+			c.ForceAI = force
+			c.AIOnly = aiOnly
+			c.ActorUserID = job.ActorUserID
+			persistSCMJob(c)
+		}
+	} else {
+		job = enqueueSCMJob(wr, conn, repo, pr, sha, event, draft, title, prBody)
+		job.ForceAI = force
+		job.AIOnly = aiOnly
+		job.ActorUserID = strings.TrimSpace(actorUserID)
+		persistSCMJob(job)
+	}
 	return job, "", 0
 }
 
@@ -656,16 +1009,96 @@ func handleSCMSimulate(w http.ResponseWriter, r *http.Request) {
 		wr.ServiceName = body.Service
 	}
 	os.Setenv("OPA_SCM_MOCK_GITHUB", "1")
-	job := enqueueSCMJob(wr, getConnector(connID), repo, body.PR, sha, "simulate", body.Draft, "simulated PR", "")
+	var job *scmJob
+	if shouldEnqueuePRRun("simulate", body.PR) {
+		job = enqueuePRRun(wr, getConnector(connID), repo, body.PR, sha, "simulate", body.Draft, "simulated PR", "")
+	} else {
+		job = enqueueSCMJob(wr, getConnector(connID), repo, body.PR, sha, "simulate", body.Draft, "simulated PR", "")
+	}
 	go processSCMJob(job.ID)
-	writeJSON(w, map[string]interface{}{"ok": true, "job_id": job.ID, "repo": repo, "sha": sha})
+	resp := map[string]interface{}{"ok": true, "job_id": job.ID, "repo": repo, "sha": sha}
+	if job.Kind != "" {
+		resp["kind"] = job.Kind
+		resp["run_id"] = job.RunID
+		if ids, ok := job.Summary["child_ids"]; ok {
+			resp["child_ids"] = ids
+		}
+	}
+	writeJSON(w, resp)
 }
 
 // scmProcessing tracks job IDs with an active processSCMJob goroutine so boot/admin
 // resume and enqueue cannot run the same job twice concurrently.
 var scmProcessing sync.Map // jobID -> struct{}
 
+// shouldSkipSCMJobForMergedPR returns true when a PR-scoped job targets a merged PR.
+// Simulate/mock and non-PR events are never skipped here. Fail-open if GitHub is unreachable.
+func shouldSkipSCMJobForMergedPR(job *scmJob) bool {
+	if job == nil || job.PRNumber <= 0 {
+		return false
+	}
+	ev := strings.ToLower(job.Event)
+	if strings.HasPrefix(ev, "push.") || strings.HasPrefix(ev, "cron.") || strings.HasPrefix(ev, "simulate") {
+		return false
+	}
+	conn := getOrHydrateConnector(job.ConnectorID)
+	if conn == nil {
+		if _, c := findWatched(job.RepoFullName); c != nil {
+			conn = c
+		}
+	}
+	if conn == nil || githubUseMockAPI(conn) {
+		return false
+	}
+	owner, repoName := splitOwnerRepo(job.RepoFullName)
+	if owner == "" || repoName == "" {
+		return false
+	}
+	meta, err := githubGetPull(conn, owner, repoName, job.PRNumber)
+	if err != nil || meta == nil {
+		return false
+	}
+	return scmPRIsMerged(meta.Merged, meta.MergedAt, meta.State)
+}
+
+// shouldSkipSCMJobForAlreadyReviewed returns true when this repo+commit SHA already
+// had a successful OPA Review. Push/cron/simulate are never skipped here.
+// ForceAI jobs (manual re-pass / Auto-fix follow-up) are never skipped so they can
+// close fixed comments, refresh auto_merge_confidence, and APPROVE when clean.
+func shouldSkipSCMJobForAlreadyReviewed(job *scmJob) (priorJobID string, skip bool) {
+	if job == nil {
+		return "", false
+	}
+	if job.ForceAI {
+		return "", false
+	}
+	ev := strings.ToLower(job.Event)
+	if strings.HasPrefix(ev, "push.") || strings.HasPrefix(ev, "cron.") || strings.HasPrefix(ev, "simulate") {
+		return "", false
+	}
+	sha := strings.TrimSpace(job.CommitSHA)
+	if scmPlaceholderCommitSHA(sha) {
+		return "", false
+	}
+	return lookupSuccessfulAIReviewForSHA(job.RepoFullName, sha, job.ID)
+}
+
 func processSCMJob(jobID string) {
+	job := getSCMJob(jobID)
+	if job == nil {
+		return
+	}
+	switch agentKind(strings.TrimSpace(job.Kind)) {
+	case kindRun:
+		processPRRun(jobID)
+	case kindPrepare, kindSecurity, kindBugbot, kindApproval, kindCloud:
+		processAgentChild(jobID)
+	default:
+		processLegacySCMJob(jobID)
+	}
+}
+
+func processLegacySCMJob(jobID string) {
 	if _, loaded := scmProcessing.LoadOrStore(jobID, struct{}{}); loaded {
 		return
 	}
@@ -678,11 +1111,31 @@ func processSCMJob(jobID string) {
 		return
 	}
 	switch job.Status {
-	case "cancelled", "completed", "failed", "error", "running":
+	case "cancelled", "completed", "failed", "error", "running", "skipped":
 		// Terminal, or another path already marked running (should be rare with scmProcessing).
 		return
 	}
-	cancel := registerSCMJobCancel(jobID)
+
+	if skip, reason, priorID := scmRunSkipGate(job); skip {
+		now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+		job.Status = "skipped"
+		if job.Summary == nil {
+			job.Summary = map[string]interface{}{}
+		}
+		job.Summary["skip_reason"] = reason
+		if priorID != "" {
+			job.Summary["prior_reviewed_job_id"] = priorID
+		}
+		job.FinishedAt = now
+		if job.StartedAt == "" {
+			job.StartedAt = now
+		}
+		persistSCMJob(job)
+		return
+	}
+
+	jobCtx, cancel := registerSCMJobCancel(jobID)
+	_ = jobCtx // threaded to children via scmJobContext(jobID)
 	defer func() {
 		cancel()
 		clearSCMJobCancel(jobID)
@@ -772,35 +1225,29 @@ func processSCMJob(jobID string) {
 	if job.AIOnly {
 		scanList = []string{}
 	}
-	runAI := wantAI && job.PRNumber > 0 && (!job.Draft || job.ForceAI)
+	runAI := wantAI && job.PRNumber > 0
 
-	// Optionally request this GitHub App as a PR reviewer before the review runs.
-	if runAI && autoRequestReviewer && conn != nil {
-		if err := githubRequestPRReviewers(conn, owner, repoName, job.PRNumber, []string{githubAppReviewerLogin()}); err != nil {
-			job.Summary["request_reviewer_error"] = err.Error()
-		} else {
-			job.Summary["requested_reviewer"] = githubAppReviewerLogin()
-		}
-	}
+	// Reviewer routing moved to approval.decide (after findings exist).
 
-	// Check runs (queued)
+	// Check runs (queued) — details_url + summary link → Dashboard /security/jobs/:id
+	jobDashURL := scmJobDashboardURL(job.ID)
 	var appSecID int64
 	if !job.AIOnly {
-		appSecID, _ = githubCreateCheckRun(conn, owner, repoName, "OPA AppSec Gate", job.CommitSHA, "in_progress", "", "Scanning…", "Repo Watch lite/stub scanners running", nil)
+		appSecID, _ = githubCreateCheckRun(conn, owner, repoName, "OPA AppSec Gate", job.CommitSHA, "in_progress", "", "Scanning…", checkRunSummaryWithJobLink("Repo Watch lite/stub scanners running", job.ID), jobDashURL, nil)
 		job.CheckRunIDs["appsec"] = appSecID
 	}
 	var aiCheckID int64
 	if runAI {
-		aiCheckID, _ = githubCreateCheckRun(conn, owner, repoName, "OPA Review", job.CommitSHA, "queued", "", "Queued", "Waiting for AppSec context", nil)
+		aiCheckID, _ = githubCreateCheckRun(conn, owner, repoName, "OPA Review", job.CommitSHA, "queued", "", "Queued", checkRunSummaryWithJobLink("Waiting for AppSec context", job.ID), jobDashURL, nil)
 		job.CheckRunIDs["ai"] = aiCheckID
 	}
 	persistSCMJob(job)
 	if finishIfCancelled() {
 		if appSecID != 0 {
-			_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", "cancelled", "Cancelled", "Job cancelled", nil)
+			_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", "cancelled", "Cancelled", checkRunSummaryWithJobLink("Job cancelled", job.ID), jobDashURL, nil)
 		}
 		if aiCheckID != 0 {
-			_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "cancelled", "Cancelled", "Job cancelled", nil)
+			_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "cancelled", "Cancelled", checkRunSummaryWithJobLink("Job cancelled", job.ID), jobDashURL, nil)
 		}
 		return
 	}
@@ -825,10 +1272,10 @@ func processSCMJob(jobID string) {
 			job.Error = "git worktree checkout failed: " + err.Error()
 			job.FinishedAt = time.Now().UTC().Format("2006-01-02 15:04:05.000")
 			if appSecID != 0 {
-				_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", "failure", "Checkout failed", err.Error(), nil)
+				_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", "failure", "Checkout failed", checkRunSummaryWithJobLink(err.Error(), job.ID), jobDashURL, nil)
 			}
 			if aiCheckID != 0 {
-				_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "failure", "Checkout failed", err.Error(), nil)
+				_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "failure", "Checkout failed", checkRunSummaryWithJobLink(err.Error(), job.ID), jobDashURL, nil)
 			}
 			persistSCMJob(job)
 			go cleanupOldSCMWorktrees(securityWorkspaceRoot(), 24*time.Hour)
@@ -850,6 +1297,28 @@ func processSCMJob(jobID string) {
 	}
 	if analyzed != "" && !strings.HasPrefix(analyzed, "manual-") && !strings.HasPrefix(analyzed, "cron-") {
 		recordAnalyzedSHA(job, analyzed)
+	}
+
+	// After checkout resolves a real SHA, skip if that commit was already reviewed
+	// (covers manual-*/cron-* placeholders that resolve late).
+	if priorID, skip := shouldSkipSCMJobForAlreadyReviewed(job); skip {
+		now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+		job.Status = "skipped"
+		job.Summary["skip_reason"] = "commit already reviewed successfully"
+		if priorID != "" {
+			job.Summary["prior_reviewed_job_id"] = priorID
+		}
+		job.FinishedAt = now
+		reason := "Commit already had a successful OPA Review"
+		if appSecID != 0 {
+			_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", "neutral", "Skipped", checkRunSummaryWithJobLink(reason, job.ID), jobDashURL, nil)
+		}
+		if aiCheckID != 0 {
+			_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "neutral", "Skipped", checkRunSummaryWithJobLink(reason, job.ID), jobDashURL, nil)
+		}
+		persistSCMJob(job)
+		go cleanupOldSCMWorktrees(securityWorkspaceRoot(), 24*time.Hour)
+		return
 	}
 
 	// Sibling clones for linked / mentioned related repos (cross-repo context).
@@ -883,10 +1352,10 @@ func processSCMJob(jobID string) {
 	persistSCMJob(job)
 	if finishIfCancelled() {
 		if appSecID != 0 {
-			_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", "cancelled", "Cancelled", "Job cancelled", nil)
+			_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", "cancelled", "Cancelled", checkRunSummaryWithJobLink("Job cancelled", job.ID), jobDashURL, nil)
 		}
 		if aiCheckID != 0 {
-			_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "cancelled", "Cancelled", "Job cancelled", nil)
+			_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "cancelled", "Cancelled", checkRunSummaryWithJobLink("Job cancelled", job.ID), jobDashURL, nil)
 		}
 		return
 	}
@@ -900,10 +1369,10 @@ func processSCMJob(jobID string) {
 	}
 	if finishIfCancelled() {
 		if appSecID != 0 {
-			_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", "cancelled", "Cancelled", "Job cancelled", nil)
+			_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", "cancelled", "Cancelled", checkRunSummaryWithJobLink("Job cancelled", job.ID), jobDashURL, nil)
 		}
 		if aiCheckID != 0 {
-			_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "cancelled", "Cancelled", "Job cancelled", nil)
+			_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "cancelled", "Cancelled", checkRunSummaryWithJobLink("Job cancelled", job.ID), jobDashURL, nil)
 		}
 		return
 	}
@@ -923,9 +1392,9 @@ func processSCMJob(jobID string) {
 		conclusion = "failure"
 		title = "AppSec Gate failed"
 	}
-	sum := fmt.Sprintf("scope=%v reasons=%v security_run_id=%s", gate["scope"], gate["reasons"], runID)
+	sum := checkRunSummaryWithJobLink(fmt.Sprintf("scope=%v reasons=%v security_run_id=%s", gate["scope"], gate["reasons"], runID), job.ID)
 	if appSecID != 0 {
-		_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", conclusion, title, sum, nil)
+		_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", conclusion, title, sum, jobDashURL, nil)
 	}
 
 	// AI review (ForceAI overrides draft skip). Runs even when the gate failed so
@@ -933,16 +1402,34 @@ func processSCMJob(jobID string) {
 	if runAI {
 		if finishIfCancelled() {
 			if aiCheckID != 0 {
-				_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "cancelled", "Cancelled", "Job cancelled", nil)
+				_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "cancelled", "Cancelled", checkRunSummaryWithJobLink("Job cancelled", job.ID), jobDashURL, nil)
+			}
+			return
+		}
+		// PR may have merged while AppSec ran — stop before spending Cursor tokens.
+		if shouldSkipSCMJobForMergedPR(job) {
+			_, _, _ = cancelSCMJobWithReason(jobID, "pull request merged")
+			if aiCheckID != 0 {
+				_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "cancelled", "Cancelled — PR merged", checkRunSummaryWithJobLink("PR merged — review cancelled", job.ID), jobDashURL, nil)
 			}
 			return
 		}
 		applied := resolveReviewContextsForRepo(job.OrganizationID, job.ProjectID, job.RepoFullName)
 		appliedSummary := summarizeAppliedContexts(applied)
 		job.Summary["review_contexts"] = appliedSummary
-		_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "in_progress", "", "OPA reviewing…", "Running OPA Review", nil)
+		_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "in_progress", "", "OPA reviewing…", checkRunSummaryWithJobLink("Running OPA Review", job.ID), jobDashURL, nil)
 		aiResult := runCursorAIReview(job, conn, wr, absRoot, runID)
 		job.AIJobID = aiResult.ID
+
+		if finishIfCancelled() || shouldSkipSCMJobForMergedPR(job) {
+			if !scmJobIsCancelled(jobID) {
+				_, _, _ = cancelSCMJobWithReason(jobID, "pull request merged")
+			}
+			if aiCheckID != 0 {
+				_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", "cancelled", "Cancelled — PR merged", checkRunSummaryWithJobLink("PR merged — review cancelled", job.ID), jobDashURL, nil)
+			}
+			return
+		}
 
 		wtOK := err == nil && absRoot != ""
 		wtDetail := ""
@@ -971,6 +1458,8 @@ func processSCMJob(jobID string) {
 			ScanSeverity:      scanSeverityCountsForRun(runID),
 			MCP:               mcpPlan,
 		}
+		legacyPrefsEarly := agentPrefsFromSummary(job)
+		populateCarriedFindingKeys(job, conn, owner, repoName, legacyPrefsEarly)
 		inline := postOPAReviewFindings(conn, owner, repoName, job, aiResult, pubMeta, autoApproveMinScore)
 		aiResult.InlinePosted = inline.Posted
 		aiResult.InlineFailed = inline.Failed
@@ -981,19 +1470,82 @@ func processSCMJob(jobID string) {
 		pubMeta.InlineMode = inline.Mode
 		pubMeta.InlineHonesty = inline.Honesty
 
-		aiComment, checkSum := publishAIReviewComment(job, aiResult, pubMeta)
-		aiResult.Comment = aiComment
+		checkSum := ""
+		if opaReviewShouldPostResume(aiResult) {
+			aiComment, cs := publishAIReviewComment(job, aiResult, pubMeta)
+			aiResult.Comment = aiComment
+			checkSum = cs
+		} else {
+			// Keep Check Run text honest without posting a PR résumé.
+			checkSum = truncateStr(nz(aiResult.Summary, "OPA Review skipped"), 500)
+			aiResult.Comment = ""
+		}
 		job.Summary["ai"] = aiResult
-		job.Summary["review_event"] = decideOPAReviewEvent(aiResult, autoApproveMinScore)
+		if scmAIReviewSucceeded(aiResult.Status) {
+			reviewedSHA := job.CommitSHA
+			if a := strFromAny(job.Summary["analyzed_sha"]); a != "" {
+				reviewedSHA = a
+			}
+			recordSuccessfulAIReview(job, reviewedSHA, aiResult.Status)
+		}
+
+		// Approval integrity: decide + publish through the chokepoint (de-fused from findings).
+		legacyPrefs := agentPrefsFromSummary(job)
+		if autoApproveMinScore > 0 {
+			legacyPrefs.AutoApprove = true
+		}
+		gateFail := gate["fail"] == true
+		secFindings := securityFindingsFromRun(job.OrganizationID, runID)
+		baseRef := "main"
+		if pull, err := githubGetPull(conn, owner, repoName, job.PRNumber); err == nil && pull != nil && pull.BaseRef != "" {
+			baseRef = pull.BaseRef
+		}
+		policyPath, _ := safePolicyPath(legacyPrefs.PolicyFilePath)
+		var policy *approvalPolicy
+		policyHonesty := ""
+		if raw, err := githubGetContentAtRef(conn, owner, repoName, policyPath, baseRef); err != nil {
+			policyHonesty = "policy unavailable: " + err.Error()
+		} else if p, err := parseApprovalPolicy(raw); err != nil {
+			policyHonesty = "policy unparseable: " + err.Error()
+		} else {
+			policy = p
+		}
+		decision := evaluateApproval(approvalEvidence{
+			Prefs: legacyPrefs, Bugbot: aiResult, SecurityRunID: runID,
+			SecurityFail: gateFail, SecurityFindings: secFindings,
+			BugbotOK: scmAIReviewSucceeded(aiResult.Status) || strings.EqualFold(aiResult.Status, "ok") || strings.EqualFold(aiResult.Status, "clean"),
+			SecurityOK: !gateFail,
+			Policy: policy, PolicyHonesty: policyHonesty, BaseRef: baseRef, MinScore: autoApproveMinScore,
+		})
+		job.Summary["review_event"] = decision.Event
+		job.Summary["approval_reasons"] = decision.Reasons
+		job.Summary["approval_honesty"] = decision.Honesty
+		decisionBody := formatOPAReviewDecisionBody(aiResult, decision.Event, autoApproveMinScore)
+		if decision.Honesty != "" {
+			decisionBody = decisionBody + "\n\n_" + decision.Honesty + "_"
+		}
+		if err := publishPRReview(conn, owner, repoName, job, decisionBody, decision.Event, nil); err != nil {
+			job.Summary["approval_publish_error"] = err.Error()
+		}
+		job.Summary["pending_decision"] = false
+		if legacyPrefs.ReviewerRouting && policy != nil {
+			_ = githubRequestPRReviewersEx(conn, owner, repoName, job.PRNumber, policy.Route.Reviewers, policy.Route.TeamReviewers)
+		} else if autoRequestReviewer {
+			if err := githubRequestPRReviewers(conn, owner, repoName, job.PRNumber, []string{githubAppReviewerLogin()}); err != nil {
+				job.Summary["request_reviewer_error"] = err.Error()
+			} else {
+				job.Summary["requested_reviewer"] = githubAppReviewerLogin()
+			}
+		}
+
 		aiConclusion := "neutral"
-		decision := decideOPAReviewEvent(aiResult, autoApproveMinScore)
 		if aiBlocking && aiResult.Status == "findings" {
 			aiConclusion = "failure"
-		} else if decision == "REQUEST_CHANGES" && autoApproveMinScore > 0 {
+		} else if decision.Event == "REQUEST_CHANGES" && autoApproveMinScore > 0 {
 			aiConclusion = "failure"
 		} else if aiResult.Status == "skipped" || aiResult.Status == "error" {
 			aiConclusion = "neutral"
-		} else if decision == "APPROVE" || aiResult.Status != "findings" {
+		} else if decision.Event == "APPROVE" || aiResult.Status != "findings" {
 			aiConclusion = "success"
 		} else {
 			aiConclusion = "success"
@@ -1009,14 +1561,14 @@ func processSCMJob(jobID string) {
 				ann = nil
 			}
 		}
-		_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", aiConclusion, checkTitle, checkSum, ann)
+		_ = githubUpdateCheckRun(conn, owner, repoName, aiCheckID, "completed", aiConclusion, checkTitle, checkRunSummaryWithJobLink(checkSum, job.ID), jobDashURL, ann)
 		// Résumé is upserted inside postOPAReviewFindings (issue comment with <!-- opa-review:resume -->).
-		// Only fall back here when inline sync could not touch GitHub at all.
-		if aiResult.Comment != "" && inline.Mode == "annotations_only" && !inline.ResumeOK {
+		// Only fall back here when inline sync could not touch GitHub at all — never when CLI key missing.
+		if opaReviewShouldPostResume(aiResult) && aiResult.Comment != "" && inline.Mode == "annotations_only" && !inline.ResumeOK {
 			_ = githubPRComment(conn, owner, repoName, job.PRNumber, aiResult.Comment)
 		}
 	} else if wantAI {
-		job.Summary["ai"] = map[string]interface{}{"status": "skipped", "reason": "draft PR or no PR number (pass force=true to override)"}
+		job.Summary["ai"] = map[string]interface{}{"status": "skipped", "reason": "no PR number (pass force=true to override)"}
 	}
 
 	if finishIfCancelled() {

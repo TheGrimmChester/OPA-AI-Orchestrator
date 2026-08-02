@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -413,6 +414,16 @@ func scanSecretsGitleaks(bin, runID, org, proj, service, root string) (int, erro
 	cfgPath, cfgCleanup := gitleaksConfigPath()
 	defer cfgCleanup()
 
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
+	defer cancel()
+
+	if sandboxMode() == "docker" {
+		if err := scanSecretsGitleaksSandboxed(ctx, runID, root, reportPath); err != nil {
+			return 0, err
+		}
+		return ingestGitleaksReport(reportPath, runID, org, proj, service, root)
+	}
+
 	args := []string{
 		"detect",
 		"--source", root,
@@ -423,20 +434,82 @@ func scanSecretsGitleaks(bin, runID, org, proj, service, root string) (int, erro
 		"--exit-code", "0",
 		"--timeout", "120",
 	}
-	env := append(os.Environ(), "GITLEAKS_CONFIG=")
+	env := jobEnv(jobEnvSpec{
+		Phase: jobPhaseScan,
+		Extra: map[string]string{"GITLEAKS_CONFIG": ""},
+	})
 	if cfgPath != "" {
 		args = append(args, "--config", cfgPath)
 	}
-	cmd := exec.Command(bin, args...)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
+	out = redactJobOutput(out)
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return 0, fmt.Errorf("gitleaks detect: timeout")
+		}
 		msg := strings.TrimSpace(string(out))
 		if len(msg) > 240 {
 			msg = msg[:240]
 		}
 		return 0, fmt.Errorf("gitleaks detect: %w (%s)", err, msg)
 	}
+	return ingestGitleaksReport(reportPath, runID, org, proj, service, root)
+}
+
+// scanSecretsGitleaksSandboxed runs gitleaks inside opa-runner-scan with the
+// report written to a host-mounted /out directory (preserves detector=gitleaks).
+func scanSecretsGitleaksSandboxed(ctx context.Context, runID, root, hostReport string) error {
+	root = filepath.Clean(root)
+	if !filepath.IsAbs(root) {
+		return fmt.Errorf("gitleaks sandbox requires absolute root")
+	}
+	jobID := runID
+	if jobID == "" {
+		jobID = filepath.Base(root)
+	}
+	outDir, err := os.MkdirTemp("", "opa-gitleaks-out-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(outDir)
+	argv := []string{
+		"gitleaks", "detect",
+		"--source", ".",
+		"--no-git",
+		"--no-banner",
+		"--report-format", "json",
+		"--report-path", "/out/report.json",
+		"--exit-code", "0",
+		"--timeout", "120",
+		"--config", "/etc/opa/gitleaks.toml",
+	}
+	out, err := runSandboxedArgv(ctx, sandboxExecSpec{
+		Phase:       jobPhaseScan,
+		JobID:       jobID,
+		HostWorkDir: root,
+		WorkRel:     "primary",
+		Argv:        argv,
+		ReadOnly:    true,
+		Network:     "none",
+		Image:       sandboxImageForPhase(jobPhaseScan),
+		Ephemeral:   true,
+		OutHostDir:  outDir,
+	})
+	if err != nil {
+		return fmt.Errorf("sandboxed gitleaks: %w (%s)", err, truncateStr(string(out), 200))
+	}
+	raw, err := os.ReadFile(filepath.Join(outDir, "report.json"))
+	if err != nil {
+		// Empty findings may omit the file depending on gitleaks version.
+		_ = os.WriteFile(hostReport, []byte("[]"), 0o600)
+		return nil
+	}
+	return os.WriteFile(hostReport, raw, 0o600)
+}
+
+func ingestGitleaksReport(reportPath, runID, org, proj, service, root string) (int, error) {
 	raw, err := os.ReadFile(reportPath)
 	if err != nil {
 		return 0, err

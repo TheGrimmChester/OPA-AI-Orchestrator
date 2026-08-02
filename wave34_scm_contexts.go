@@ -1,12 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -34,7 +34,9 @@ type opaReviewContext struct {
 	BodyMarkdown   string   `json:"body_markdown"`
 	TagsJSON       string   `json:"tags_json"`
 	LinkGroupID    string   `json:"link_group_id"`
-	Source         string   `json:"source"` // manual | cursor | draft
+	Source         string   `json:"source"` // manual | cursor | draft | learned
+	Kind           string   `json:"kind,omitempty"`   // must | should | note
+	Status         string   `json:"status,omitempty"` // active | candidate | rejected
 	UpdatedAt      string   `json:"updated_at"`
 	CreatedAt      string   `json:"created_at"`
 	Deleted        bool     `json:"deleted,omitempty"`
@@ -87,6 +89,8 @@ func handleReviewContextCreate(w http.ResponseWriter, r *http.Request) {
 		Tags         []string `json:"tags"`
 		LinkGroupID  string   `json:"link_group_id"`
 		Source       string   `json:"source"`
+		Kind         string   `json:"kind"`
+		Status       string   `json:"status"`
 	}
 	if json.Unmarshal(raw, &body) != nil {
 		http.Error(w, "bad json", 400)
@@ -117,6 +121,7 @@ func handleReviewContextCreate(w http.ResponseWriter, r *http.Request) {
 		TagsJSON: string(tagsJSON), LinkGroupID: strings.TrimSpace(body.LinkGroupID),
 		Source: nz(body.Source, "manual"), CreatedAt: now, UpdatedAt: now,
 	}
+	applyRuleFieldsFromCreate(rc, body.Kind, body.Status)
 	// Inherit link group from watched repo when unset.
 	if rc.LinkGroupID == "" && repo != "*" {
 		rc.LinkGroupID = linkGroupForRepo(repo)
@@ -134,6 +139,13 @@ func handleReviewContextSub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := strings.Split(path, "/")[0]
+	rest := ""
+	if parts := strings.SplitN(path, "/", 2); len(parts) == 2 {
+		rest = parts[1]
+	}
+	if rest != "" && maybeHandleRuleAction(w, r, id, rest) {
+		return
+	}
 	rc := getReviewContext(id)
 	if rc == nil || rc.Deleted {
 		http.Error(w, "not found", 404)
@@ -175,6 +187,7 @@ func handleReviewContextSub(w http.ResponseWriter, r *http.Request) {
 		if body.Source != nil {
 			rc.Source = strings.TrimSpace(*body.Source)
 		}
+		decodeRulePatchExtras(raw, rc)
 		rc.UpdatedAt = time.Now().UTC().Format("2006-01-02 15:04:05.000")
 		persistReviewContext(rc)
 		writeJSON(w, map[string]interface{}{"ok": true, "context": rc})
@@ -512,12 +525,11 @@ Do not commit or push. Do not invent vendor product names.
 		"Working directory is the full repo checkout at %s. Explore architecture, invariants, tests, and risk areas in this tree — do not limit yourself to README. Read %s and write the senior-engineer reviewer context markdown with the required sections.",
 		wtHint, promptPath,
 	))
-	cmd := exec.Command(agentBin, args...)
-	if worktreeAbs != "" {
-		cmd.Dir = worktreeAbs
-	}
-	cmd.Env = append(os.Environ(), "CURSOR_API_KEY="+apiKey, "NO_OPEN_BROWSER=1", "OPA_SCAN_WORKTREE="+worktreeAbs)
-	out, err := cmd.CombinedOutput()
+	_ = agentBin
+	out, err := launchAgentSandbox(agentLaunchSpec{
+		Phase: jobPhaseContext, Args: args, Dir: worktreeAbs, WorktreeRoot: worktreeAbs,
+		APIKey: apiKey, Timeout: 900 * time.Second,
+	})
 	usage := string(out)
 	if err != nil {
 		return "", usage, err
@@ -563,10 +575,15 @@ func runOPAReviewUnderstandingPass(job *scmJob, key, agentBin string, baseArgs [
 	prompt := fmt.Sprintf("%s Full PR tree at %s. Explore surrounding code as needed. Read %s. Output ONLY JSON with understanding (3-5 bullets covering data flow, control flow, assumptions) and summary. No findings yet — Step 2 will review aggressively.",
 		opaReviewCompactScaffold, checkoutRoot, promptPath)
 	args := append(append([]string{}, baseArgs...), prompt)
-	cmd := exec.Command(agentBin, args...)
-	cmd.Dir = checkoutRoot
-	cmd.Env = append(os.Environ(), "CURSOR_API_KEY="+key, "NO_OPEN_BROWSER=1", "OPA_SCAN_WORKTREE="+checkoutRoot)
-	out, err := cmd.CombinedOutput()
+	_ = agentBin
+	parent := context.Background()
+	if job != nil {
+		parent = scmJobContext(job.ID)
+	}
+	out, err := launchAgentSandbox(agentLaunchSpec{
+		Phase: jobPhaseContext, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
+		APIKey: key, Parent: parent,
+	})
 	if err != nil {
 		return ""
 	}
@@ -673,6 +690,7 @@ func reviewContextFromRow(row map[string]interface{}) *opaReviewContext {
 		ConnectorID: str("connector_id"), RepoFullName: str("repo_full_name"),
 		Title: str("title"), BodyMarkdown: str("body_markdown"), TagsJSON: nz(str("tags_json"), "[]"),
 		LinkGroupID: str("link_group_id"), Source: nz(str("source"), "manual"),
+		Kind: normalizeRuleKind(str("kind")), Status: normalizeRuleStatus(str("status")),
 		UpdatedAt: str("updated_at"), CreatedAt: str("created_at"), Deleted: del,
 	}
 }
@@ -685,11 +703,18 @@ func persistReviewContext(rc *opaReviewContext) {
 	if rc.Deleted {
 		del = 1
 	}
+	if rc.Kind == "" {
+		rc.Kind = ruleKindNote
+	}
+	if rc.Status == "" {
+		rc.Status = ruleStatusActive
+	}
 	payload, _ := json.Marshal(map[string]interface{}{
 		"id": rc.ID, "organization_id": rc.OrganizationID, "project_id": rc.ProjectID,
 		"connector_id": rc.ConnectorID, "repo_full_name": rc.RepoFullName,
 		"title": rc.Title, "body_markdown": rc.BodyMarkdown, "tags_json": nz(rc.TagsJSON, "[]"),
 		"link_group_id": rc.LinkGroupID, "source": nz(rc.Source, "manual"),
+		"kind": rc.Kind, "status": rc.Status,
 		"updated_at": rc.UpdatedAt, "created_at": rc.CreatedAt, "deleted": del,
 	})
 	writer.insertAsync("review_contexts", append(payload, '\n'))

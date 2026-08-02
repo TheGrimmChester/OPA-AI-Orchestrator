@@ -54,30 +54,9 @@ func githubAppJWT() (string, error) {
 }
 
 func githubInstallationToken(installationID string) (string, error) {
-	jwtStr, err := githubAppJWT()
-	if err != nil {
-		return "", err
-	}
-	url := fmt.Sprintf("https://api.github.com/app/installations/%s/access_tokens", installationID)
-	req, _ := http.NewRequest(http.MethodPost, url, nil)
-	req.Header.Set("Authorization", "Bearer "+jwtStr)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := githubHTTPClient().Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("installation token %d: %s", resp.StatusCode, string(raw))
-	}
-	var out struct {
-		Token string `json:"token"`
-	}
-	if json.Unmarshal(raw, &out) != nil || out.Token == "" {
-		return "", fmt.Errorf("no token in response")
-	}
-	return out.Token, nil
+	// Legacy full-installation scope. Prefer githubInstallationTokenScoped with
+	// an explicit repos+perms allowlist for new call sites.
+	return githubInstallationTokenScoped(installationID, nil, nil)
 }
 
 func githubAccessToken(c *opaConnector) (string, error) {
@@ -257,14 +236,39 @@ func githubMockListRepos(c *opaConnector) []map[string]interface{} {
 	return out
 }
 
-func githubCreateCheckRun(c *opaConnector, owner, repo, name, headSHA, status, conclusion, title, summary string, annotations []map[string]interface{}) (int64, error) {
+// scmJobDashboardURL returns the OPA Dashboard job page URL for a SCM job.
+// Matches Dashboard scmJobHref: /security/jobs/:jobId
+func scmJobDashboardURL(jobID string) string {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return ""
+	}
+	base := strings.TrimRight(envOr("OPA_DASHBOARD_URL", "http://127.0.0.1:8088"), "/")
+	return base + "/security/jobs/" + jobID
+}
+
+// checkRunSummaryWithJobLink appends a markdown link to the Dashboard job page.
+func checkRunSummaryWithJobLink(summary, jobID string) string {
+	u := scmJobDashboardURL(jobID)
+	if u == "" {
+		return summary
+	}
+	link := fmt.Sprintf("[View in OPA Dashboard](%s)", u)
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return link
+	}
+	return summary + "\n\n" + link
+}
+
+func githubCreateCheckRun(c *opaConnector, owner, repo, name, headSHA, status, conclusion, title, summary, detailsURL string, annotations []map[string]interface{}) (int64, error) {
 	if c == nil || githubUseMockAPI(c) || c.Kind == "github_pat" && envOr("OPA_SCM_SKIP_CHECK_RUNS", "1") == "1" {
 		return time.Now().Unix(), nil // mock id
 	}
 	body := map[string]interface{}{
-		"name":       name,
-		"head_sha":   headSHA,
-		"status":     status,
+		"name":     name,
+		"head_sha": headSHA,
+		"status":   status,
 		"output": map[string]interface{}{
 			"title":   title,
 			"summary": summary,
@@ -272,6 +276,9 @@ func githubCreateCheckRun(c *opaConnector, owner, repo, name, headSHA, status, c
 	}
 	if conclusion != "" {
 		body["conclusion"] = conclusion
+	}
+	if detailsURL != "" {
+		body["details_url"] = detailsURL
 	}
 	if len(annotations) > 0 {
 		if out, ok := body["output"].(map[string]interface{}); ok {
@@ -296,7 +303,7 @@ func githubCreateCheckRun(c *opaConnector, owner, repo, name, headSHA, status, c
 	return resp.ID, nil
 }
 
-func githubUpdateCheckRun(c *opaConnector, owner, repo string, checkID int64, status, conclusion, title, summary string, annotations []map[string]interface{}) error {
+func githubUpdateCheckRun(c *opaConnector, owner, repo string, checkID int64, status, conclusion, title, summary, detailsURL string, annotations []map[string]interface{}) error {
 	if checkID == 0 || githubUseMockAPI(c) {
 		return nil
 	}
@@ -306,6 +313,9 @@ func githubUpdateCheckRun(c *opaConnector, owner, repo string, checkID int64, st
 	}
 	if conclusion != "" {
 		body["conclusion"] = conclusion
+	}
+	if detailsURL != "" {
+		body["details_url"] = detailsURL
 	}
 	if len(annotations) > 0 {
 		if out, ok := body["output"].(map[string]interface{}); ok {
@@ -580,10 +590,34 @@ func githubCreatePRReview(c *opaConnector, owner, repo string, pr int, commitSHA
 	return nil
 }
 
+// githubUpdatePullBody PATCHes a pull request description. Used for the OPA
+// summary fence — never for decision events.
+func githubUpdatePullBody(c *opaConnector, owner, repo string, pr int, body string) error {
+	if c == nil || pr <= 0 {
+		return nil
+	}
+	if githubUseMockAPI(c) {
+		return nil
+	}
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	resp, code, err := githubAPI(c, http.MethodPatch, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, pr), strings.NewReader(string(payload)))
+	if err != nil {
+		return err
+	}
+	if code >= 300 {
+		return fmt.Errorf("update pull body %d: %s", code, truncateStr(string(resp), 200))
+	}
+	return nil
+}
+
 // githubRequestPRReviewers asks GitHub to request reviewers on a PR.
 // For GitHub Apps, pass the app slug (OPA_GITHUB_APP_SLUG) as a reviewer login.
 func githubRequestPRReviewers(c *opaConnector, owner, repo string, pr int, reviewers []string) error {
-	if c == nil || pr <= 0 || len(reviewers) == 0 || githubUseMockAPI(c) {
+	return githubRequestPRReviewersEx(c, owner, repo, pr, reviewers, nil)
+}
+
+func githubRequestPRReviewersEx(c *opaConnector, owner, repo string, pr int, reviewers, teamReviewers []string) error {
+	if c == nil || pr <= 0 || githubUseMockAPI(c) {
 		return nil
 	}
 	cleaned := make([]string, 0, len(reviewers))
@@ -601,10 +635,31 @@ func githubRequestPRReviewers(c *opaConnector, owner, repo string, pr int, revie
 		seen[key] = struct{}{}
 		cleaned = append(cleaned, r)
 	}
-	if len(cleaned) == 0 {
+	teams := make([]string, 0, len(teamReviewers))
+	teamSeen := map[string]struct{}{}
+	for _, t := range teamReviewers {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		key := strings.ToLower(t)
+		if _, ok := teamSeen[key]; ok {
+			continue
+		}
+		teamSeen[key] = struct{}{}
+		teams = append(teams, t)
+	}
+	if len(cleaned) == 0 && len(teams) == 0 {
 		return nil
 	}
-	payload, _ := json.Marshal(map[string]interface{}{"reviewers": cleaned})
+	payloadMap := map[string]interface{}{}
+	if len(cleaned) > 0 {
+		payloadMap["reviewers"] = cleaned
+	}
+	if len(teams) > 0 {
+		payloadMap["team_reviewers"] = teams
+	}
+	payload, _ := json.Marshal(payloadMap)
 	resp, code, err := githubAPI(c, http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/requested_reviewers", owner, repo, pr), strings.NewReader(string(payload)))
 	if err != nil {
 		return err
@@ -652,14 +707,16 @@ func githubPRDiff(c *opaConnector, owner, repo string, pr int) (string, error) {
 }
 
 type githubPullMeta struct {
-	Number  int
-	Title   string
-	Body    string
-	Draft   bool
-	HeadSHA string
-	HeadRef string
-	BaseRef string
-	State   string
+	Number   int
+	Title    string
+	Body     string
+	Draft    bool
+	HeadSHA  string
+	HeadRef  string
+	BaseRef  string
+	State    string
+	Merged   bool
+	MergedAt string
 }
 
 func githubGetPull(c *opaConnector, owner, repo string, pr int) (*githubPullMeta, error) {
@@ -680,12 +737,14 @@ func githubGetPull(c *opaConnector, owner, repo string, pr int) (*githubPullMeta
 		return nil, fmt.Errorf("pull %d: %s", code, truncateStr(string(raw), 200))
 	}
 	var body struct {
-		Number int    `json:"number"`
-		Title  string `json:"title"`
-		Body   string `json:"body"`
-		Draft  bool   `json:"draft"`
-		State  string `json:"state"`
-		Head   struct {
+		Number   int    `json:"number"`
+		Title    string `json:"title"`
+		Body     string `json:"body"`
+		Draft    bool   `json:"draft"`
+		State    string `json:"state"`
+		Merged   bool   `json:"merged"`
+		MergedAt string `json:"merged_at"`
+		Head     struct {
 			SHA string `json:"sha"`
 			Ref string `json:"ref"`
 		} `json:"head"`
@@ -700,6 +759,7 @@ func githubGetPull(c *opaConnector, owner, repo string, pr int) (*githubPullMeta
 		Number: body.Number, Title: body.Title, Body: body.Body,
 		Draft: body.Draft, HeadSHA: body.Head.SHA, HeadRef: body.Head.Ref,
 		BaseRef: body.Base.Ref, State: body.State,
+		Merged: body.Merged, MergedAt: body.MergedAt,
 	}, nil
 }
 

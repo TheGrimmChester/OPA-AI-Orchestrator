@@ -238,7 +238,13 @@ func shallowCloneRelated(c *opaConnector, fullName, dest string) error {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return err
 	}
-	cloneURL := fmt.Sprintf("https://github.com/%s.git", fullName)
+	if err := validateGitHubRepoFullName(fullName); err != nil {
+		return fmt.Errorf("related clone refused: %w", err)
+	}
+	cloneURL, err := githubHTTPSCloneURL(fullName)
+	if err != nil {
+		return err
+	}
 	cmd := exec.Command("git", "clone", "--depth", "50", "--single-branch", cloneURL, dest)
 	cmd.Env = askEnv
 	if out, err := cmd.CombinedOutput(); err != nil {
