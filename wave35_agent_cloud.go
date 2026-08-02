@@ -44,6 +44,9 @@ func runCloudAgent(job *scmJob) error {
 	}
 
 	owner, repoName := splitOwnerRepo(job.RepoFullName)
+	if !githubUseMockAPI(conn) {
+		_ = ensureGitHubWriteAllowed(job, conn)
+	}
 	jobDashURL := scmJobDashboardURL(nz(job.RunID, job.ID))
 	checkID, _ := githubCreateCheckRun(conn, owner, repoName, "OPA Auto-fix", job.CommitSHA, "in_progress", "",
 		"Cloud autofix…", checkRunSummaryWithJobLink("patch → gate → clean land", nz(job.RunID, job.ID)), jobDashURL, nil)
@@ -211,7 +214,7 @@ func runOneCloudAttempt(job *scmJob, conn *opaConnector, auth autofixAuthOK, pre
 		return out, err
 	}
 
-	// --- cloud.patch (sandbox / agent-writable tree only) ---
+	// --- cloud.patch (no-.git sandbox; never --trust on live shared-bare worktree) ---
 	skippedAI := envOr("SKIP_CURSOR_AI", "0") == "1" || resolveCursorAPIKey(job.OrganizationID, job.ProjectID, job.ActorUserID) == ""
 	if skippedAI || githubUseMockAPI(conn) {
 		note := filepath.Join(absRoot, ".opa-review-autofix.md")
@@ -226,11 +229,32 @@ func runOneCloudAttempt(job *scmJob, conn *opaConnector, auth autofixAuthOK, pre
 			out["honesty"] = "AI skipped — recorded finding list only"
 		}
 	} else {
+		agentRoot, n, merr := prepareAutofixAgentTree(patchWtID, absRoot)
+		if merr != nil {
+			if !allowHostExecFallback() {
+				out["status"] = "failed"
+				out["honesty"] = "cloud.patch sandbox materialize failed (set OPA_JOB_ALLOW_HOST_EXEC=1 to fall back): " + merr.Error()
+				return out, merr
+			}
+			stampSandboxHonesty(job.ID, "UNSANDBOXED: autofix ran on live worktree (OPA_JOB_ALLOW_HOST_EXEC=1; materialize failed)")
+			agentRoot = absRoot
+			out["sandbox_fallback"] = "host_exec"
+		} else {
+			out["sandbox_tree"] = agentRoot
+			out["sandbox_file_count"] = n
+		}
 		fixStub := &opaAutoFixJob{ID: fmt.Sprintf("%s-%d", job.ID, iteration), FindingKeys: keysFromFindings(auth.Findings), Findings: findings}
-		if err := runAutoFixAgent(job, absRoot, patchWtID, fixStub); err != nil {
+		if err := runAutoFixAgent(job, agentRoot, job.ID, patchWtID, fixStub); err != nil {
 			out["status"] = "failed"
 			out["honesty"] = "cloud.patch: " + err.Error()
 			return out, err
+		}
+		if agentRoot != absRoot {
+			if serr := syncSandboxTreeToPrimary(agentRoot, absRoot); serr != nil {
+				out["status"] = "failed"
+				out["honesty"] = "cloud.patch sync: " + serr.Error()
+				return out, serr
+			}
 		}
 		out["patch"] = "ok"
 	}
@@ -371,7 +395,7 @@ func landValidatedPatch(job *scmJob, conn *opaConnector, landWtID, baseSHA, bran
 		return out, nil
 	}
 
-	if err := gitPushBranch(conn, landRoot, branch); err != nil {
+	if err := gitPushBranch(conn, landRoot, branch, job.RepoFullName); err != nil {
 		out["status"] = "failed"
 		out["honesty"] = "push: " + err.Error()
 		return out, err

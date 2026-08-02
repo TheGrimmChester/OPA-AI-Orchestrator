@@ -140,3 +140,57 @@ func countFilesUnder(root string) (int, error) {
 	})
 	return n, err
 }
+
+// prepareAutofixAgentTree materializes a no-.git writable sandbox under
+// {worktreeID}/sandbox for cloud.patch / Auto-fix agents. Agents must not
+// run --trust on a live worktree whose gitdir is linked to the shared bare.
+func prepareAutofixAgentTree(worktreeID, primaryAbs string) (agentRoot string, fileCount int, err error) {
+	return materializeSandboxTreeForJob(worktreeID, primaryAbs)
+}
+
+// syncSandboxTreeToPrimary copies agent edits from a no-.git sandbox onto the
+// git primary so gateCloudDiff / captureValidatedPatch / land see the same
+// changes. Tracked primary files missing from the sandbox are removed.
+func syncSandboxTreeToPrimary(sandboxAbs, primaryAbs string) error {
+	sandboxAbs = filepath.Clean(sandboxAbs)
+	primaryAbs = filepath.Clean(primaryAbs)
+	if sandboxAbs == "" || primaryAbs == "" {
+		return fmt.Errorf("sandbox and primary required")
+	}
+	if sandboxAbs == primaryAbs {
+		return fmt.Errorf("sandbox and primary must differ")
+	}
+	if _, err := copyTreeFiles(sandboxAbs, primaryAbs); err != nil {
+		return fmt.Errorf("sync sandbox→primary: %w", err)
+	}
+	tracked, err := gitTrackedRelPaths(primaryAbs)
+	if err != nil {
+		return err
+	}
+	for _, rel := range tracked {
+		if _, err := os.Stat(filepath.Join(sandboxAbs, rel)); os.IsNotExist(err) {
+			_ = os.Remove(filepath.Join(primaryAbs, rel))
+		}
+	}
+	return nil
+}
+
+func gitTrackedRelPaths(worktree string) ([]string, error) {
+	cmd := exec.Command("git", "-C", worktree, "ls-files", "-z")
+	cmd.Env = hostToolEnv()
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git ls-files: %w", err)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	paths := []string{}
+	for _, p := range strings.Split(string(out), "\x00") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths, nil
+}

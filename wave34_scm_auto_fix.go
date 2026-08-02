@@ -444,11 +444,30 @@ func runOPAAutoFix(parent *scmJob, conn *opaConnector, fix *opaAutoFixJob) (*opa
 			fix.Status = "skipped"
 		}
 	} else {
-		if err := runAutoFixAgent(parent, absRoot, wtID, fix); err != nil {
+		agentRoot, _, merr := prepareAutofixAgentTree(wtID, absRoot)
+		if merr != nil {
+			if !allowHostExecFallback() {
+				fix.Status = "failed"
+				fix.Error = "sandbox materialize: " + merr.Error()
+				fix.Honesty = "Auto-fix refused: no-.git sandbox required (set OPA_JOB_ALLOW_HOST_EXEC=1 to fall back)"
+				return fix, merr
+			}
+			stampSandboxHonesty(parent.ID, "UNSANDBOXED: autofix ran on live worktree (OPA_JOB_ALLOW_HOST_EXEC=1; materialize failed)")
+			agentRoot = absRoot
+		}
+		if err := runAutoFixAgent(parent, agentRoot, parent.ID, wtID, fix); err != nil {
 			fix.Status = "failed"
 			fix.Error = "agent: " + err.Error()
 			fix.Honesty = "Auto-fix agent failed"
 			return fix, err
+		}
+		if agentRoot != absRoot {
+			if serr := syncSandboxTreeToPrimary(agentRoot, absRoot); serr != nil {
+				fix.Status = "failed"
+				fix.Error = "sync: " + serr.Error()
+				fix.Honesty = "Auto-fix sandbox sync failed"
+				return fix, serr
+			}
 		}
 		fix.Honesty = "Auto-fix agent completed"
 	}
@@ -541,7 +560,7 @@ func runOPAAutoFix(parent *scmJob, conn *opaConnector, fix *opaAutoFixJob) (*opa
 		return fix, nil
 	}
 
-	if err := gitPushBranch(conn, landRoot, branch); err != nil {
+	if err := gitPushBranch(conn, landRoot, branch, parent.RepoFullName); err != nil {
 		fix.Status = "failed"
 		fix.Error = "push: " + err.Error()
 		return fix, err
@@ -629,14 +648,16 @@ func buildAutoFixPRBody(parent *scmJob, fix *opaAutoFixJob) string {
 	return b.String()
 }
 
-func runAutoFixAgent(parent *scmJob, checkoutRoot, worktreeID string, fix *opaAutoFixJob) error {
+func runAutoFixAgent(parent *scmJob, checkoutRoot, scmJobID, worktreeID string, fix *opaAutoFixJob) error {
 	key, agentBin, model, force := resolveCLICursorConfig(parent.OrganizationID, parent.ProjectID, parent.ActorUserID)
 	if key == "" {
 		return fmt.Errorf("CLI agent API key not set — save one under Account (personal or org)")
 	}
 	brief := packAutoFixBrief(parent, checkoutRoot, fix)
-	// Autofix checkouts live under their own worktree id (not the parent run).
-	jobLabel := resolveSandboxJobID(worktreeID, checkoutRoot)
+	// opa.job = SCM job/child id (cancel teardown); LayoutID/RunID = worktree id
+	// (bind path under cloud-patch-* / autofix worktree layout).
+	jobLabel := resolveSandboxJobID(scmJobID, checkoutRoot)
+	layoutLabel := resolveSandboxJobID(worktreeID, checkoutRoot)
 	cancelID := ""
 	if parent != nil {
 		cancelID = parent.ID
@@ -660,7 +681,7 @@ func runAutoFixAgent(parent *scmJob, checkoutRoot, worktreeID string, fix *opaAu
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseAutofix, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
 		APIKey: key, Parent: scmJobContext(cancelID), Timeout: 1200 * time.Second,
-		JobID: jobLabel, RunID: jobLabel,
+		JobID: jobLabel, RunID: layoutLabel,
 	})
 	if err != nil {
 		return fmt.Errorf("%v (%s)", err, truncateStr(string(out), 300))
@@ -763,11 +784,11 @@ func gitCommitAll(root, message string) (string, error) {
 	return gitRevParse(root), nil
 }
 
-func gitPushBranch(conn *opaConnector, root, branch string) error {
+func gitPushBranch(conn *opaConnector, root, branch, repoFullName string) error {
 	if err := authorizeGitPush(conn); err != nil {
 		return err
 	}
-	tok, err := githubAccessToken(conn)
+	tok, err := githubAccessTokenFor(conn, repoFullName, githubPermsPush())
 	if err != nil {
 		return err
 	}

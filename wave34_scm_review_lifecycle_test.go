@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -114,6 +116,29 @@ func TestRelatedRepoPathLayout(t *testing.T) {
 	}
 	if sanitizeRelatedRepoDir("foo/bar") != "foo-bar" {
 		t.Fatal("sanitize")
+	}
+}
+
+func TestPrepareRelatedCheckoutsNoGit(t *testing.T) {
+	t.Setenv("OPA_REVIEW_TMP", t.TempDir())
+	t.Setenv("OPA_SCM_MOCK_GITHUB", "1")
+	id := "rel-job-1"
+	got := prepareRelatedCheckouts(nil, id, []string{"acme/shared"}, nil)
+	if len(got) != 1 {
+		t.Fatalf("want 1 related, got %+v", got)
+	}
+	rc := got[0]
+	if rc.Error != "" {
+		t.Fatalf("unexpected error: %s", rc.Error)
+	}
+	if _, err := os.Stat(filepath.Join(rc.Path, ".git")); err == nil {
+		t.Fatal("related agent tree must not contain .git")
+	}
+	if _, err := os.Stat(filepath.Join(rc.Path, "README.md")); err != nil {
+		t.Fatal("expected materialized README")
+	}
+	if rc.SHA == "" {
+		t.Fatal("expected recorded sha from clone before materialize")
 	}
 }
 

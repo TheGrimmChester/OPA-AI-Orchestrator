@@ -25,8 +25,9 @@ type agentLaunchSpec struct {
 	Timeout      time.Duration
 	Parent       context.Context
 	// JobID labels the sandbox container (opa.job) for cancel teardown.
-	// Prefer the scm *child* id. RunID is the worktree/network identity when
-	// the checkout lives under the parent run (opa.run + bind layout).
+	// Must be the SCM job/child id so cancelSCMJob(teardown by opa.job) hits
+	// the box. RunID is the worktree/network identity (LayoutID + opa.run)
+	// when the checkout lives under a different layout id (e.g. cloud-patch-*).
 	JobID string
 	RunID string
 }

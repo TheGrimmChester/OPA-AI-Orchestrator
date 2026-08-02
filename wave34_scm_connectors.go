@@ -112,9 +112,10 @@ type opaWatchedRepo struct {
 	AIBlocking     bool   `json:"ai_blocking"`
 	// AutoRequestReviewer asks GitHub to add this App as a PR reviewer.
 	AutoRequestReviewer bool `json:"auto_request_reviewer"`
-	// AutoApproveMinScore is 1–100; when >0 OPA submits APPROVE if
-	// auto_merge_confidence >= threshold (and no blocker/high findings),
-	// else REQUEST_CHANGES. 0 keeps legacy COMMENT-only reviews.
+	// AutoApproveMinScore is 1–100 confidence veto only: when >0 and
+	// auto_merge_confidence is below the threshold, APPROVE is blocked
+	// (REQUEST_CHANGES). It never grants APPROVE by itself — that requires
+	// agent prefs AutoApprove plus the evidence conjunction.
 	AutoApproveMinScore int    `json:"auto_approve_min_score"`
 	LinkGroupID         string `json:"link_group_id"`
 	UpdatedAt           string `json:"updated_at"`

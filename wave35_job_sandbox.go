@@ -62,6 +62,9 @@ func (hostSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([]b
 	if len(spec.Argv) == 0 {
 		return nil, fmt.Errorf("empty argv")
 	}
+	if hostPhaseNeedsHonestyStamp(spec.Phase) {
+		stampSandboxHonesty(spec.JobID, "UNSANDBOXED: OPA_JOB_SANDBOX=off — exec-untrusted phase ran on host")
+	}
 	env := jobEnv(jobEnvSpec{
 		Phase:        spec.Phase,
 		WorktreeRoot: spec.HostWorkDir,
@@ -76,6 +79,15 @@ func (hostSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([]b
 	out, err := cmd.CombinedOutput()
 	out = redactJobOutput(out, secretValues(spec.Secrets)...)
 	return out, err
+}
+
+func hostPhaseNeedsHonestyStamp(phase jobPhase) bool {
+	switch phase {
+	case jobPhaseReview, jobPhaseContext, jobPhaseScan, jobPhaseAutofix, jobPhaseCheckup, jobPhaseAITask:
+		return true
+	default:
+		return false
+	}
 }
 
 type dockerSandboxRunner struct{}

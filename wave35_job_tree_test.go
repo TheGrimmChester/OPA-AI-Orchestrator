@@ -65,6 +65,54 @@ func TestMaterializeSandboxTreeForJob(t *testing.T) {
 	}
 }
 
+func TestSyncSandboxTreeToPrimary(t *testing.T) {
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "primary")
+	sandbox := filepath.Join(dir, "sandbox")
+	must := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = dir
+		cmd.Env = hostToolEnv()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v (%s)", args, err, out)
+		}
+	}
+	_ = os.MkdirAll(primary, 0o755)
+	must(primary, "git", "init")
+	must(primary, "git", "config", "user.email", "t@example.com")
+	must(primary, "git", "config", "user.name", "t")
+	_ = os.WriteFile(filepath.Join(primary, "keep.go"), []byte("package keep\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(primary, "gone.go"), []byte("package gone\n"), 0o644)
+	must(primary, "git", "add", ".")
+	must(primary, "git", "commit", "-m", "init")
+
+	_, err := materializeTreeWithCheckoutIndex(primary, sandbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(sandbox, "keep.go"), []byte("package keep\n// patched\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(sandbox, "new.go"), []byte("package new\n"), 0o644)
+	_ = os.Remove(filepath.Join(sandbox, "gone.go"))
+
+	if err := syncSandboxTreeToPrimary(sandbox, primary); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(primary, "keep.go"))
+	if !strings.Contains(string(raw), "patched") {
+		t.Fatalf("keep.go not synced: %s", raw)
+	}
+	if _, err := os.Stat(filepath.Join(primary, "new.go")); err != nil {
+		t.Fatal("new.go missing on primary")
+	}
+	if _, err := os.Stat(filepath.Join(primary, "gone.go")); err == nil {
+		t.Fatal("gone.go should be removed from primary")
+	}
+	if _, err := os.Stat(filepath.Join(primary, ".git")); err != nil {
+		t.Fatal("primary .git must remain")
+	}
+}
+
 func TestMaterializeSandboxTreeForJobGitParity(t *testing.T) {
 	t.Setenv("OPA_REVIEW_TMP", t.TempDir())
 	id := "mat-git-1"

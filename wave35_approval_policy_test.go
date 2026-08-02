@@ -9,6 +9,9 @@ func TestParseApprovalPolicyRejectsWiden(t *testing.T) {
 	if _, err := parseApprovalPolicy(`{"version":1,"approve_if":{"any":true}}`); err == nil {
 		t.Fatal("expected reject of approve_if")
 	}
+	if _, err := parseApprovalPolicy(`{"version":1,"require":["security"],"mystery":true}`); err == nil {
+		t.Fatal("expected reject of unknown key")
+	}
 	p, err := parseApprovalPolicy(`{"version":1,"require":["security"],"block_if":{"security_min_severity":"high"},"on_fail":"COMMENT"}`)
 	if err != nil {
 		t.Fatal(err)
@@ -24,6 +27,13 @@ func TestEvaluateApprovalConfidenceVetoOnly(t *testing.T) {
 	d := evaluateApproval(approvalEvidence{Bugbot: clean, BugbotOK: true, Prefs: agentPrefs{AutoApprove: false}})
 	if d.Event != "COMMENT" {
 		t.Fatalf("auto off want COMMENT got %s", d.Event)
+	}
+	// MinScore > 0 without AutoApprove must not grant APPROVE.
+	d = evaluateApproval(approvalEvidence{
+		Bugbot: clean, BugbotOK: true, Prefs: agentPrefs{AutoApprove: false}, MinScore: 70,
+	})
+	if d.Event != "COMMENT" {
+		t.Fatalf("minScore alone want COMMENT got %s", d.Event)
 	}
 	// Degraded never APPROVE even with high confidence + auto on.
 	d = evaluateApproval(approvalEvidence{
