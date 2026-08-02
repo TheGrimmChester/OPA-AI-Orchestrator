@@ -1521,10 +1521,8 @@ func processLegacySCMJob(jobID string) {
 		}
 
 		// Approval integrity: decide + publish through the chokepoint (de-fused from findings).
+		// MinScore is veto-only — never promote AutoApprove from auto_approve_min_score.
 		legacyPrefs := agentPrefsFromSummary(job)
-		if autoApproveMinScore > 0 {
-			legacyPrefs.AutoApprove = true
-		}
 		gateFail := gate["fail"] == true
 		secFindings := securityFindingsFromRun(job.OrganizationID, runID)
 		baseRef := "main"

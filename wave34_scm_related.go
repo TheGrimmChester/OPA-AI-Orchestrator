@@ -21,6 +21,7 @@ type relatedCheckout struct {
 	SHA          string `json:"sha,omitempty"`
 	Source       string `json:"source"` // link | pr_body | context | mid_review | stack
 	Error        string `json:"error,omitempty"`
+	Honesty      string `json:"honesty,omitempty"`
 }
 
 func opaReviewRelatedMax() int {
@@ -170,7 +171,8 @@ func extractRelatedReposFromText(texts ...string) []string {
 	return out
 }
 
-// prepareRelatedCheckouts shallow-clones related repos under job related/.
+// prepareRelatedCheckouts shallow-clones related repos under job related/, then
+// materializes a no-.git tree for agent-visible consumption (Plan B.5).
 func prepareRelatedCheckouts(c *opaConnector, worktreeID string, repos []string, sourceByRepo map[string]string) []relatedCheckout {
 	out := []relatedCheckout{}
 	if worktreeID == "" || len(repos) == 0 {
@@ -194,18 +196,44 @@ func prepareRelatedCheckouts(c *opaConnector, worktreeID string, repos []string,
 		}
 		dest := scmRelatedRepoAbs(worktreeID, fullName)
 		rc := relatedCheckout{RepoFullName: fullName, Path: dest, Source: src}
-		if st, err := os.Stat(filepath.Join(dest, ".git")); err == nil && st != nil {
-			rc.SHA = gitRevParse(dest)
-			out = append(out, rc)
-			continue
+		// Already a no-.git agent tree — reuse.
+		if st, err := os.Stat(dest); err == nil && st.IsDir() {
+			if _, gerr := os.Stat(filepath.Join(dest, ".git")); gerr != nil {
+				if marker, _ := os.ReadFile(filepath.Join(dest, ".opa-related-sha")); len(marker) > 0 {
+					rc.SHA = strings.TrimSpace(string(marker))
+				}
+				out = append(out, rc)
+				continue
+			}
 		}
 		_ = os.RemoveAll(dest)
-		if err := shallowCloneRelated(c, fullName, dest); err != nil {
+		cloneDir := dest + ".gitclone"
+		_ = os.RemoveAll(cloneDir)
+		if err := shallowCloneRelated(c, fullName, cloneDir); err != nil {
 			rc.Error = truncateStr(err.Error(), 200)
 			out = append(out, rc)
 			continue
 		}
-		rc.SHA = gitRevParse(dest)
+		rc.SHA = gitRevParse(cloneDir)
+		if _, err := materializeTreeWithCheckoutIndex(cloneDir, dest); err != nil {
+			// Fallback: leave the clone but strip remotes and stamp honesty.
+			_ = os.RemoveAll(dest)
+			if rerr := os.Rename(cloneDir, dest); rerr != nil {
+				rc.Error = truncateStr(err.Error()+"; rename: "+rerr.Error(), 200)
+				_ = os.RemoveAll(cloneDir)
+				out = append(out, rc)
+				continue
+			}
+			_ = exec.Command("git", "-C", dest, "remote", "remove", "origin").Run()
+			rc.Honesty = "materialize failed — left clone with remotes stripped: " + truncateStr(err.Error(), 120)
+			out = append(out, rc)
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(dest, ".git"))
+		_ = os.RemoveAll(cloneDir)
+		if rc.SHA != "" {
+			_ = os.WriteFile(filepath.Join(dest, ".opa-related-sha"), []byte(rc.SHA+"\n"), 0o644)
+		}
 		out = append(out, rc)
 	}
 	return out
@@ -226,7 +254,7 @@ func shallowCloneRelated(c *opaConnector, fullName, dest string) error {
 		_ = exec.Command("git", "-C", dest, "commit", "-m", "mock related", "--allow-empty").Run()
 		return nil
 	}
-	tok, err := githubAccessToken(c)
+	tok, err := githubAccessTokenFor(c, fullName, githubPermsCloneRead())
 	if err != nil {
 		return err
 	}
@@ -272,6 +300,9 @@ func formatRelatedCheckoutsForPrompt(related []relatedCheckout) string {
 			sha = "—"
 		}
 		fmt.Fprintf(&b, "- `%s` → `%s` (sha `%s`, source=%s)\n", r.RepoFullName, r.Path, truncateStr(sha, 12), r.Source)
+		if r.Honesty != "" {
+			fmt.Fprintf(&b, "  - honesty: %s\n", r.Honesty)
+		}
 	}
 	b.WriteString("\n")
 	return b.String()
@@ -301,6 +332,7 @@ func relatedCheckoutsFromJobSummary(job *scmJob) []relatedCheckout {
 				SHA:          strFromAny(m["sha"]),
 				Source:       strFromAny(m["source"]),
 				Error:        strFromAny(m["error"]),
+				Honesty:      strFromAny(m["honesty"]),
 			})
 		}
 		return out

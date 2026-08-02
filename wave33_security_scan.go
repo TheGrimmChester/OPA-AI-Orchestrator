@@ -308,8 +308,8 @@ func rememberSecretSeverity(runID, sev string) {
 	}
 	v, _ := secretSevByRun.LoadOrStore(runID, map[string]int{})
 	m := v.(map[string]int)
-	// map is not concurrent-safe for writes across goroutines, but scans are
-	// serialized by securityScanMu; still copy-on-store for safety.
+	// Per-run maps are only written from that run's goroutine; copy-on-store
+	// keeps the stored value immutable if another reader loads mid-update.
 	cp := map[string]int{}
 	for k, n := range m {
 		cp[k] = n

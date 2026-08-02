@@ -72,6 +72,30 @@ func TestResolveSandboxJobID(t *testing.T) {
 	}
 }
 
+func TestAutofixSandboxLabelsSplitJobFromLayout(t *testing.T) {
+	// Cloud patch worktrees are cloud-patch-<child>-N; cancel tears down opa.job=<child>.
+	scmJobID := "cloud-child-abc"
+	worktreeID := "cloud-patch-cloud-child-abc-1"
+	checkout := "/tmp/opa-review/" + worktreeID + "/sandbox"
+	jobLabel := resolveSandboxJobID(scmJobID, checkout)
+	layoutLabel := resolveSandboxJobID(worktreeID, checkout)
+	if jobLabel != scmJobID {
+		t.Fatalf("JobID (opa.job) want %s got %s", scmJobID, jobLabel)
+	}
+	if layoutLabel != worktreeID {
+		t.Fatalf("RunID/LayoutID want %s got %s", worktreeID, layoutLabel)
+	}
+	if jobLabel == layoutLabel {
+		t.Fatal("cloud patch JobID must differ from worktree layout id so cancel finds boxes")
+	}
+	spec := agentLaunchSpec{JobID: jobLabel, RunID: layoutLabel, WorktreeRoot: checkout}
+	labelID := resolveSandboxJobID(spec.JobID, spec.WorktreeRoot)
+	layoutID := nz(strings.TrimSpace(spec.RunID), labelID)
+	if labelID != scmJobID || layoutID != worktreeID {
+		t.Fatalf("launch spec resolution: job=%s layout=%s", labelID, layoutID)
+	}
+}
+
 func TestWriteAgentBriefVisiblePath(t *testing.T) {
 	dir := t.TempDir()
 	checkout := filepath.Join(dir, "job1", "sandbox")

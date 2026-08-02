@@ -69,8 +69,11 @@ func parseApprovalPolicy(raw string) (*approvalPolicy, error) {
 	for k := range probe {
 		switch k {
 		case "version", "require", "block_if", "route", "on_fail":
+			// known clamp-only keys
 		case "approve_if", "allow_if", "widen":
 			return nil, fmt.Errorf("policy contains forbidden widening key %q", k)
+		default:
+			return nil, fmt.Errorf("policy contains unknown key %q (fail closed)", k)
 		}
 	}
 	if p.OnFail == "" {
@@ -102,8 +105,9 @@ func evaluateApproval(ev approvalEvidence) approvalDecision {
 		return d
 	}
 
-	autoOn := ev.Prefs.AutoApprove || ev.MinScore > 0
-	if !autoOn {
+	// AutoApprove is the sole grant switch. MinScore is veto-only and must
+	// never promote auto-approve on its own.
+	if !ev.Prefs.AutoApprove {
 		add("auto_approve off")
 		d.Event = "COMMENT"
 		d.Reasons = reasons
@@ -230,14 +234,15 @@ func severityAtLeast(have, want string) bool {
 	return order[strings.ToLower(have)] >= order[strings.ToLower(want)] && order[strings.ToLower(want)] > 0
 }
 
-// decideOPAReviewEvent keeps the legacy signature. Confidence is veto-only:
-// it can block but never grant APPROVE. Call evaluateApproval for real APPROVE.
+// decideOPAReviewEvent keeps the legacy signature. Confidence/MinScore is
+// veto-only and never grants APPROVE (AutoApprove stays off here). Prefer
+// evaluateApproval with explicit prefs for real APPROVE decisions.
 func decideOPAReviewEvent(res aiReviewResult, minScore int) string {
 	ev := approvalEvidence{
 		Bugbot:   res,
 		MinScore: minScore,
 		BugbotOK: strings.ToLower(res.Status) != "skipped" && strings.ToLower(res.Status) != "error" && strings.ToLower(res.Status) != "failed",
-		Prefs:    agentPrefs{AutoApprove: minScore > 0},
+		Prefs:    agentPrefs{AutoApprove: false},
 	}
 	d := evaluateApproval(ev)
 	return d.Event
