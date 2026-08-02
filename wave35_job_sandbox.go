@@ -119,6 +119,11 @@ func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([
 	if err := assertJobBindPath(hostDir, layoutID); err != nil {
 		return nil, err
 	}
+	ensureSandboxWorkWritable(hostDir)
+	// When we bind the layout root, make sure that tree is writable too.
+	if base := filepath.Base(hostDir); base == "primary" || base == "sandbox" || base == "related" {
+		ensureSandboxWorkWritable(filepath.Dir(hostDir))
+	}
 
 	envSpec := jobEnvSpec{
 		Phase:        spec.Phase,

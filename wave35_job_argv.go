@@ -119,9 +119,19 @@ func buildDockerRunArgv(spec dockerRunSpec) ([]string, error) {
 	if spec.ReadOnlyBind {
 		bindMode = "ro"
 	}
-	// Bind job root so identity path is /opa-jobs/<id>/… matching prompts when
-	// OPA_REVIEW_TMP=/opa-jobs on the orchestrator.
-	argv = append(argv, "-v", host+":"+containerCwd+":"+bindMode)
+	// Bind the job layout root at /opa-jobs/<id> when WorkHostPath is a leaf
+	// (primary|sandbox|…). Leaf-only binds made the parent path land on the
+	// read-only container root (npm EACCES mkdir /opa-jobs/<id>).
+	bindHost := host
+	bindCont := containerCwd
+	if base := filepath.Base(host); base == rel || base == "primary" || base == "sandbox" || base == "related" {
+		parent := filepath.Dir(host)
+		if parent != "" && parent != "/" && parent != "." {
+			bindHost = parent
+			bindCont = containerWork
+		}
+	}
+	argv = append(argv, "-v", bindHost+":"+bindCont+":"+bindMode)
 	argv = append(argv, "-w", containerCwd)
 	for _, b := range spec.ExtraBinds {
 		b = strings.TrimSpace(b)
