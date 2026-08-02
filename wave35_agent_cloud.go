@@ -117,6 +117,13 @@ func runCloudStages(job *scmJob, conn *opaConnector, keys []string) (map[string]
 	var lastErr error
 
 	for i := 1; i <= max; i++ {
+		if cloudJobMustAbort(job) {
+			out["status"] = "cancelled"
+			out["honesty"] = "superseded/cancelled — aborting cloud stages"
+			out["attempts"] = attempts
+			out["iterations"] = i
+			return out, fmt.Errorf("%s", out["honesty"])
+		}
 		auth, err := authorizeAutofixRequestAttempt(conn, prefs, job.RepoFullName, ledger, keys, i == 1)
 		if err != nil {
 			out["status"] = "refused"
@@ -355,6 +362,11 @@ func runOneCloudAttempt(job *scmJob, conn *opaConnector, auth autofixAuthOK, pre
 // and pushes. The agent-writable sandbox is not used for land.
 func landValidatedPatch(job *scmJob, conn *opaConnector, landWtID, baseSHA, branch, patch string, auth autofixAuthOK) (map[string]interface{}, error) {
 	out := map[string]interface{}{}
+	if cloudJobMustAbort(job) {
+		out["status"] = "cancelled"
+		out["honesty"] = "superseded/cancelled — refusing land"
+		return out, fmt.Errorf("%s", out["honesty"])
+	}
 	if err := authorizeGitPush(conn); err != nil {
 		out["status"] = "failed"
 		out["honesty"] = err.Error()
@@ -402,6 +414,12 @@ func landValidatedPatch(job *scmJob, conn *opaConnector, landWtID, baseSHA, bran
 		out["pr_url"] = fmt.Sprintf("https://github.com/%s/pull/mock-autofix", job.RepoFullName)
 		out["honesty"] = "mock land on clean tree"
 		return out, nil
+	}
+
+	if cloudJobMustAbort(job) {
+		out["status"] = "cancelled"
+		out["honesty"] = "superseded/cancelled — refusing push"
+		return out, fmt.Errorf("%s", out["honesty"])
 	}
 
 	if err := gitPushBranch(conn, landRoot, branch, job.RepoFullName); err != nil {
@@ -457,7 +475,8 @@ func runCloudVerify(job *scmJob, workRoot string) (map[string]interface{}, error
 	}
 	policed := intersectSpecWithPolicy(rawPlan)
 	ctx := scmJobContext(job.ID)
-	result, _ := runCheckupPlan(ctx, nz(job.RunID, job.ID)+"-cloud-verify", workRoot, policed.Plan)
+	// Use the cloud child id so cancel/teardown by opa.job hits verify boxes.
+	result, _ := runCheckupPlan(ctx, job.ID, workRoot, policed.Plan)
 	m := map[string]interface{}{
 		"status": result.Status, "honesty": result.Honesty, "drops": policed.Drops,
 	}
@@ -465,6 +484,32 @@ func runCloudVerify(job *scmJob, workRoot string) (map[string]interface{}, error
 		return m, fmt.Errorf("%s", nz(result.Honesty, result.Status))
 	}
 	return m, nil
+}
+
+// cloudJobMustAbort is true when the cloud child (or its parent run) was cancelled
+// or marked supersede_drain — land/push must not proceed on a stale SHA.
+func cloudJobMustAbort(job *scmJob) bool {
+	if job == nil {
+		return false
+	}
+	// Re-load live row so drain flags set by cancel cascade are visible.
+	live := getSCMJob(job.ID)
+	if live == nil {
+		live = job
+	}
+	if scmJobIsCancelled(live.ID) || (live.RunID != "" && scmJobIsCancelled(live.RunID)) {
+		return true
+	}
+	if live.Summary == nil {
+		return false
+	}
+	if live.Summary["supersede_drain"] == true {
+		return true
+	}
+	if live.Summary["cancel_drain"] != nil && strFromAny(live.Summary["cancel_drain"]) != "" {
+		return true
+	}
+	return false
 }
 
 var opaFixBranchSafe = regexp.MustCompile(`[^a-zA-Z0-9._/-]+`)

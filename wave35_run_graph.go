@@ -399,7 +399,12 @@ func runPrepareAgent(job *scmJob) error {
 	if sandboxMode() == "docker" && absRoot != "" {
 		if sb, n, merr := materializeSandboxTreeForJob(worktreeID, absRoot); merr != nil {
 			job.Summary["sandbox_tree_error"] = merr.Error()
-			LogWarn("sandbox tree materialize", map[string]interface{}{"error": merr.Error(), "job": job.ID})
+			if !allowHostExecFallback() {
+				return fmt.Errorf("sandbox materialize failed (set OPA_JOB_ALLOW_HOST_EXEC=1 to fall back): %w", merr)
+			}
+			stampSandboxHonesty(job.ID, "UNSANDBOXED: prepare fell back to primary .git (OPA_JOB_ALLOW_HOST_EXEC=1; materialize failed)")
+			job.Summary["sandbox_fallback"] = "host_exec"
+			LogWarn("sandbox tree materialize — host fallback", map[string]interface{}{"error": merr.Error(), "job": job.ID})
 		} else if sb != "" {
 			job.Summary["sandbox_tree"] = sb
 			job.Summary["sandbox_file_count"] = n

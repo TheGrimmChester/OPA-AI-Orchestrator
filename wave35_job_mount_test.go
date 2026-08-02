@@ -89,3 +89,35 @@ func TestWriteSandboxSecretsEnvFile(t *testing.T) {
 		t.Fatalf("secrets env must be 0600, got %v", info.Mode())
 	}
 }
+
+func TestRelatedROBind(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("OPA_REVIEW_TMP", tmp)
+	layout := "run-rel-1"
+	sandbox := filepath.Join(tmp, layout, "sandbox")
+	related := filepath.Join(tmp, layout, "related", "acme-shared")
+	if err := os.MkdirAll(sandbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(related, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jobID := "bugbot-child"
+	bind, ok := relatedROBind(sandbox, jobID, layout)
+	if !ok {
+		t.Fatal("expected related bind")
+	}
+	wantCont := "/opa-jobs/" + sanitizeDockerName(jobID) + "/related"
+	if !strings.Contains(bind, wantCont+":ro") {
+		t.Fatalf("want %s:ro in %s", wantCont, bind)
+	}
+	if !strings.HasPrefix(bind, filepath.Join(tmp, layout, "related")) {
+		t.Fatalf("bind host side: %s", bind)
+	}
+	if got := relatedContainerPath(jobID, "acme/shared"); got != wantCont+"/acme-shared" {
+		t.Fatalf("container path: %s", got)
+	}
+	if _, ok := relatedROBind(sandbox, jobID, "other-layout"); ok {
+		t.Fatal("cross-layout related bind must fail assertJobBindPath")
+	}
+}

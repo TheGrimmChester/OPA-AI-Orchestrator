@@ -139,3 +139,38 @@ func TestAuthorizeReauthSkipsRate(t *testing.T) {
 		t.Fatal("recording auth should hit rate limit")
 	}
 }
+
+func TestCloudJobMustAbortHonorsDrain(t *testing.T) {
+	job := &scmJob{ID: "cloud-1", RunID: "run-1", Status: "running", Summary: map[string]interface{}{}}
+	scmJobLive.Store(job.ID, job)
+	defer scmJobLive.Delete(job.ID)
+	if cloudJobMustAbort(job) {
+		t.Fatal("fresh cloud job must not abort")
+	}
+	job.Summary["supersede_drain"] = true
+	if !cloudJobMustAbort(job) {
+		t.Fatal("supersede_drain must abort land")
+	}
+	job.Summary = map[string]interface{}{"cancel_drain": "cancelled"}
+	if !cloudJobMustAbort(job) {
+		t.Fatal("cancel_drain must abort land")
+	}
+	job.Summary = map[string]interface{}{}
+	job.Status = "cancelled"
+	if !cloudJobMustAbort(job) {
+		t.Fatal("cancelled cloud child must abort")
+	}
+}
+
+func TestLandValidatedPatchRefusesDrain(t *testing.T) {
+	job := &scmJob{
+		ID: "cloud-land-1", RunID: "run-land-1", Status: "running",
+		RepoFullName: "acme/demo", Summary: map[string]interface{}{"supersede_drain": true},
+	}
+	scmJobLive.Store(job.ID, job)
+	defer scmJobLive.Delete(job.ID)
+	out, err := landValidatedPatch(job, &opaConnector{Kind: "github_app", InstallationID: "1"}, "wt-land", "sha", "opa-fix/x-1", "diff", autofixAuthOK{})
+	if err == nil || out["status"] != "cancelled" {
+		t.Fatalf("want cancelled refuse, got out=%v err=%v", out, err)
+	}
+}
