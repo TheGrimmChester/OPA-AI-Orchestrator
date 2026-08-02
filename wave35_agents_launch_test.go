@@ -72,6 +72,33 @@ func TestResolveSandboxJobID(t *testing.T) {
 	}
 }
 
+func TestGitleaksSandboxBindUsesCheckoutLayout(t *testing.T) {
+	// Security scans pass srun-* as runID but checkout lives under the SCM job/run folder.
+	tmp := t.TempDir()
+	t.Setenv("OPA_REVIEW_TMP", tmp)
+	scmJobID := "scm-job-abc"
+	securityRunID := "srun-be76e9a4c2814e13"
+	checkout := filepath.Join(tmp, scmJobID, "sandbox")
+	if err := os.MkdirAll(checkout, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Bug: resolveSandboxJobID(securityRunID, checkout) → srun-* and assertJobBindPath rejects.
+	if err := assertJobBindPath(checkout, resolveSandboxJobID(securityRunID, checkout)); err == nil {
+		t.Fatal("expected srun-* layout id to reject scm checkout bind")
+	}
+	layoutID := resolveSandboxJobID("", checkout)
+	workRel := sandboxWorkRel(checkout)
+	if layoutID != scmJobID {
+		t.Fatalf("path-derived layout want %s got %s", scmJobID, layoutID)
+	}
+	if workRel != "sandbox" {
+		t.Fatalf("workRel want sandbox got %s", workRel)
+	}
+	if err := assertJobBindPath(checkout, layoutID); err != nil {
+		t.Fatalf("path-derived layout must allow bind: %v", err)
+	}
+}
+
 func TestAutofixSandboxLabelsSplitJobFromLayout(t *testing.T) {
 	// Cloud patch worktrees are cloud-patch-<child>-N; cancel tears down opa.job=<child>.
 	scmJobID := "cloud-child-abc"

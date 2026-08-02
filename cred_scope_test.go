@@ -137,3 +137,27 @@ func TestCanSeeSCMJob(t *testing.T) {
 		t.Fatal("auth off + All should see all")
 	}
 }
+
+func TestSCMSecretStorageKey(t *testing.T) {
+	if got := scmSecretStorageKey("cursor_api_key", credScopeAdmin, ""); got != "cursor_api_key#admin" {
+		t.Fatalf("admin: %q", got)
+	}
+	if got := scmSecretStorageKey("cursor_api_key", credScopeUser, "alice"); got != "cursor_api_key#user:alice" {
+		t.Fatalf("user: %q", got)
+	}
+	if got := scmSecretStorageKey("cursor_api_key", credScopeOrg, "alice"); got != "cursor_api_key" {
+		t.Fatalf("org: %q", got)
+	}
+	logical, scope, user := parseSCMSecretStorageKey("cursor_api_key#admin")
+	if logical != "cursor_api_key" || scope != credScopeAdmin || user != "" {
+		t.Fatalf("parse admin: %q %q %q", logical, scope, user)
+	}
+	logical, scope, user = parseSCMSecretStorageKey("cursor_api_key#user:alice")
+	if logical != "cursor_api_key" || scope != credScopeUser || user != "alice" {
+		t.Fatalf("parse user: %q %q %q", logical, scope, user)
+	}
+	logical, scope, user = parseSCMSecretStorageKey("cursor_api_key")
+	if logical != "cursor_api_key" || scope != "" || user != "" {
+		t.Fatalf("parse org/legacy: %q %q %q", logical, scope, user)
+	}
+}

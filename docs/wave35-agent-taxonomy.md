@@ -68,7 +68,8 @@ See also [wave35-job-isolation.md](./wave35-job-isolation.md).
 - Prompt injection and publish-path exfil remain residual risks bounded by
   the capability envelope, not eliminated.
 - AI docker egress uses a **shared allowlist proxy** on `--internal` job nets;
-  unsettable `HTTP(S)_PROXY` is only a hint — see job-isolation Honesty.
+  `HTTP(S)_PROXY` is unsettable by the guest and only a hint — network boundary
+  is `--internal` (see job-isolation Honesty).
 - Checkup **phpstan** is best-effort new-errors-only when a baseline file exists
   **and** the neon includes it; no host-side error differ vs prior job yet.
 - Checkup per-step log viewer / stdout surfacing in the Dashboard is still a
