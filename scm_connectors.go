@@ -19,13 +19,15 @@ import (
 // Repo watch — GitHub Repo Watch connectors + settings.
 
 func registerRepoWatchMux(mux *http.ServeMux, authView, authAdmin func(string, http.HandlerFunc)) {
-	authView("/api/connectors", handleConnectorsList)
+	// Connector list/read accept user JWT or peer service JWT (connectors:read).
+	registerConnectorReadAuth(mux, "/api/connectors", handleConnectorsList)
 	authAdmin("/api/connectors/github/install-url", handleGitHubInstallURL)
 	mux.HandleFunc("/api/connectors/github/callback", handleGitHubCallback)
 	// PAT connect: viewer+ (scope gates in-handler — users can add personal PATs).
 	registerAISettingsAuth(mux, "/api/connectors/github/pat", handleGitHubPATConnect)
-	// Connector sub-routes: viewer+; mutate gates live in-handler (owner / org-admin / admin).
-	registerAISettingsAuth(mux, "/api/connectors/", handleConnectorSub)
+	// Connector sub-routes: viewer+ or peer service; mutate gates live in-handler.
+	registerConnectorReadAuth(mux, "/api/connectors/", handleConnectorSub)
+	registerPeerSCMMux(mux)
 	authView("/api/scm/jobs", handleSCMJobsList)
 	authAdmin("/api/scm/jobs/resume", handleSCMJobsResume)
 	registerSCMAuthFlexible(mux, "/api/scm/jobs/", handleSCMJobSub)
@@ -47,6 +49,22 @@ func registerRepoWatchMux(mux *http.ServeMux, authView, authAdmin func(string, h
 	authAdmin("/api/scm/context-links", handleContextLinks)
 	registerSCMAuthFlexible(mux, "/api/scm/contexts/", handleReviewContextSub)
 	startSCMCronOnce()
+}
+
+// registerConnectorReadAuth allows user JWTs (viewer+) or peer service JWTs with
+// connectors:read. Mutations require a user JWT so peers cannot bootstrap PATs.
+func registerConnectorReadAuth(mux *http.ServeMux, pattern string, h http.HandlerFunc) {
+	mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+		if !authEnforced {
+			h(w, r)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+			AuthMiddleware(h, "viewer")(w, r)
+			return
+		}
+		AuthUserOrServiceMiddleware(h, "viewer", "connectors:read")(w, r)
+	})
 }
 
 // registerSCMAuthFlexible wraps a handler so GET/HEAD are viewer-scoped and
