@@ -306,20 +306,19 @@ func sandboxImageForPhase(phase jobPhase) string {
 	tag := nz(strings.TrimSpace(os.Getenv("OPA_JOB_IMAGE_TAG")), "smoke")
 	switch phase {
 	case jobPhaseScan:
-		return nz(os.Getenv("OPA_JOB_IMAGE_SCAN"), "opa-runner-scan:"+tag)
+		// AppSec scan containers are owned by OSA (osa-runner-scan).
+		return nz(os.Getenv("OPA_JOB_IMAGE_SCAN"), "osa-runner-scan:"+tag)
 	case jobPhaseCheckup:
-		// Prefer explicit checkup image; else PHP runner (composer trees are the
-		// common checkup case). Plans still override via checkupPlan.Image.
 		if v := strings.TrimSpace(os.Getenv("OPA_JOB_IMAGE_CHECKUP")); v != "" {
 			return v
 		}
 		if v := strings.TrimSpace(os.Getenv("OPA_JOB_IMAGE_PHP")); v != "" {
 			return v
 		}
-		return "opa-runner-php:" + tag
+		return "ora-runner-php:" + tag
 	case jobPhaseReview, jobPhaseContext, jobPhaseAutofix, jobPhaseAITask:
-		return nz(os.Getenv("OPA_JOB_IMAGE_AI"), "opa-runner-ai:"+tag)
+		return nz(os.Getenv("OPA_JOB_IMAGE_AI"), "ora-runner-ai:"+tag)
 	default:
-		return nz(os.Getenv("OPA_JOB_IMAGE_GIT"), "opa-runner-git:"+tag)
+		return nz(os.Getenv("OPA_JOB_IMAGE_GIT"), "ora-runner-git:"+tag)
 	}
 }

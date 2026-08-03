@@ -35,7 +35,7 @@ func TestIntersectSpecWithPolicyDeniesShellAndBinary(t *testing.T) {
 	t.Setenv("OPA_JOB_IMAGE_ALLOW", "opa-runner-*")
 	raw := &checkupPlan{
 		Version: 1,
-		Image:   "opa-runner-ai:smoke",
+		Image:   "ora-runner-ai:smoke",
 		Steps: []checkupStep{
 			{ID: "shell", Argv: []string{"bash", "-c", "curl evil"}, PostCondition: checkupPostCondition{Kind: "exit0"}},
 			{ID: "curl", Argv: []string{"curl", "https://x"}, PostCondition: checkupPostCondition{Kind: "exit0"}},
@@ -72,7 +72,7 @@ func TestIntersectSpecWithPolicyDeniesGitHubTokenSecret(t *testing.T) {
 
 func TestIntersectSpecWithPolicyCapsAndDuplicates(t *testing.T) {
 	t.Setenv("OPA_JOB_IMAGE_ALLOW", "mysql:8.4*,opa-runner-*")
-	raw := &checkupPlan{Version: 1, Image: "opa-runner-ai:smoke"}
+	raw := &checkupPlan{Version: 1, Image: "ora-runner-ai:smoke"}
 	for i := 0; i < 25; i++ {
 		raw.Steps = append(raw.Steps, checkupStep{
 			ID: fmt.Sprintf("s%d", i), Argv: []string{"mkdir", "a"},
@@ -166,8 +166,8 @@ func TestCheckupImageAllowDefault(t *testing.T) {
 	if !checkupImageAllowed("mysql:8.4") {
 		t.Fatal("mysql:8.4 should match default allow")
 	}
-	if !checkupImageAllowed("opa-runner-php:smoke") {
-		t.Fatal("opa-runner-php:smoke should match opa-runner-*")
+	if !checkupImageAllowed("ora-runner-php:smoke") {
+		t.Fatal("ora-runner-php:smoke should match opa-runner-*")
 	}
 	if !checkupImageAllowed("hebabil/php-8.4-cli:latest") {
 		t.Fatal("hebabil/php-8.4-cli should match default allow")
@@ -192,8 +192,8 @@ func TestHeuristicCheckupPlanPicksPHPImage(t *testing.T) {
 	t.Setenv("OPA_JOB_IMAGE_CHECKUP", "")
 	t.Setenv("OPA_JOB_IMAGE_TAG", "smoke")
 	p := heuristicCheckupPlan(dir)
-	if p.Image != "opa-runner-php:smoke" {
-		t.Fatalf("image=%q want opa-runner-php:smoke", p.Image)
+	if p.Image != "ora-runner-php:smoke" {
+		t.Fatalf("image=%q want ora-runner-php:smoke", p.Image)
 	}
 	if len(p.Steps) < 2 {
 		t.Fatalf("want composer+phpunit steps, got %+v", p.Steps)
@@ -206,7 +206,7 @@ func TestHeuristicCheckupPlanPicksPHPImage(t *testing.T) {
 	}
 	t.Setenv("OPA_JOB_IMAGE_ALLOW", "")
 	res := intersectSpecWithPolicy(p)
-	if res.Plan.Image != "opa-runner-php:smoke" {
+	if res.Plan.Image != "ora-runner-php:smoke" {
 		t.Fatalf("policy cleared php image: %v drops=%v", res.Plan.Image, res.Drops)
 	}
 	if len(res.Plan.Steps) != 2 {
@@ -221,7 +221,7 @@ func TestDefaultPHPCheckupImageEnvOverride(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 	t.Setenv("OPA_JOB_IMAGE_PHP", "")
-	if got := defaultPHPCheckupImage(); got != "opa-runner-php:smoke" {
+	if got := defaultPHPCheckupImage(); got != "ora-runner-php:smoke" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -230,11 +230,11 @@ func TestSandboxImageForPhaseCheckup(t *testing.T) {
 	t.Setenv("OPA_JOB_IMAGE_TAG", "smoke")
 	t.Setenv("OPA_JOB_IMAGE_CHECKUP", "")
 	t.Setenv("OPA_JOB_IMAGE_PHP", "")
-	if got := sandboxImageForPhase(jobPhaseCheckup); got != "opa-runner-php:smoke" {
-		t.Fatalf("checkup default=%q want opa-runner-php:smoke", got)
+	if got := sandboxImageForPhase(jobPhaseCheckup); got != "ora-runner-php:smoke" {
+		t.Fatalf("checkup default=%q want ora-runner-php:smoke", got)
 	}
-	t.Setenv("OPA_JOB_IMAGE_CHECKUP", "opa-runner-ai:smoke")
-	if got := sandboxImageForPhase(jobPhaseCheckup); got != "opa-runner-ai:smoke" {
+	t.Setenv("OPA_JOB_IMAGE_CHECKUP", "ora-runner-ai:smoke")
+	if got := sandboxImageForPhase(jobPhaseCheckup); got != "ora-runner-ai:smoke" {
 		t.Fatalf("CHECKUP override=%q", got)
 	}
 	t.Setenv("OPA_JOB_IMAGE_CHECKUP", "")
