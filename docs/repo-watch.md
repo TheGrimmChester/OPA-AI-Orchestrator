@@ -38,7 +38,7 @@ Harness: `OPA-stack/harness/appsec-pr-check.sh`
 | Env | Purpose |
 |-----|---------|
 | `OPA_GITHUB_APP_ID` | App id |
-| `OPA_GITHUB_APP_SLUG` | apps/… slug |
+| `OPA_GITHUB_APP_SLUG` | GitHub App slug (`https://github.com/apps/<slug>`). Used as the reviewer login for Apps. Code fallback is `ora`; **production must set the installed App’s real slug** (NAS currently uses `opa-ai-orchestrator` via compose `.env`). |
 | `OPA_GITHUB_APP_CLIENT_ID` / `CLIENT_SECRET` | OAuth (optional) |
 | `OPA_GITHUB_APP_PRIVATE_KEY` | PEM (use `\n` for newlines in env) |
 | `OPA_GITHUB_WEBHOOK_SECRET` | HMAC |
