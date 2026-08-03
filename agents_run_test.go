@@ -219,3 +219,58 @@ func TestRebuildPRRunIndexFromLive(t *testing.T) {
 		t.Fatalf("rebuild missed live run; got %q", currentPRRun(repo, pr))
 	}
 }
+
+func TestSupersedeSameSHADoesNotCancel(t *testing.T) {
+	const repo = "acme/same-sha-supersede"
+	const pr = 44
+	sha := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	run := &scmJob{
+		ID: "same-sha-run", RepoFullName: repo, PRNumber: pr, CommitSHA: sha,
+		Status: "running", Kind: string(kindRun), RunID: "same-sha-run",
+		Summary: map[string]interface{}{"child_ids": []string{}},
+		StartedAt: "2026-08-01 11:00:00.000",
+	}
+	scmJobLive.Store(run.ID, run)
+	t.Cleanup(func() {
+		scmJobLive.Delete(run.ID)
+		prRunIndexMu.Lock()
+		delete(prRunIndex, prRunIndexKey(repo, pr))
+		prRunIndexMu.Unlock()
+	})
+	ids := supersedeInFlightPRJobs(repo, pr, sha)
+	if len(ids) != 0 {
+		t.Fatalf("same SHA must not cancel live run, got %v", ids)
+	}
+	if getSCMJob(run.ID).Status != "running" {
+		t.Fatalf("status=%s want running", getSCMJob(run.ID).Status)
+	}
+}
+
+func TestEnqueuePRRunReusesInFlightSameSHA(t *testing.T) {
+	const repo = "acme/reuse-same-sha"
+	const pr = 45
+	sha := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	prior := &scmJob{
+		ID: "reuse-run", RepoFullName: repo, PRNumber: pr, CommitSHA: sha,
+		Status: "running", Kind: string(kindRun), RunID: "reuse-run",
+		Summary: map[string]interface{}{"child_ids": []string{}},
+		StartedAt: "2026-08-01 11:00:00.000",
+	}
+	scmJobLive.Store(prior.ID, prior)
+	rememberPRRun(repo, pr, prior.ID)
+	t.Cleanup(func() {
+		scmJobLive.Range(func(k, v interface{}) bool {
+			if j, ok := v.(*scmJob); ok && j != nil && strings.EqualFold(j.RepoFullName, repo) && j.PRNumber == pr {
+				scmJobLive.Delete(k)
+			}
+			return true
+		})
+		prRunIndexMu.Lock()
+		delete(prRunIndex, prRunIndexKey(repo, pr))
+		prRunIndexMu.Unlock()
+	})
+	job := enqueuePRRun(nil, nil, repo, pr, sha, "manual", false, "t", "")
+	if job == nil || job.ID != prior.ID {
+		t.Fatalf("want reuse %s, got %+v", prior.ID, job)
+	}
+}
