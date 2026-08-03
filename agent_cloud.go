@@ -318,25 +318,32 @@ func runOneCloudAttempt(job *scmJob, conn *opaConnector, auth autofixAuthOK, pre
 	}
 	out["patch_bytes"] = len(validatedPatch)
 
-	// suggest mode: post proposal, do not land.
+	// suggest mode: post proposal, do not land. Post failure fails the attempt —
+	// do not claim "proposal posted" when GitHub create returned an error.
 	if auth.Mode == "suggest" {
 		body := formatCloudSuggestComment(job, auth, changes, branch)
 		owner, repoName := splitOwnerRepo(job.RepoFullName)
-		if job.PRNumber > 0 && conn != nil {
-			id, err := githubPRCommentCreate(conn, owner, repoName, job.PRNumber, body)
-			post := JobEvidencePost{
-				Type: "suggest", Target: "issue_comment", GitHubID: id, Body: body,
-			}
-			if err != nil {
-				post.Status = "error"
-				post.Error = err.Error()
-				out["suggest_post_error"] = err.Error()
-			} else {
-				post.Status = "created"
-				post.URL = fmt.Sprintf("https://github.com/%s/%s/pull/%d#issuecomment-%d", owner, repoName, job.PRNumber, id)
-			}
-			appendEvidencePost(job, post)
+		if job.PRNumber <= 0 || conn == nil {
+			out["status"] = "failed"
+			out["honesty"] = "suggest mode — missing PR or connector; cannot post proposal"
+			return out, fmt.Errorf("%s", out["honesty"])
 		}
+		id, err := githubPRCommentCreate(conn, owner, repoName, job.PRNumber, body)
+		post := JobEvidencePost{
+			Type: "suggest", Target: "issue_comment", GitHubID: id, Body: body,
+		}
+		if err != nil {
+			post.Status = "error"
+			post.Error = err.Error()
+			appendEvidencePost(job, post)
+			out["suggest_post_error"] = err.Error()
+			out["status"] = "failed"
+			out["honesty"] = "suggest mode — proposal post failed: " + err.Error()
+			return out, err
+		}
+		post.Status = "created"
+		post.URL = fmt.Sprintf("https://github.com/%s/%s/pull/%d#issuecomment-%d", owner, repoName, job.PRNumber, id)
+		appendEvidencePost(job, post)
 		out["status"] = "suggest"
 		out["honesty"] = "suggest mode — proposal posted, no land"
 		return out, nil
