@@ -94,9 +94,42 @@ func processPRRun(jobID string) {
 	}
 }
 
+// finalizeGraphRun folds issue_run / roadmap_run parents when all children are terminal.
+func finalizeGraphRun(runID string) {
+	job := getSCMJob(runID)
+	if job == nil {
+		return
+	}
+	children := listRunChildren(runID)
+	for _, c := range children {
+		if c == nil || c.Summary == nil {
+			continue
+		}
+		if job.Summary == nil {
+			job.Summary = map[string]interface{}{}
+		}
+		for _, k := range []string{
+			"findings", "spec_draft", "implement", "roadmap", "discovery",
+			"competitor_analysis", "publish", "checkout_path", "issue_status",
+		} {
+			if v, ok := c.Summary[k]; ok {
+				job.Summary[k] = v
+			}
+		}
+	}
+	job.Status = foldRunStatus(children, job.Status)
+	job.FinishedAt = time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	_ = finalizeJobEvidence(job)
+	persistSCMJob(job)
+}
+
 func finalizePRRun(runID string) {
 	job := getSCMJob(runID)
 	if job == nil {
+		return
+	}
+	if agentKind(job.Kind) == kindIssueRun || agentKind(job.Kind) == kindRoadmapRun {
+		finalizeGraphRun(runID)
 		return
 	}
 	children := listRunChildren(runID)
@@ -308,6 +341,18 @@ func processAgentChild(jobID string) {
 		err = runApprovalAgent(job)
 	case kindCloud:
 		err = runCloudAgent(job)
+	case kindIssuePrepare:
+		err = runIssuePrepareAgent(job)
+	case kindIssueInvestigate:
+		err = runIssueInvestigateAgent(job)
+	case kindIssuePublish:
+		err = runIssuePublishAgent(job)
+	case kindIssueImplement:
+		err = runIssueImplementAgent(job)
+	case kindRoadmapGenerate:
+		err = runRoadmapGenerateAgent(job)
+	case kindRoadmapPublish:
+		err = runRoadmapPublishAgent(job)
 	default:
 		err = fmt.Errorf("unknown agent kind %q", job.Kind)
 	}

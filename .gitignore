@@ -1,5 +1,6 @@
-/opa-orchestrator
-/opa-perf-lab
 *.exe
 *.test
+/opa-orchestrator
+/opa-perf-lab
 /tmp/
+opa-ai-orchestrator
