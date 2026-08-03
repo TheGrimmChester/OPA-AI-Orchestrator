@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,6 +44,10 @@ type sandboxExecSpec struct {
 	// also get label opa.run=<id> so parent-run cancel can reap them.
 	LayoutID  string
 	NetworkID string
+	// LivePhase / LiveUnit drive mid-run artifacts/live.log + Summary["live"].
+	// LivePhase overrides string(Phase) when set (e.g. "synth").
+	LivePhase string
+	LiveUnit  string
 }
 
 func getSandboxRunner() jobSandboxRunner {
@@ -76,7 +81,9 @@ func (hostSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([]b
 		cmd.Dir = spec.HostWorkDir
 	}
 	cmd.Env = env
-	out, err := cmd.CombinedOutput()
+	sink := liveSinkForSpec(spec)
+	defer sink.Close()
+	out, err := runCmdWithLiveSink(cmd, sink)
 	out = redactJobOutput(out, secretValues(spec.Secrets)...)
 	return out, err
 }
@@ -187,7 +194,9 @@ func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([
 		if err != nil {
 			return nil, err
 		}
-		out, err := dockerCmd(ctx, runArgv...)
+		sink := liveSinkForSpec(spec)
+		defer sink.Close()
+		out, err := dockerCmdCapture(ctx, sink, runArgv...)
 		out = redactJobOutput(out, secretValues(spec.Secrets)...)
 		return out, err
 	}
@@ -218,7 +227,9 @@ func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([
 	}
 	execArgv = append(execArgv, name)
 	execArgv = append(execArgv, spec.Argv...)
-	out, err := dockerCmd(ctx, execArgv...)
+	sink := liveSinkForSpec(spec)
+	defer sink.Close()
+	out, err := dockerCmdCapture(ctx, sink, execArgv...)
 	out = redactJobOutput(out, secretValues(spec.Secrets)...)
 	return out, err
 }
@@ -291,11 +302,26 @@ func stampSandboxHonesty(jobID, honesty string) {
 }
 
 func dockerCmd(ctx context.Context, args ...string) ([]byte, error) {
+	return dockerCmdCapture(ctx, nil, args...)
+}
+
+func dockerCmdCapture(ctx context.Context, sink *liveOutputSink, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "docker", args...)
+	return runCmdWithLiveSink(cmd, sink)
+}
+
+func runCmdWithLiveSink(cmd *exec.Cmd, sink *liveOutputSink) ([]byte, error) {
 	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	var w io.Writer = &buf
+	if sink != nil {
+		w = io.MultiWriter(&buf, sink)
+	}
+	cmd.Stdout = w
+	cmd.Stderr = w
 	err := cmd.Run()
+	if sink != nil {
+		sink.Flush(true)
+	}
 	return buf.Bytes(), err
 }
 

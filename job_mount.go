@@ -68,8 +68,22 @@ func ensureSandboxWorkWritable(hostDir string) {
 		return
 	}
 	const uid, gid = 65532, 65532
+	// Layout root (parent of primary|sandbox): only fix the directory inode —
+	// recursive walk belongs on the leaf the agent actually writes.
+	if isJobLayoutRoot(hostDir) {
+		_ = os.Chown(hostDir, uid, gid)
+		_ = os.Chmod(hostDir, 0o775)
+		return
+	}
 	_ = filepath.Walk(hostDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info == nil {
+			return nil
+		}
+		base := filepath.Base(path)
+		if base == ".git" {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		_ = os.Chown(path, uid, gid)
@@ -78,13 +92,13 @@ func ensureSandboxWorkWritable(hostDir string) {
 		}
 		return nil
 	})
-	// Also fix the layout root (parent of primary|sandbox) when present.
-	base := filepath.Base(hostDir)
-	if base == "primary" || base == "sandbox" || base == "related" {
-		parent := filepath.Dir(hostDir)
-		if parent != "" && parent != "/" && underOPAReviewTmp(parent) {
-			_ = os.Chown(parent, uid, gid)
-			_ = os.Chmod(parent, 0o775)
-		}
+}
+
+func isJobLayoutRoot(dir string) bool {
+	if !underOPAReviewTmp(dir) {
+		return false
 	}
+	_, e1 := os.Stat(filepath.Join(dir, "primary"))
+	_, e2 := os.Stat(filepath.Join(dir, "sandbox"))
+	return e1 == nil || e2 == nil
 }

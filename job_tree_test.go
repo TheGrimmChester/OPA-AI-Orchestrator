@@ -95,7 +95,11 @@ func TestSyncSandboxTreeToPrimary(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(sandbox, "new.go"), []byte("package new\n"), 0o644)
 	_ = os.Remove(filepath.Join(sandbox, "gone.go"))
 
-	if err := syncSandboxTreeToPrimary(sandbox, primary); err != nil {
+	tracked, err := gitTrackedRelPaths(primary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syncSandboxTreeToPrimary(sandbox, primary, tracked); err != nil {
 		t.Fatal(err)
 	}
 	raw, _ := os.ReadFile(filepath.Join(primary, "keep.go"))
@@ -110,6 +114,73 @@ func TestSyncSandboxTreeToPrimary(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(primary, ".git")); err != nil {
 		t.Fatal("primary .git must remain")
+	}
+}
+
+func TestSyncSandboxTreeToPrimaryUsesPreAgentTracked(t *testing.T) {
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "primary")
+	sandbox := filepath.Join(dir, "sandbox")
+	must := func(d string, args ...string) {
+		t.Helper()
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = d
+		cmd.Env = hostToolEnv()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v (%s)", args, err, out)
+		}
+	}
+	_ = os.MkdirAll(primary, 0o755)
+	must(primary, "git", "init")
+	must(primary, "git", "config", "user.email", "t@example.com")
+	must(primary, "git", "config", "user.name", "t")
+	_ = os.WriteFile(filepath.Join(primary, "keep.go"), []byte("package keep\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(primary, "gone.go"), []byte("package gone\n"), 0o644)
+	must(primary, "git", "add", ".")
+	must(primary, "git", "commit", "-m", "init")
+
+	tracked, err := gitTrackedRelPaths(primary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = materializeTreeWithCheckoutIndex(primary, sandbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(sandbox, "keep.go"), []byte("package keep\n// patched\n"), 0o644)
+	_ = os.Remove(filepath.Join(sandbox, "gone.go"))
+	// Simulate agent corrupting primary/.git after the pre-agent snapshot.
+	if err := os.RemoveAll(filepath.Join(primary, ".git")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := syncSandboxTreeToPrimary(sandbox, primary, tracked); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(primary, "keep.go"))
+	if !strings.Contains(string(raw), "patched") {
+		t.Fatalf("keep.go not synced: %s", raw)
+	}
+	if _, err := os.Stat(filepath.Join(primary, "gone.go")); err == nil {
+		t.Fatal("gone.go should be removed using pre-agent tracked list")
+	}
+}
+
+func TestSyncSandboxTreeToPrimaryNilTrackedWhenGitBroken(t *testing.T) {
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "primary")
+	sandbox := filepath.Join(dir, "sandbox")
+	_ = os.MkdirAll(primary, 0o755)
+	_ = os.MkdirAll(sandbox, 0o755)
+	_ = os.WriteFile(filepath.Join(primary, "a.go"), []byte("old\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(sandbox, "a.go"), []byte("new\n"), 0o644)
+	// No .git → ls-files fails; sync should still copy and not error.
+	if err := syncSandboxTreeToPrimary(sandbox, primary, nil); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(primary, "a.go"))
+	if string(raw) != "new\n" {
+		t.Fatalf("want copy-only sync, got %q", raw)
 	}
 }
 

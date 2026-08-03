@@ -33,6 +33,15 @@ bounded re-auth iterations, babysit deleted).
 **Dashboard Agents UI** (tri-state prefs, run DAG detail) ships in OPA-Dashboard
 against the prefs/promote APIs — not a remaining orchestrator gap.
 
+## Job evidence (structured history)
+
+Each child finalizes a versioned `summary.evidence` object (also returned as
+top-level `evidence` on `GET /api/scm/jobs/{id}`). Sections: context (prefs,
+briefs), chat (model/transcript), results (kind-specific), posts (GitHub
+résumé/inline/decision/suggest with ids), findings, auto_fixes. Full blobs live
+under `$OPA_SCM_STATE_DIR/jobs/{id}/artifacts/`. See [repo-watch.md](repo-watch.md)
+API notes (`?view=ops|org|client`, artifact GET).
+
 ## Enable cloud locally
 
 Set repo/installation prefs:
@@ -44,6 +53,10 @@ Set repo/installation prefs:
 Optional verify: `"cloud_run_tests": true` with `OPA_JOB_SANDBOX=docker`.
 Requires a `github_app` connector — PAT push is refused.
 `OPA_CLOUD_MAX_ITERATIONS` defaults to 3 (clamped 1–3).
+
+To disable Cloud, set `cloud_enabled: false` and/or `autofix_mode: "off"`. The
+run still enqueues a **skipped** `kind=cloud` child so Approval (which depends on
+Cloud) becomes ready; it does not hang waiting on a missing child.
 
 See also [job-isolation.md](./job-isolation.md).
 
@@ -68,6 +81,7 @@ See also [job-isolation.md](./job-isolation.md).
 - Prompt injection and publish-path exfil remain residual risks bounded by
   the capability envelope, not eliminated.
 - Approval waits for cloud (plus bugbot/security) so `pending_autofix` cannot race.
+  When Cloud is disabled, the cloud child is still planned as `skipped`.
 - AI docker egress uses a **shared allowlist proxy** on `--internal` job nets;
   `HTTP(S)_PROXY` is unsettable by the guest and only a hint — network boundary
   is `--internal` (see job-isolation Honesty).

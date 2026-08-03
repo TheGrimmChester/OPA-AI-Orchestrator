@@ -254,6 +254,16 @@ func runOneCloudAttempt(job *scmJob, conn *opaConnector, auth autofixAuthOK, pre
 			out["sandbox_tree"] = agentRoot
 			out["sandbox_file_count"] = n
 		}
+		var tracked []string
+		if agentRoot != absRoot {
+			var terr error
+			tracked, terr = gitTrackedRelPaths(absRoot)
+			if terr != nil {
+				out["status"] = "failed"
+				out["honesty"] = "cloud.patch pre-sync ls-files: " + terr.Error()
+				return out, terr
+			}
+		}
 		fixStub := &opaAutoFixJob{ID: fmt.Sprintf("%s-%d", job.ID, iteration), FindingKeys: keysFromFindings(auth.Findings), Findings: findings}
 		if err := runAutoFixAgent(job, agentRoot, job.ID, patchWtID, fixStub); err != nil {
 			out["status"] = "failed"
@@ -261,7 +271,7 @@ func runOneCloudAttempt(job *scmJob, conn *opaConnector, auth autofixAuthOK, pre
 			return out, err
 		}
 		if agentRoot != absRoot {
-			if serr := syncSandboxTreeToPrimary(agentRoot, absRoot); serr != nil {
+			if serr := syncSandboxTreeToPrimary(agentRoot, absRoot, tracked); serr != nil {
 				out["status"] = "failed"
 				out["honesty"] = "cloud.patch sync: " + serr.Error()
 				return out, serr
@@ -313,7 +323,11 @@ func runOneCloudAttempt(job *scmJob, conn *opaConnector, auth autofixAuthOK, pre
 		body := formatCloudSuggestComment(job, auth, changes, branch)
 		owner, repoName := splitOwnerRepo(job.RepoFullName)
 		if job.PRNumber > 0 && conn != nil {
-			_, _ = githubPRCommentCreate(conn, owner, repoName, job.PRNumber, body)
+			id, _ := githubPRCommentCreate(conn, owner, repoName, job.PRNumber, body)
+			appendEvidencePost(job, JobEvidencePost{
+				Type: "suggest", Target: "issue_comment", GitHubID: id, Status: "created", Body: body,
+				URL: fmt.Sprintf("https://github.com/%s/%s/pull/%d#issuecomment-%d", owner, repoName, job.PRNumber, id),
+			})
 		}
 		out["status"] = "suggest"
 		out["honesty"] = "suggest mode — proposal posted, no land"
@@ -579,7 +593,38 @@ func cloudFindingKeys(job *scmJob, ledger []agentFinding, prefs agentPrefs) ([]s
 			keys = append(keys, f.Key)
 		}
 	}
-	return keys, "auto from ledger"
+	if len(keys) > 0 {
+		return keys, "auto from ledger"
+	}
+	// Fallback so Cloud is not a silent skip when Bugbot left open medium/low findings
+	// (approval may already have posted pending_autofix). Prefer medium+, then any
+	// non-info actionable finding when autofix_mode is suggest|branch.
+	mode := strings.ToLower(strings.TrimSpace(prefs.AutofixMode))
+	if mode == "" || mode == "off" {
+		return nil, ""
+	}
+	var mediumKeys []string
+	var anyKeys []string
+	for _, f := range ledger {
+		sev := strings.ToLower(strings.TrimSpace(f.Severity))
+		if f.Key == "" {
+			continue
+		}
+		if sev == "info" {
+			continue
+		}
+		anyKeys = append(anyKeys, f.Key)
+		if severityAtLeast(f.Severity, "medium") || severityEqualsBlocker(f.Severity) {
+			mediumKeys = append(mediumKeys, f.Key)
+		}
+	}
+	if len(mediumKeys) > 0 {
+		return mediumKeys, "fallback: no findings at threshold " + threshold + "; using medium+"
+	}
+	if len(anyKeys) > 0 {
+		return anyKeys, "fallback: open findings below threshold " + threshold + "; using all actionable"
+	}
+	return nil, ""
 }
 
 func findingsMapsFromAgent(fs []agentFinding) []map[string]interface{} {

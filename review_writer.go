@@ -31,7 +31,18 @@ func publishPRReview(conn *opaConnector, owner, repo string, job *scmJob, body, 
 		if strings.TrimSpace(body) == "" {
 			body = "OPA Review — inline findings updated."
 		}
-		return githubCreatePRReview(conn, owner, repo, job.PRNumber, job.CommitSHA, body, event, comments)
+		err := githubCreatePRReview(conn, owner, repo, job.PRNumber, job.CommitSHA, body, event, comments)
+		if err == nil {
+			for _, c := range comments {
+				appendEvidencePost(job, JobEvidencePost{
+					Type: "inline", Target: "review_comment", Status: "created", Body: c.Body,
+				})
+			}
+			appendEvidencePost(job, JobEvidencePost{
+				Type: "decision", Target: "pull_request_review", Status: "created", Body: body,
+			})
+		}
+		return err
 	}
 	return publishOPADecisionReview(conn, owner, repo, job, body, event)
 }
@@ -54,7 +65,13 @@ func publishOPADecisionReview(conn *opaConnector, owner, repo string, job *scmJo
 
 	if event == "COMMENT" {
 		if first != nil {
-			return githubUpdatePRReviewBody(conn, owner, repo, job.PRNumber, first.ID, body)
+			err := githubUpdatePRReviewBody(conn, owner, repo, job.PRNumber, first.ID, body)
+			if err == nil {
+				appendEvidencePost(job, JobEvidencePost{
+					Type: "decision", Target: "pull_request_review", GitHubID: first.ID, Status: "updated", Body: body,
+				})
+			}
+			return err
 		}
 		// No prior card and nothing to gate — do not spam a new COMMENT review.
 		return nil
@@ -64,11 +81,20 @@ func publishOPADecisionReview(conn *opaConnector, owner, repo string, job *scmJo
 		if err := githubUpdatePRReviewBody(conn, owner, repo, job.PRNumber, first.ID, body); err != nil {
 			return err
 		}
+		appendEvidencePost(job, JobEvidencePost{
+			Type: "decision", Target: "pull_request_review", GitHubID: first.ID, Status: "updated", Body: body,
+		})
 		if reviewStateMatchesEvent(first.State, event) {
 			return nil
 		}
 	}
-	return githubCreatePRReview(conn, owner, repo, job.PRNumber, job.CommitSHA, body, event, nil)
+	err = githubCreatePRReview(conn, owner, repo, job.PRNumber, job.CommitSHA, body, event, nil)
+	if err == nil {
+		appendEvidencePost(job, JobEvidencePost{
+			Type: "decision", Target: "pull_request_review", Status: "created", Body: body,
+		})
+	}
+	return err
 }
 
 func embedOPAReviewDecisionMarker(body string) string {

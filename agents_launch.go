@@ -35,6 +35,10 @@ type agentLaunchSpec struct {
 	// checkout lives under a different folder than RunID (e.g. cloud-patch-*).
 	// Empty → RunID → JobID.
 	LayoutID string
+	// LivePhase overrides Summary.live.phase (e.g. "synth"). Empty → Phase.
+	LivePhase string
+	// LiveUnit tags multi-unit Bugbot runs in Summary.live.unit + live-{unit}.log.
+	LiveUnit string
 }
 
 func launchAgentSandbox(spec agentLaunchSpec) ([]byte, error) {
@@ -70,6 +74,8 @@ func launchAgentSandbox(spec agentLaunchSpec) ([]byte, error) {
 		Network:     networkForPhase(spec.Phase),
 		Timeout:     0, // already on ctx
 		Image:       sandboxImageForPhase(spec.Phase),
+		LivePhase:   strings.TrimSpace(spec.LivePhase),
+		LiveUnit:    strings.TrimSpace(spec.LiveUnit),
 	})
 	out = redactJobOutput(out, spec.APIKey)
 	if err != nil {
@@ -142,6 +148,14 @@ func writeAgentBrief(checkoutRoot, jobID, filename, body string) (promptRef stri
 	hostPath := filepath.Join(dir, filename)
 	if err := os.WriteFile(hostPath, []byte(body), 0o600); err != nil {
 		return "", func() {}, err
+	}
+	// Durable copy under scm-state before worktree cleanup removes .opa-briefs.
+	if j := getSCMJob(jobID); j != nil {
+		recordJobBrief(j, body, filename)
+		persistSCMJob(j)
+	} else if jobID != "" {
+		// Parent may pass label ids (airev-…); still try durable write by label.
+		_, _ = writeJobArtifact(jobID, filepath.Base(filename), "brief", body)
 	}
 	promptRef = filepath.Join(agentVisibleWorkDir(checkoutRoot, jobID), ".opa-briefs", filename)
 	cleanup = func() { _ = os.Remove(hostPath) }
