@@ -23,7 +23,10 @@ export OPA_INSTANCE_ID=laptop-dev   # reaper only kills this instance's labels
 # Optional: OPA_SKIP_PHP_IMAGE=1 / OPA_SKIP_AI_IMAGE=1  # fast rebuild loops
 # Optional: OPA_REVIEW_TMP=/opa-jobs  # identity path shared with container binds
 # Optional: OPA_JOB_EGRESS_NPM=1      # add registry.npmjs.org (prefer image-pinned deps)
-# Optional: OPA_JOB_EGRESS_ALLOWLIST=api.cursor.sh,api5.cursor.sh  # override defaults
+# Optional: OPA_JOB_EGRESS_ALLOWLIST — **full override** of defaults (not a merge).
+#   Leave unset to keep api.cursor.sh + api2–api5.cursor.sh (+ checkup registries).
+#   If you set it, list EVERY host you need, e.g.:
+#   export OPA_JOB_EGRESS_ALLOWLIST=api.cursor.sh,api2.cursor.sh,api3.cursor.sh,api4.cursor.sh,api5.cursor.sh
 # Optional: OPA_JOB_EGRESS_STACK_NETWORKS=opa-stack_opa_internal,opa_network
 #   (default) also join compose bridges so NAS egress routing/DNS matches the stack
 ```

@@ -151,7 +151,11 @@ func prepareAutofixAgentTree(worktreeID, primaryAbs string) (agentRoot string, f
 // syncSandboxTreeToPrimary copies agent edits from a no-.git sandbox onto the
 // git primary so gateCloudDiff / captureValidatedPatch / land see the same
 // changes. Tracked primary files missing from the sandbox are removed.
-func syncSandboxTreeToPrimary(sandboxAbs, primaryAbs string) error {
+//
+// tracked should be captured via gitTrackedRelPaths(primary) *before* the agent
+// runs — autofix boxes bind the layout root RW, so a compromised/confused agent
+// can break primary/.git; re-running ls-files after the agent then fails with 128.
+func syncSandboxTreeToPrimary(sandboxAbs, primaryAbs string, tracked []string) error {
 	sandboxAbs = filepath.Clean(sandboxAbs)
 	primaryAbs = filepath.Clean(primaryAbs)
 	if sandboxAbs == "" || primaryAbs == "" {
@@ -163,9 +167,14 @@ func syncSandboxTreeToPrimary(sandboxAbs, primaryAbs string) error {
 	if _, err := copyTreeFiles(sandboxAbs, primaryAbs); err != nil {
 		return fmt.Errorf("sync sandbox→primary: %w", err)
 	}
-	tracked, err := gitTrackedRelPaths(primaryAbs)
-	if err != nil {
-		return err
+	if tracked == nil {
+		var err error
+		tracked, err = gitTrackedRelPaths(primaryAbs)
+		if err != nil {
+			// Copy already applied; skip deletions rather than failing the whole run
+			// when git metadata was damaged mid-agent.
+			return nil
+		}
 	}
 	for _, rel := range tracked {
 		if _, err := os.Stat(filepath.Join(sandboxAbs, rel)); os.IsNotExist(err) {
@@ -178,9 +187,9 @@ func syncSandboxTreeToPrimary(sandboxAbs, primaryAbs string) error {
 func gitTrackedRelPaths(worktree string) ([]string, error) {
 	cmd := exec.Command("git", "-C", worktree, "ls-files", "-z")
 	cmd.Env = hostToolEnv()
-	out, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("git ls-files: %w", err)
+		return nil, fmt.Errorf("git ls-files: %w (%s)", err, truncateStr(string(out), 240))
 	}
 	if len(out) == 0 {
 		return nil, nil

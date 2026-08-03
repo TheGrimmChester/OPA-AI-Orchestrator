@@ -178,6 +178,10 @@ func filterFindingsByKeys(findings []map[string]interface{}, keys []string) []ma
 }
 
 func scmJobAPIView(job *scmJob) map[string]interface{} {
+	return scmJobAPIViewWithOpts(job, "ops", false)
+}
+
+func scmJobAPIViewWithOpts(job *scmJob, view string, compactChildren bool) map[string]interface{} {
 	b, _ := json.Marshal(job)
 	out := map[string]interface{}{}
 	_ = json.Unmarshal(b, &out)
@@ -198,6 +202,11 @@ func scmJobAPIView(job *scmJob) map[string]interface{} {
 			out["auto_fixes"] = fixes
 		}
 	}
+	ev := evidenceFromJob(job)
+	if ev != nil {
+		out["evidence"] = projectEvidence(ev, view)
+	}
+	_ = compactChildren
 	return out
 }
 
@@ -465,6 +474,17 @@ func runOPAAutoFix(parent *scmJob, conn *opaConnector, fix *opaAutoFixJob) (*opa
 			stampSandboxHonesty(parent.ID, "UNSANDBOXED: autofix ran on live worktree (OPA_JOB_ALLOW_HOST_EXEC=1; materialize failed)")
 			agentRoot = absRoot
 		}
+		var tracked []string
+		if agentRoot != absRoot {
+			var terr error
+			tracked, terr = gitTrackedRelPaths(absRoot)
+			if terr != nil {
+				fix.Status = "failed"
+				fix.Error = "pre-sync ls-files: " + terr.Error()
+				fix.Honesty = "Auto-fix refused: primary git tree unreadable before agent"
+				return fix, terr
+			}
+		}
 		if err := runAutoFixAgent(parent, agentRoot, parent.ID, wtID, fix); err != nil {
 			fix.Status = "failed"
 			fix.Error = "agent: " + err.Error()
@@ -472,7 +492,7 @@ func runOPAAutoFix(parent *scmJob, conn *opaConnector, fix *opaAutoFixJob) (*opa
 			return fix, err
 		}
 		if agentRoot != absRoot {
-			if serr := syncSandboxTreeToPrimary(agentRoot, absRoot); serr != nil {
+			if serr := syncSandboxTreeToPrimary(agentRoot, absRoot, tracked); serr != nil {
 				fix.Status = "failed"
 				fix.Error = "sync: " + serr.Error()
 				fix.Honesty = "Auto-fix sandbox sync failed"

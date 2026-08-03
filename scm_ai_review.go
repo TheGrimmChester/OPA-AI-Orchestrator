@@ -494,6 +494,7 @@ func reviewOneUnit(job *scmJob, key, agentBin, model string, baseArgs []string, 
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseReview, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
 		APIKey: key, Extra: extra, Parent: scmJobContext(job.ID), JobID: labelID, RunID: runID,
+		LiveUnit: unit.ID,
 	})
 	if err != nil {
 		part.Fallback = true
@@ -993,6 +994,7 @@ func runOPAReviewSynthesis(job *scmJob, key, agentBin string, baseArgs []string,
 	out, err := launchAgentSandbox(agentLaunchSpec{
 		Phase: jobPhaseReview, Args: args, Dir: checkoutRoot, WorktreeRoot: checkoutRoot,
 		APIKey: key, Parent: scmJobContext(job.ID), JobID: labelID, RunID: runID,
+		LivePhase: "synth",
 	})
 	if err != nil {
 		return fallbackSynth
@@ -1509,9 +1511,19 @@ func findingFileLine(f map[string]interface{}) (path string, line int, ok bool) 
 }
 
 // upsertOPAReviewResumeComment edits the existing résumé issue comment in place, or creates one.
+// When job is non-nil, records the post into job evidence.
 func upsertOPAReviewResumeComment(conn *opaConnector, owner, repo string, pr int, body string) (updated bool, err error) {
+	return upsertOPAReviewResumeCommentForJob(conn, owner, repo, pr, body, nil)
+}
+
+func upsertOPAReviewResumeCommentForJob(conn *opaConnector, owner, repo string, pr int, body string, job *scmJob) (updated bool, err error) {
 	body = embedOPAReviewResumeMarker(body)
 	if githubUseMockAPI(conn) {
+		if job != nil {
+			appendEvidencePost(job, JobEvidencePost{
+				Type: "resume", Target: "issue_comment", Status: "created", Body: body,
+			})
+		}
 		return true, nil
 	}
 	comments, lerr := githubListIssueComments(conn, owner, repo, pr)
@@ -1521,12 +1533,31 @@ func upsertOPAReviewResumeComment(conn *opaConnector, owner, repo string, pr int
 	for _, c := range comments {
 		if isOPAReviewResumeBody(c.Body) {
 			if bodiesMeaningfullyEqual(c.Body, body) {
+				if job != nil {
+					appendEvidencePost(job, JobEvidencePost{
+						Type: "resume", Target: "issue_comment", GitHubID: c.ID, Status: "updated", Body: body,
+						URL: fmt.Sprintf("https://github.com/%s/%s/pull/%d#issuecomment-%d", owner, repo, pr, c.ID),
+					})
+				}
 				return true, nil
 			}
-			return true, githubUpdateIssueComment(conn, owner, repo, c.ID, body)
+			err := githubUpdateIssueComment(conn, owner, repo, c.ID, body)
+			if job != nil && err == nil {
+				appendEvidencePost(job, JobEvidencePost{
+					Type: "resume", Target: "issue_comment", GitHubID: c.ID, Status: "updated", Body: body,
+					URL: fmt.Sprintf("https://github.com/%s/%s/pull/%d#issuecomment-%d", owner, repo, pr, c.ID),
+				})
+			}
+			return true, err
 		}
 	}
-	_, err = githubPRCommentCreate(conn, owner, repo, pr, body)
+	id, err := githubPRCommentCreate(conn, owner, repo, pr, body)
+	if job != nil && err == nil {
+		appendEvidencePost(job, JobEvidencePost{
+			Type: "resume", Target: "issue_comment", GitHubID: id, Status: "created", Body: body,
+			URL: fmt.Sprintf("https://github.com/%s/%s/pull/%d#issuecomment-%d", owner, repo, pr, id),
+		})
+	}
 	return err == nil, err
 }
 
@@ -1666,7 +1697,7 @@ func postOPAReviewFindings(conn *opaConnector, owner, repo string, job *scmJob, 
 	}
 
 	if postResume && resume != "" {
-		if _, err := upsertOPAReviewResumeComment(conn, owner, repo, job.PRNumber, resume); err == nil {
+		if _, err := upsertOPAReviewResumeCommentForJob(conn, owner, repo, job.PRNumber, resume, job); err == nil {
 			out.ResumeOK = true
 		}
 	}
@@ -1681,6 +1712,11 @@ func postOPAReviewFindings(conn *opaConnector, owner, repo string, job *scmJob, 
 			continue
 		}
 		out.Resolved++
+		appendEvidencePost(job, JobEvidencePost{
+			Type: "inline", Target: "review_comment", GitHubID: old.ID, Status: "resolved",
+			Body: old.Body, FindingKey: old.Key,
+			URL: fmt.Sprintf("https://github.com/%s/%s/pull/%d#discussion_r%d", owner, repo, job.PRNumber, old.ID),
+		})
 	}
 
 	for _, u := range plan.Update {
@@ -1689,6 +1725,10 @@ func postOPAReviewFindings(conn *opaConnector, owner, repo string, job *scmJob, 
 				out.Failed++
 			} else {
 				out.Resolved++
+				appendEvidencePost(job, JobEvidencePost{
+					Type: "inline", Target: "review_comment", GitHubID: u.Prior.ID, Status: "resolved",
+					Body: u.Body, FindingKey: u.Prior.Key,
+				})
 			}
 			continue
 		}
@@ -1697,6 +1737,11 @@ func postOPAReviewFindings(conn *opaConnector, owner, repo string, job *scmJob, 
 			continue
 		}
 		out.Updated++
+		appendEvidencePost(job, JobEvidencePost{
+			Type: "inline", Target: "review_comment", GitHubID: u.Prior.ID, Status: "updated",
+			Body: u.Body, FindingKey: u.Prior.Key,
+			URL: fmt.Sprintf("https://github.com/%s/%s/pull/%d#discussion_r%d", owner, repo, job.PRNumber, u.Prior.ID),
+		})
 	}
 
 	createSpecs := []githubPRReviewCommentSpec{}

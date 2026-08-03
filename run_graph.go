@@ -331,6 +331,7 @@ func processAgentChild(jobID string) {
 		job.Error = ""
 	}
 	job.FinishedAt = time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	_ = finalizeJobEvidence(job)
 	persistSCMJob(job)
 }
 

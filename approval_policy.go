@@ -265,7 +265,9 @@ func concreteConfidenceWhy(res aiReviewResult) string {
 }
 
 // confidenceWhyIsActionable is true when low confidence points at something a
-// human (or a follow-up commit) can address — not a vague title/description mismatch.
+// human (or a follow-up commit) can address — not a vague empty rationale.
+// A non-empty ConfidenceRationale counts: models often put real uncertainty
+// only there (without findings/priorities), and raising the score would hide it.
 func confidenceWhyIsActionable(res aiReviewResult) bool {
 	if res.Fallback {
 		return true
@@ -276,7 +278,13 @@ func confidenceWhyIsActionable(res aiReviewResult) bool {
 	if len(res.HumanReviewPriorities) > 0 {
 		return true
 	}
+	if strings.TrimSpace(res.ConfidenceRationale) != "" {
+		return true
+	}
 	if strings.EqualFold(strings.TrimSpace(res.Verdict), "request_changes") {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(res.Verdict), "needs_context") {
 		return true
 	}
 	st := strings.ToLower(strings.TrimSpace(res.Status))
@@ -287,8 +295,8 @@ func confidenceWhyIsActionable(res aiReviewResult) bool {
 }
 
 // calibrateConfidenceForVeto raises confidence to minScore when the review is
-// clean but the model under-scored without actionable blockers. Returns whether
-// the score was raised and a short honesty note.
+// clean but the model under-scored without any why (empty rationale, no
+// findings/priorities). Never rewrites needs_context → approve.
 func calibrateConfidenceForVeto(res *aiReviewResult, minScore int) (bool, string) {
 	if res == nil || minScore <= 0 || res.AutoMergeConfidence >= minScore {
 		return false, ""
@@ -301,14 +309,6 @@ func calibrateConfidenceForVeto(res *aiReviewResult, minScore int) (bool, string
 	res.ConfidenceLabel = confidenceLabelFromScore(res.AutoMergeConfidence)
 	if strings.TrimSpace(res.ConfidenceRationale) == "" {
 		res.ConfidenceRationale = "No findings or merge-blocker priorities; confidence raised to the auto-approve veto threshold."
-	} else {
-		res.ConfidenceRationale = truncateStr(
-			res.ConfidenceRationale+" — no actionable merge blockers, so confidence was raised to the veto threshold.",
-			280,
-		)
-	}
-	if strings.EqualFold(res.Verdict, "needs_context") {
-		res.Verdict = "approve"
 	}
 	return true, fmt.Sprintf("confidence calibrated %d→%d (no actionable why for hard veto)", prev, minScore)
 }

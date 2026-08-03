@@ -211,9 +211,9 @@ func planRunChildren(parent *scmJob, prefs agentPrefs, skipBugbot bool, skipBugb
 		kinds = []agentKind{kindPrepare, kindSecurity, kindBugbot, kindCheckup, kindApproval}
 	}
 	cloudOn := prefs.CloudEnabled && prefs.AutofixMode != "" && prefs.AutofixMode != "off"
-	if cloudOn {
-		kinds = append(kinds, kindCloud)
-	}
+	// Always enqueue cloud so approval's cloud dependency is satisfiable. When
+	// cloud is off, the child is skipped immediately (avoids approval stuck forever).
+	kinds = append(kinds, kindCloud)
 	out := make([]*scmJob, 0, len(kinds))
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
 	for _, k := range kinds {
@@ -234,6 +234,10 @@ func planRunChildren(parent *scmJob, prefs agentPrefs, skipBugbot bool, skipBugb
 		if k == kindCheckup && sandboxMode() != "docker" {
 			child.Status = "skipped"
 			child.Summary["skip_reason"] = "OPA_JOB_SANDBOX=docker required for checkup"
+		}
+		if k == kindCloud && !cloudOn {
+			child.Status = "skipped"
+			child.Summary["skip_reason"] = "cloud_enabled/autofix_mode off"
 		}
 		out = append(out, child)
 	}
@@ -357,12 +361,17 @@ func readyChildren(runID string) []*scmJob {
 // runPRRunAPIView mirrors child fields onto the parent for smoke/Dashboard
 // compatibility (security_run_id / ai_job_id lived on the monolithic job).
 func runPRRunAPIView(job *scmJob) map[string]interface{} {
-	out := scmJobAPIView(job)
+	return runPRRunAPIViewWithView(job, "ops")
+}
+
+func runPRRunAPIViewWithView(job *scmJob, view string) map[string]interface{} {
+	out := scmJobAPIViewWithOpts(job, view, false)
 	if job == nil || agentKind(job.Kind) != kindRun {
 		return out
 	}
 	children := listRunChildren(job.ID)
-	out["children"] = children
+	compact := make([]map[string]interface{}, 0, len(children))
+	childViews := make([]map[string]interface{}, 0, len(children))
 	kinds := map[string]string{}
 	for _, c := range children {
 		kinds[c.Kind] = c.Status
@@ -372,7 +381,13 @@ func runPRRunAPIView(job *scmJob) map[string]interface{} {
 		if c.AIJobID != "" && job.AIJobID == "" {
 			out["ai_job_id"] = c.AIJobID
 		}
+		// Ensure evidence exists for older jobs that never finalized.
+		_ = evidenceFromJob(c)
+		compact = append(compact, evidenceCompactSummary(c))
+		childViews = append(childViews, scmJobAPIViewWithOpts(c, view, true))
 	}
+	out["children"] = childViews
+	out["children_evidence"] = compact
 	out["child_status"] = kinds
 	out["status"] = foldRunStatus(children, job.Status)
 	return out

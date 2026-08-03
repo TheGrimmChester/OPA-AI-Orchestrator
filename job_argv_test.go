@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -43,6 +45,57 @@ func TestBuildDockerRunArgvHardening(t *testing.T) {
 	}
 	if err := validateDockerRunArgv(argv); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBuildDockerRunArgvSandboxRemountsPrimaryRO(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("OPA_REVIEW_TMP", tmp)
+	layout := filepath.Join(tmp, "run1")
+	sandbox := filepath.Join(layout, "sandbox")
+	primary := filepath.Join(layout, "primary")
+	if err := os.MkdirAll(sandbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(primary, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	argv, err := buildDockerRunArgv(dockerRunSpec{
+		Name: "opa-job-test-cloud", Image: "opa-runner-ai:smoke",
+		JobID: "child1", RunID: "run1", WorkHostPath: sandbox,
+		WorkRel: "sandbox", ReadOnlyBind: false, Network: "none",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, layout+":/opa-jobs/child1:rw") {
+		t.Fatalf("want layout RW bind, got %s", joined)
+	}
+	wantRO := primary + ":/opa-jobs/child1/primary:ro"
+	if !strings.Contains(joined, wantRO) {
+		t.Fatalf("want primary RO remount %q in %s", wantRO, joined)
+	}
+}
+
+func TestBuildDockerRunArgvSandboxRequiresPrimary(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("OPA_REVIEW_TMP", tmp)
+	layout := filepath.Join(tmp, "run1")
+	sandbox := filepath.Join(layout, "sandbox")
+	if err := os.MkdirAll(sandbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := buildDockerRunArgv(dockerRunSpec{
+		Name: "opa-job-test-cloud", Image: "opa-runner-ai:smoke",
+		JobID: "child1", RunID: "run1", WorkHostPath: sandbox,
+		WorkRel: "sandbox", ReadOnlyBind: false, Network: "none",
+	})
+	if err == nil {
+		t.Fatal("expected error when primary missing")
+	}
+	if !strings.Contains(err.Error(), "requires primary") {
+		t.Fatalf("want primary error, got %v", err)
 	}
 }
 

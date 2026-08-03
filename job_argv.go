@@ -136,6 +136,16 @@ func buildDockerRunArgv(spec dockerRunSpec) ([]string, error) {
 		}
 	}
 	argv = append(argv, "-v", bindHost+":"+bindCont+":"+bindMode)
+	// Autofix runs on …/sandbox but layout-root bind also exposes primary RW.
+	// Remount primary RO so --trust agents cannot corrupt the git worktree
+	// (symptom: post-agent `git ls-files` exit 128 during sandbox sync).
+	if !spec.ReadOnlyBind && (rel == "sandbox" || filepath.Base(host) == "sandbox") {
+		primaryHost := filepath.Join(bindHost, "primary")
+		if st, err := os.Stat(primaryHost); err != nil || !st.IsDir() {
+			return nil, fmt.Errorf("autofix sandbox requires primary checkout at %s: %v", primaryHost, err)
+		}
+		argv = append(argv, "-v", primaryHost+":"+containerWork+"/primary:ro")
+	}
 	argv = append(argv, "-w", containerCwd)
 	for _, b := range spec.ExtraBinds {
 		b = strings.TrimSpace(b)

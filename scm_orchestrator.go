@@ -876,7 +876,34 @@ func handleSCMJobSub(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not found", 404)
 			return
 		}
-		writeJSON(w, runPRRunAPIView(job))
+		view := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("view")))
+		if view == "" {
+			view = "ops"
+		}
+		writeJSON(w, runPRRunAPIViewWithView(job, view))
+		return
+	}
+	if len(parts) >= 3 && parts[1] == "artifacts" && r.Method == http.MethodGet {
+		job := getSCMJob(id)
+		if job == nil {
+			http.Error(w, "not found", 404)
+			return
+		}
+		a := actorFromRequest(r)
+		if !canSeeSCMJob(a, job, "") && !canSeeSCMJob(a, job, strings.TrimSpace(job.ConnectorID)) {
+			http.Error(w, "not found", 404)
+			return
+		}
+		name := parts[2]
+		raw, err := readJobArtifact(id, name)
+		if err != nil {
+			http.Error(w, "not found", 404)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(raw)
 		return
 	}
 	if len(parts) >= 2 && parts[1] == "retry" && r.Method == http.MethodPost {

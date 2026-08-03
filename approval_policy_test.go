@@ -97,17 +97,32 @@ func TestEvaluateApprovalConfidenceVetoOnly(t *testing.T) {
 	if d.Event != "COMMENT" {
 		t.Fatalf("pending autofix want COMMENT got %s", d.Event)
 	}
-	// Low confidence without actionable why → raise so clean PRs can APPROVE.
-	lowVague := aiReviewResult{
+	// Low confidence WITH only a ConfidenceRationale stays blocked — do not
+	// raise score / rewrite needs_context when the model explained uncertainty.
+	lowRationale := aiReviewResult{
 		Status: "clean", AutoMergeConfidence: 25, Verdict: "needs_context",
 		ConfidenceRationale: "PR title claims UI work not in this diff",
 	}
 	d = evaluateApproval(approvalEvidence{
-		Bugbot: lowVague, BugbotOK: true, SecurityOK: true,
+		Bugbot: lowRationale, BugbotOK: true, SecurityOK: true,
+		Prefs: agentPrefs{AutoApprove: true}, MinScore: 70,
+	})
+	if d.Event == "APPROVE" {
+		t.Fatalf("rationale-only low conf must not APPROVE (got %s %v)", d.Event, d.Reasons)
+	}
+	if d.Bugbot.Verdict != "needs_context" {
+		t.Fatalf("needs_context must not be rewritten, got %q", d.Bugbot.Verdict)
+	}
+	// Empty rationale + clean + no priorities → calibrate so clean PRs can APPROVE.
+	lowEmpty := aiReviewResult{
+		Status: "ok", AutoMergeConfidence: 25, Verdict: "approve",
+	}
+	d = evaluateApproval(approvalEvidence{
+		Bugbot: lowEmpty, BugbotOK: true, SecurityOK: true,
 		Prefs: agentPrefs{AutoApprove: true}, MinScore: 70,
 	})
 	if d.Event != "APPROVE" {
-		t.Fatalf("vague low conf want APPROVE after calibrate got %s (%v)", d.Event, d.Reasons)
+		t.Fatalf("empty-why low conf want APPROVE after calibrate got %s (%v)", d.Event, d.Reasons)
 	}
 	if d.Bugbot.AutoMergeConfidence < 70 {
 		t.Fatalf("calibrated conf want ≥70 got %d", d.Bugbot.AutoMergeConfidence)
