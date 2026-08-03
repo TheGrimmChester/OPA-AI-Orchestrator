@@ -12,5 +12,9 @@
 | `PEER_OSA_URL` | OSA base URL (AppSec runs + gate) |
 | `PEER_OPA_URL` | Optional OPA hub base URL (also selects co-deployed auth when set) |
 | `ORA_PUBLIC_URL` | Public URL for this product |
+| `OPA_GITHUB_APP_ID` | GitHub App id |
+| `OPA_GITHUB_APP_SLUG` | GitHub App slug for install URLs and reviewer login. Fallback `ora`; set to the **installed** App slug in production (do not force-rename a live App). |
+| `OPA_GITHUB_APP_PRIVATE_KEY` | GitHub App PEM |
+| `OPA_GITHUB_WEBHOOK_SECRET` | Webhook HMAC secret |
 | `ORA_RUNNER_TAG` | Runner image tag (`smoke` or `nas`) |
 | `ORCHESTRATOR_LISTEN_ADDR` | Orchestrator health listen (default `:8096`) |
