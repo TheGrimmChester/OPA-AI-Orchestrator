@@ -9,6 +9,9 @@ import (
 	"strings"
 )
 
+// cloudPRCommentCreate posts the suggest-mode proposal comment. Tests may stub it.
+var cloudPRCommentCreate = githubPRCommentCreate
+
 // runCloudAgent is the kind=cloud child: bounded patch → gateCloudDiff →
 // verify? → land-on-clean-tree (or suggest). GitHub write stays in-process; the
 // patch agent never receives a push token. Land never trusts the sandbox WD.
@@ -328,7 +331,7 @@ func runOneCloudAttempt(job *scmJob, conn *opaConnector, auth autofixAuthOK, pre
 			out["honesty"] = "suggest mode — missing PR or connector; cannot post proposal"
 			return out, fmt.Errorf("%s", out["honesty"])
 		}
-		id, err := githubPRCommentCreate(conn, owner, repoName, job.PRNumber, body)
+		id, err := cloudPRCommentCreate(conn, owner, repoName, job.PRNumber, body)
 		post := JobEvidencePost{
 			Type: "suggest", Target: "issue_comment", GitHubID: id, Body: body,
 		}
