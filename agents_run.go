@@ -140,6 +140,40 @@ func pruneSupersededInFlightPRRuns() int {
 	return cancelled
 }
 
+// findInFlightPRRunForSHA returns a live parent run for repo+PR already on sha.
+func findInFlightPRRunForSHA(repo string, pr int, sha string) *scmJob {
+	repo = strings.TrimSpace(repo)
+	sha = strings.TrimSpace(sha)
+	if repo == "" || pr <= 0 || sha == "" {
+		return nil
+	}
+	var found *scmJob
+	scmJobLive.Range(func(_, v interface{}) bool {
+		j, ok := v.(*scmJob)
+		if !ok || j == nil {
+			return true
+		}
+		if j.PRNumber != pr || !strings.EqualFold(j.RepoFullName, repo) {
+			return true
+		}
+		if strings.TrimSpace(j.ParentID) != "" {
+			return true
+		}
+		st := strings.ToLower(j.Status)
+		if st != "queued" && st != "waiting" && st != "running" {
+			return true
+		}
+		if !strings.EqualFold(strings.TrimSpace(j.CommitSHA), sha) {
+			return true
+		}
+		if found == nil || j.StartedAt >= found.StartedAt {
+			found = j
+		}
+		return true
+	})
+	return found
+}
+
 // enqueuePRRun creates a parent kind=run job and its agent children (queued).
 // Prefs are resolved once and frozen onto the parent summary.
 func enqueuePRRun(wr *opaWatchedRepo, conn *opaConnector, repo string, pr int, sha, event string, draft bool, title, body string) *scmJob {
@@ -153,9 +187,18 @@ func enqueuePRRun(wr *opaWatchedRepo, conn *opaConnector, repo string, pr int, s
 	prefs, sources := resolveAgentPrefs(org, proj, connID, repo)
 
 	// Cancel every older in-flight job for this PR; only this head SHA should run.
+	// Same-SHA re-entry reuses the live parent so manual + webhook do not cancel
+	// each other mid-approval (GitHub checks would stay "skipped").
 	if pr > 0 {
 		unlock := lockPREnqueue(repo, pr)
 		defer unlock()
+		sha = strings.TrimSpace(sha)
+		if sha != "" {
+			if existing := findInFlightPRRunForSHA(repo, pr, sha); existing != nil {
+				rememberPRRun(repo, pr, existing.ID)
+				return existing
+			}
+		}
 		supersedeInFlightPRJobs(repo, pr, sha)
 	}
 

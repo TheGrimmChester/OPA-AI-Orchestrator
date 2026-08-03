@@ -655,15 +655,86 @@ func cancelInFlightJobsForPR(repo string, pr int, reason string) []string {
 	return ids
 }
 
-// supersedeInFlightPRJobs cancels every in-flight job for repo+PR so only the
-// newly enqueued head commit runs. Used when synchronize (or any new enqueue)
-// lands while older commits are still queued/running.
+// supersedeInFlightPRJobs cancels every in-flight job for repo+PR that is not
+// already analyzing newSHA, so only the newly enqueued head commit runs. Same-SHA
+// re-triggers (manual AI review + webhook) must not cancel the live run mid-approval.
 func supersedeInFlightPRJobs(repo string, pr int, newSHA string) []string {
-	reason := "Superseded by " + strings.TrimSpace(newSHA)
+	newSHA = strings.TrimSpace(newSHA)
+	reason := "Superseded by " + newSHA
 	if reason == "Superseded by " {
 		reason = "Superseded by newer push"
 	}
-	return cancelInFlightJobsForPR(repo, pr, reason)
+	return cancelInFlightJobsForPRExceptSHA(repo, pr, reason, newSHA)
+}
+
+// cancelInFlightJobsForPRExceptSHA is cancelInFlightJobsForPR but leaves jobs
+// whose CommitSHA matches keepSHA (case-insensitive). Empty keepSHA cancels all.
+func cancelInFlightJobsForPRExceptSHA(repo string, pr int, reason, keepSHA string) []string {
+	repo = strings.TrimSpace(repo)
+	keepSHA = strings.TrimSpace(keepSHA)
+	if repo == "" || pr <= 0 {
+		return nil
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "cancelled"
+	}
+	var topLevel, children []string
+	scmJobLive.Range(func(_, v interface{}) bool {
+		job, ok := v.(*scmJob)
+		if !ok || job == nil {
+			return true
+		}
+		if job.PRNumber != pr || !strings.EqualFold(job.RepoFullName, repo) {
+			return true
+		}
+		st := strings.ToLower(job.Status)
+		if st != "queued" && st != "waiting" && st != "running" {
+			return true
+		}
+		if keepSHA != "" && strings.EqualFold(strings.TrimSpace(job.CommitSHA), keepSHA) {
+			return true
+		}
+		if strings.TrimSpace(job.ParentID) != "" {
+			children = append(children, job.ID)
+		} else {
+			topLevel = append(topLevel, job.ID)
+		}
+		return true
+	})
+	var ids []string
+	for _, id := range topLevel {
+		if _, errMsg, _ := cancelSCMJobWithReason(id, reason); errMsg == "" {
+			ids = append(ids, id)
+		}
+	}
+	for _, id := range children {
+		j := getSCMJob(id)
+		if j == nil {
+			continue
+		}
+		st := strings.ToLower(j.Status)
+		if st != "queued" && st != "waiting" && st != "running" {
+			continue
+		}
+		if keepSHA != "" && strings.EqualFold(strings.TrimSpace(j.CommitSHA), keepSHA) {
+			continue
+		}
+		if agentKind(j.Kind) == kindCloud && (st == "running" || st == "waiting") {
+			if j.Summary == nil {
+				j.Summary = map[string]interface{}{}
+			}
+			j.Summary["supersede_drain"] = true
+			j.Summary["cancel_drain"] = reason
+			persistSCMJob(j)
+			ids = append(ids, id)
+			continue
+		}
+		if _, errMsg, _ := cancelSCMJobWithReason(id, reason); errMsg == "" {
+			ids = append(ids, id)
+		}
+	}
+	cancelInFlightAutoFixesForPR(repo, pr, reason)
+	return ids
 }
 
 func cancelInFlightAutoFixesForPR(repo string, pr int, reason string) {
