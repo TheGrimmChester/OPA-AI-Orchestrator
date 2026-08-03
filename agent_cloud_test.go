@@ -142,6 +142,7 @@ func TestAuthorizeReauthSkipsRate(t *testing.T) {
 }
 
 func TestCloudJobMustAbortHonorsDrain(t *testing.T) {
+	t.Setenv("OPA_SCM_STATE_DIR", t.TempDir())
 	job := &scmJob{ID: "cloud-1", RunID: "run-1", Status: "running", Summary: map[string]interface{}{}}
 	scmJobLive.Store(job.ID, job)
 	defer scmJobLive.Delete(job.ID)
@@ -164,6 +165,7 @@ func TestCloudJobMustAbortHonorsDrain(t *testing.T) {
 }
 
 func TestLandValidatedPatchRefusesDrain(t *testing.T) {
+	t.Setenv("OPA_SCM_STATE_DIR", t.TempDir())
 	job := &scmJob{
 		ID: "cloud-land-1", RunID: "run-land-1", Status: "running",
 		RepoFullName: "acme/demo", Summary: map[string]interface{}{"supersede_drain": true},
@@ -177,6 +179,7 @@ func TestLandValidatedPatchRefusesDrain(t *testing.T) {
 }
 
 func TestSuggestModeFailsWhenCommentPostErrors(t *testing.T) {
+	t.Setenv("OPA_SCM_STATE_DIR", t.TempDir())
 	t.Setenv("SKIP_CURSOR_AI", "1")
 	t.Setenv("OPA_SCM_MOCK_GITHUB", "1")
 	old := cloudPRCommentCreate
