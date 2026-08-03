@@ -228,7 +228,8 @@ func applyPrefsPatch(out *agentPrefs, sources map[string]string, patch map[strin
 }
 
 // issueLabelMatchesPrefs reports whether any of the issue's labels is in the
-// configured AI gate list (case-insensitive). Empty prefs list → no match.
+// configured AI gate list (case-insensitive). Empty prefs list defaults to
+// matching the literal label "AI".
 func issueLabelMatchesPrefs(prefs agentPrefs, labels []string) bool {
 	want := prefs.AIIssueLabels
 	if len(want) == 0 {

@@ -108,7 +108,12 @@ func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([
 			LogWarn("sandbox docker unavailable — OPA_JOB_ALLOW_HOST_EXEC=1 falling back to host", map[string]interface{}{
 				"error": err.Error(), "honesty": "UNSANDBOXED: tools ran as root", "job_id": spec.JobID,
 			})
-			return hostSandboxRunner{}.RunOnce(ctx, spec)
+			hostSpec := spec
+			if len(hostSpec.Argv) > 0 && hostSpec.Argv[0] == "/opt/opa/agent" {
+				hostSpec.Argv = append([]string{}, hostSpec.Argv...)
+				hostSpec.Argv[0] = resolveAgentBinForRunner("host")
+			}
+			return hostSandboxRunner{}.RunOnce(ctx, hostSpec)
 		}
 		return nil, err
 	}

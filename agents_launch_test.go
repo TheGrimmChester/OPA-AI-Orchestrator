@@ -165,3 +165,23 @@ func TestWriteAgentBriefVisiblePath(t *testing.T) {
 		t.Fatalf("docker visible path: got %s want %s", ref2, want)
 	}
 }
+
+func TestResolveAgentBinForRunner(t *testing.T) {
+	t.Setenv("OPA_CURSOR_AGENT_BIN", "")
+	if got := resolveAgentBinForRunner("docker"); got != "/opt/opa/agent" {
+		t.Fatalf("docker runner: got %q", got)
+	}
+	t.Setenv("OPA_CURSOR_AGENT_BIN", "/usr/local/bin/agent")
+	if got := resolveAgentBinForRunner("host"); got != "/usr/local/bin/agent" {
+		t.Fatalf("host with allowlisted env: got %q", got)
+	}
+	// Docker must ignore host env and keep the baked path.
+	if got := resolveAgentBinForRunner("docker"); got != "/opt/opa/agent" {
+		t.Fatalf("docker ignores OPA_CURSOR_AGENT_BIN: got %q", got)
+	}
+	t.Setenv("OPA_JOB_SANDBOX", "docker")
+	// resolveAgentBin is host-side even when sandbox mode is docker (host fallback).
+	if got := resolveAgentBin(); got != "/usr/local/bin/agent" {
+		t.Fatalf("resolveAgentBin stays host-resolvable under docker sandbox mode: got %q", got)
+	}
+}
