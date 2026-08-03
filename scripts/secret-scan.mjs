@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Wave 30 — ripgrep-style secret scan of cwd; POST findings to /v1/security/secrets.
+ * AppSec — ripgrep-style secret scan of cwd; POST findings to /v1/security/secrets.
  *
  * Usage:
  *   node scripts/secret-scan.mjs [--root .] [--agent URL] [--token TOKEN] [--service name]

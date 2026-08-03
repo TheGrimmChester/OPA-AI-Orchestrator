@@ -110,34 +110,43 @@ func TestCanSeeSCMJob(t *testing.T) {
 	ownDef := &scmJob{ID: "3", OrganizationID: "default-org", ActorUserID: "alice"}
 	legacy := &scmJob{ID: "4", OrganizationID: "", ActorUserID: ""}
 
-	if !canSeeSCMJob(adminAll, nasJob) || !canSeeSCMJob(adminAll, defJob) {
+	if !canSeeSCMJob(adminAll, nasJob, "") || !canSeeSCMJob(adminAll, defJob, "") {
 		t.Fatal("admin with All should see every org")
 	}
-	if canSeeSCMJob(adminNas, defJob) {
+	if canSeeSCMJob(adminNas, defJob, "") {
 		t.Fatal("admin scoped to nas must not see default-org")
 	}
-	if !canSeeSCMJob(adminNas, nasJob) {
+	if !canSeeSCMJob(adminNas, nasJob, "") {
 		t.Fatal("admin scoped to nas should see nas")
 	}
-	if canSeeSCMJob(memberAll, defJob) {
+	if canSeeSCMJob(memberAll, defJob, "") {
 		t.Fatal("member with All must not see others' jobs")
 	}
-	if !canSeeSCMJob(memberAll, ownDef) {
+	if !canSeeSCMJob(memberAll, ownDef, "") {
 		t.Fatal("member with All should see own queued jobs")
 	}
-	if !canSeeSCMJob(memberNas, nasJob) {
+	if !canSeeSCMJob(memberNas, nasJob, "") {
 		t.Fatal("member in nas should see nas jobs")
 	}
-	if canSeeSCMJob(memberNas, ownDef) {
+	if canSeeSCMJob(memberNas, ownDef, "") {
 		t.Fatal("member in nas must not see default-org even if own actor")
 	}
 	// Legacy empty org counts as default-org when default-org selected.
-	if !canSeeSCMJob(credActor{Username: "x", Role: "viewer", OrganizationID: defaultOrgID}, legacy) {
+	if !canSeeSCMJob(credActor{Username: "x", Role: "viewer", OrganizationID: defaultOrgID}, legacy, "") {
 		t.Fatal("legacy empty org should match default-org filter")
 	}
 	authEnforced = false
-	if !canSeeSCMJob(credActor{OrganizationID: ""}, nasJob) {
+	if !canSeeSCMJob(credActor{OrganizationID: ""}, nasJob, "") {
 		t.Fatal("auth off + All should see all")
+	}
+	// Connector filter bypasses tenant org for admins (App install often on default-org).
+	authEnforced = true
+	defJob.ConnectorID = "conn-app"
+	if !canSeeSCMJob(adminNas, defJob, "conn-app") {
+		t.Fatal("admin nas + connector filter should see default-org job on that connector")
+	}
+	if canSeeSCMJob(adminNas, defJob, "conn-other") {
+		t.Fatal("connector filter must not match wrong connector")
 	}
 }
 
