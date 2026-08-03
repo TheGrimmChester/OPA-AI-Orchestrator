@@ -10,7 +10,7 @@ import (
 	openauth "github.com/TheGrimmChester/open-auth-go"
 )
 
-// registerPeerSCMMux exposes service-JWT-only SCM helpers for peer products (OPM).
+// registerPeerSCMMux exposes service-JWT-only SCM helpers for peer products (OPM, OSA).
 // GitHub App/PAT secrets stay in ORA; peers receive short-lived clone credentials only.
 func registerPeerSCMMux(mux *http.ServeMux) {
 	mux.HandleFunc("/api/peer/scm/clone-credentials", handlePeerCloneCredentials)

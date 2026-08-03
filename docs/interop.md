@@ -26,8 +26,9 @@ Caller mints with `Open-Auth-Go` / `Open-Client-Go` peer helpers:
 
 - `iss=ora-api`, `aud=osa-api` — scopes: `runs:write`, `findings:read`, `health:read`
 - `iss=opm-api`, `aud=ora-api` — scopes: `connectors:read`, `scm:clone`, `health:read`
+- `iss=osa-api`, `aud=ora-api` — scopes: `connectors:read`, `scm:clone`, `health:read`
 
-OPM discovers GitHub repos via `GET /api/connectors` and `GET /api/connectors/{id}/repos` (user JWT or service JWT with `connectors:read`). Ephemeral clones use `POST /api/peer/scm/clone-credentials` (service JWT + `scm:clone` only). GitHub App/PAT secrets never leave ORA.
+OPM and OSA discover GitHub repos via `GET /api/connectors` and `GET /api/connectors/{id}/repos` (user JWT or service JWT with `connectors:read`). Ephemeral clones use `POST /api/peer/scm/clone-credentials` (service JWT + `scm:clone` only). GitHub App/PAT secrets never leave ORA.
 
 ## Review vs AppSec gate
 
