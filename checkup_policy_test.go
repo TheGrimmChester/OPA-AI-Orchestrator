@@ -32,7 +32,7 @@ func TestIntersectSpecWithPolicyDeniesDangerousImage(t *testing.T) {
 }
 
 func TestIntersectSpecWithPolicyDeniesShellAndBinary(t *testing.T) {
-	t.Setenv("OPA_JOB_IMAGE_ALLOW", "opa-runner-*")
+	t.Setenv("OPA_JOB_IMAGE_ALLOW", "ora-runner-*")
 	raw := &checkupPlan{
 		Version: 1,
 		Image:   "ora-runner-ai:smoke",
@@ -71,7 +71,7 @@ func TestIntersectSpecWithPolicyDeniesGitHubTokenSecret(t *testing.T) {
 }
 
 func TestIntersectSpecWithPolicyCapsAndDuplicates(t *testing.T) {
-	t.Setenv("OPA_JOB_IMAGE_ALLOW", "mysql:8.4*,opa-runner-*")
+	t.Setenv("OPA_JOB_IMAGE_ALLOW", "mysql:8.4*,ora-runner-*")
 	raw := &checkupPlan{Version: 1, Image: "ora-runner-ai:smoke"}
 	for i := 0; i < 25; i++ {
 		raw.Steps = append(raw.Steps, checkupStep{
@@ -167,7 +167,7 @@ func TestCheckupImageAllowDefault(t *testing.T) {
 		t.Fatal("mysql:8.4 should match default allow")
 	}
 	if !checkupImageAllowed("ora-runner-php:smoke") {
-		t.Fatal("ora-runner-php:smoke should match opa-runner-*")
+		t.Fatal("ora-runner-php:smoke should match ora-runner-*")
 	}
 	if !checkupImageAllowed("hebabil/php-8.4-cli:latest") {
 		t.Fatal("hebabil/php-8.4-cli should match default allow")
