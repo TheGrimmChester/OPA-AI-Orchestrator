@@ -1,6 +1,6 @@
 # AI Issues and Roadmap automation
 
-OPA can investigate GitHub Issues labelled for AI, generate product roadmaps from the Dashboard, publish milestones + Issues, and (opt-in) open implementation PRs. Patterns follow [AutoCursor](https://github.com/TheGrimmChester/AutoCursor) / Aperant-style lifecycle — reimplemented for the Go orchestrator (not an AGPL copy).
+ORA can investigate GitHub Issues labelled for AI, generate product roadmaps from ORA-Dashboard, publish milestones + Issues, and (opt-in) open implementation PRs. Patterns follow a structured issue-to-roadmap lifecycle, implemented in the Go job orchestrator.
 
 ## Gate
 

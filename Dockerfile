@@ -1,4 +1,4 @@
-# OPA AI Orchestrator — Security runs + Repo Watch / OPA Review
+# ORA-API — Open Review Agent control plane
 FROM golang:1.25-alpine AS builder
 RUN apk --no-cache add git ca-certificates
 WORKDIR /app
@@ -8,11 +8,11 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY *.go ./
 COPY gitleaks.toml ./
-RUN CGO_ENABLED=0 GOOS=linux go build -o opa-orchestrator .
+RUN CGO_ENABLED=0 GOOS=linux go build -o ora-api .
 
 # Default compose target — keep this stage named; later runner/egress stages must
 # not become the default image (docker build uses the last stage otherwise).
-FROM debian:bookworm-slim AS opa-orchestrator
+FROM debian:bookworm-slim AS ora-api
 ARG TARGETARCH
 ARG GITLEAKS_VERSION=8.30.0
 ARG PLAYWRIGHT_VERSION=1.50.1
@@ -50,7 +50,7 @@ RUN apt-get update \
  && rm -rf /root/.npm /tmp/*
 
 WORKDIR /root/
-COPY --from=builder /app/opa-orchestrator .
+COPY --from=builder /app/ora-api .
 COPY gitleaks.toml /etc/opa/gitleaks.toml
 COPY scripts/ /opt/opa/scripts/
 
@@ -62,7 +62,7 @@ ENV HTTP_ADDR=:8091 \
     OPA_JOB_SANDBOX=off
 
 EXPOSE 8091
-CMD ["./opa-orchestrator"]
+CMD ["./ora-api"]
 
 # --- Runner images (OPA_JOB_SANDBOX=docker) ---
 # Scan-only: gitleaks + config. No node/chromium/agent. Non-root via docker --user.
@@ -177,9 +177,9 @@ CMD ["sleep", "infinity"]
 FROM alpine:3.20 AS opa-egress-proxy
 RUN apk --no-cache add ca-certificates \
  && adduser -D -u 65532 -g 65532 opa
-COPY --from=builder /app/opa-orchestrator /opa-orchestrator
+COPY --from=builder /app/ora-api /ora-api
 USER 65532:65532
 ENV OPA_EGRESS_PROXY_LISTEN=:3128 \
     OPA_EGRESS_ALLOWLIST=api.cursor.sh,api2.cursor.sh
 EXPOSE 3128
-ENTRYPOINT ["/opa-orchestrator", "egress-proxy"]
+ENTRYPOINT ["/ora-api", "egress-proxy"]

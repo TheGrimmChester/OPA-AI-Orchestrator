@@ -1,4 +1,4 @@
-module github.com/opa/opa-ai-orchestrator
+module github.com/TheGrimmChester/ora-api
 
 go 1.25.0
 
