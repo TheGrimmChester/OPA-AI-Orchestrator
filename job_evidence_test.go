@@ -92,7 +92,7 @@ func TestWriteAndReadJobArtifact(t *testing.T) {
 	}
 }
 
-func TestCloudFindingKeysFallbackMedium(t *testing.T) {
+func TestCloudFindingKeysRespectsThreshold(t *testing.T) {
 	prefs := builtinAgentPrefs()
 	prefs.AutofixSeverityThreshold = "high"
 	prefs.AutofixMode = "branch"
@@ -101,11 +101,13 @@ func TestCloudFindingKeysFallbackMedium(t *testing.T) {
 		{Key: "b", Severity: "low", File: "y.go", Message: "l"},
 	}
 	keys, rationale := cloudFindingKeys(nil, ledger, prefs)
-	if len(keys) != 1 || keys[0] != "a" {
-		t.Fatalf("keys=%v rationale=%s", keys, rationale)
+	if len(keys) != 0 {
+		t.Fatalf("below-threshold must not invent keys (authorize would refuse), got %v (%q)", keys, rationale)
 	}
-	if rationale == "" || rationale == "auto from ledger" {
-		t.Fatalf("expected fallback rationale, got %q", rationale)
+	ledger = append(ledger, agentFinding{Key: "c", Severity: "high", File: "z.go", Message: "h"})
+	keys, rationale = cloudFindingKeys(nil, ledger, prefs)
+	if len(keys) != 1 || keys[0] != "c" || rationale != "auto from ledger" {
+		t.Fatalf("keys=%v rationale=%q", keys, rationale)
 	}
 }
 

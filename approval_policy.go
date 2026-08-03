@@ -161,6 +161,13 @@ func evaluateApproval(ev approvalEvidence) approvalDecision {
 		d.Reasons = reasons
 		return d
 	}
+	if strings.EqualFold(strings.TrimSpace(bugbot.Verdict), "needs_context") {
+		add("bugbot needs_context verdict — human context required before approve")
+		d.Event = "REQUEST_CHANGES"
+		d.Reasons = reasons
+		d.Honesty = "needs_context veto"
+		return d
+	}
 	status = strings.ToLower(strings.TrimSpace(bugbot.Status))
 	if status == "findings" {
 		add("bugbot reported findings")

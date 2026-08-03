@@ -314,6 +314,44 @@ func TestPlanRunChildrenCheckupGating(t *testing.T) {
 	}
 }
 
+func TestEnsureRunChildrenAddsMissingCloud(t *testing.T) {
+	parent := &scmJob{
+		ID: "run-miss-cloud", Kind: string(kindRun), RunID: "run-miss-cloud", Status: "running",
+		OrganizationID: "o", ProjectID: "p", RepoFullName: "o/r", CommitSHA: "abc",
+		Summary: map[string]interface{}{"prefs": builtinAgentPrefs()},
+	}
+	scmJobLive.Store(parent.ID, parent)
+	defer func() {
+		for _, c := range listRunChildren(parent.ID) {
+			scmJobLive.Delete(c.ID)
+		}
+		scmJobLive.Delete(parent.ID)
+	}()
+	// Simulate a legacy run that never planned cloud.
+	legacy := &scmJob{
+		ID: "run-miss-cloud-bugbot", Kind: string(kindBugbot), RunID: parent.ID, ParentID: parent.ID,
+		OrganizationID: "o", ProjectID: "p", RepoFullName: "o/r", CommitSHA: "abc",
+		Status: "completed", Summary: map[string]interface{}{},
+	}
+	scmJobLive.Store(legacy.ID, legacy)
+	out := ensureRunChildren(parent)
+	var cloud *scmJob
+	for _, c := range out {
+		if agentKind(c.Kind) == kindCloud {
+			cloud = c
+		}
+	}
+	if cloud == nil {
+		t.Fatal("ensureRunChildren must add missing kindCloud")
+	}
+	// Idempotent: second call does not duplicate.
+	n := len(out)
+	out2 := ensureRunChildren(parent)
+	if len(out2) != n {
+		t.Fatalf("duplicated children %d -> %d", n, len(out2))
+	}
+}
+
 func TestEnsureRunChildrenIdempotent(t *testing.T) {
 	parent := &scmJob{
 		ID: "run-2", Kind: string(kindRun), RunID: "run-2", Status: "running",

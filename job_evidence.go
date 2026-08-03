@@ -83,15 +83,16 @@ type JobEvidenceChat struct {
 }
 
 type JobEvidencePost struct {
-	Type      string `json:"type"` // resume|inline|decision|suggest|check_run|other
-	Target    string `json:"target,omitempty"`
-	GitHubID  int64  `json:"github_id,omitempty"`
-	URL       string `json:"url,omitempty"`
-	Body      string `json:"body,omitempty"`
+	Type        string `json:"type"` // resume|inline|decision|suggest|check_run|other
+	Target      string `json:"target,omitempty"`
+	GitHubID    int64  `json:"github_id,omitempty"`
+	URL         string `json:"url,omitempty"`
+	Body        string `json:"body,omitempty"`
 	BodyPreview string `json:"body_preview,omitempty"`
-	CreatedAt string `json:"created_at,omitempty"`
-	Status    string `json:"status,omitempty"` // created|updated|resolved|skipped
-	FindingKey string `json:"finding_key,omitempty"`
+	CreatedAt   string `json:"created_at,omitempty"`
+	Status      string `json:"status,omitempty"` // created|updated|resolved|skipped|error
+	Error       string `json:"error,omitempty"`
+	FindingKey  string `json:"finding_key,omitempty"`
 }
 
 type JobEvidenceArtifact struct {

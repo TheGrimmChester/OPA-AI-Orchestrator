@@ -24,8 +24,10 @@ export OPA_INSTANCE_ID=laptop-dev   # reaper only kills this instance's labels
 # Optional: OPA_REVIEW_TMP=/opa-jobs  # identity path shared with container binds
 # Optional: OPA_JOB_EGRESS_NPM=1      # add registry.npmjs.org (prefer image-pinned deps)
 # Optional: OPA_JOB_EGRESS_ALLOWLIST — **full override** of defaults (not a merge).
-#   Leave unset to keep api.cursor.sh + api2–api5.cursor.sh (+ checkup registries).
-#   If you set it, list EVERY host you need, e.g.:
+#   Leave unset to keep api.cursor.sh + api2–api5.cursor.sh and any checkup
+#   registry hosts the proxy ships with. Setting this replaces the entire list —
+#   do not copy a Cursor-only example into prod if checkup installs need npm/packagist.
+#   Full Cursor AI set example:
 #   export OPA_JOB_EGRESS_ALLOWLIST=api.cursor.sh,api2.cursor.sh,api3.cursor.sh,api4.cursor.sh,api5.cursor.sh
 # Optional: OPA_JOB_EGRESS_STACK_NETWORKS=opa-stack_opa_internal,opa_network
 #   (default) also join compose bridges so NAS egress routing/DNS matches the stack
@@ -85,8 +87,11 @@ container with its own argv (including `-e`); it is not a job box.
 **Networks:** Scan uses `--network none`. Review/autofix AI phases use a
 per-job `--internal` network with the shared allowlist proxy attached (DNS
 alias `opa-egress-proxy`) and `HTTP(S)_PROXY` pointing at it. Checkup
-`runCheckupPlan` / sidecars create the same `--internal` job net but do **not**
-attach the Cursor allowlist proxy (no default route; no proxy env).
+`runCheckupPlan` uses the **same** allowlist proxy path when
+`OPA_JOB_EGRESS_PROXY` is enabled and there are no sidecar services (so
+`composer`/`npm` can reach registries on the allowlist). With sidecars or
+proxy disabled, checkup falls back to a sealed `--internal` net (offline /
+vendor-only).
 
 ## Prepare → sandbox tree
 
@@ -111,12 +116,13 @@ when present.
 - Checkup sidecars and the shared egress proxy are **not** under the job-box
   non-root / read-only envelope; treat them as trusted helpers on the job
   `--internal` network, not as untrusted agent sandboxes.
-- **Checkup has no package-registry egress.** Heuristic/AI `composer` /
-  `npm` / `yarn` install steps only succeed when `vendor/` / `node_modules`
-  (or an offline cache bind) is already in the tree — otherwise expect
-  refused/failed install. Checkup `--internal` nets do not attach the
-  allowlist proxy (no default route / proxy env). A future registry allowlist
-  would be an explicit product change, not break-glass bridge/host exec.
+- **Checkup registry egress** follows the shared allowlist proxy when
+  `OPA_JOB_EGRESS_PROXY` is on and the plan has no sidecar services (same
+  `--internal` + proxy path as AI). With sidecars or proxy off, checkup nets
+  stay sealed — `composer`/`npm`/`yarn` then only succeed when `vendor/` /
+  `node_modules` (or an offline cache bind) is already in the tree. Expanding
+  the allowlist for registries is an explicit product change, not break-glass
+  bridge/host exec.
 - `OPA_JOB_ALLOW_HOST_EXEC=1` falls back to host exec and stamps
   `UNSANDBOXED: tools ran as root` — use only for break-glass debugging.
 - Chromium inside `opa-runner-ai` needs `--no-sandbox` inside an already
