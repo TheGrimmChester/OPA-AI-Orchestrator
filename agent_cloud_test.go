@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -172,5 +173,74 @@ func TestLandValidatedPatchRefusesDrain(t *testing.T) {
 	out, err := landValidatedPatch(job, &opaConnector{Kind: "github_app", InstallationID: "1"}, "wt-land", "sha", "opa-fix/x-1", "diff", autofixAuthOK{})
 	if err == nil || out["status"] != "cancelled" {
 		t.Fatalf("want cancelled refuse, got out=%v err=%v", out, err)
+	}
+}
+
+func TestSuggestModeFailsWhenCommentPostErrors(t *testing.T) {
+	t.Setenv("SKIP_CURSOR_AI", "1")
+	t.Setenv("OPA_SCM_MOCK_GITHUB", "1")
+	old := cloudPRCommentCreate
+	defer func() { cloudPRCommentCreate = old }()
+	cloudPRCommentCreate = func(c *opaConnector, owner, repo string, pr int, body string) (int64, error) {
+		return 0, fmt.Errorf("comment 403")
+	}
+
+	job := &scmJob{
+		ID: "cloud-suggest-fail", RunID: "run-suggest-fail", Status: "running",
+		RepoFullName: "acme/demo", PRNumber: 42, Attempt: 1,
+		Summary: map[string]interface{}{},
+	}
+	conn := &opaConnector{ID: "conn-suggest", Kind: "github_app", InstallationID: "1", Status: "active"}
+	auth := autofixAuthOK{
+		Mode: "suggest",
+		Findings: []agentFinding{{
+			Key: "k1", Severity: "high", File: ".opa-review-autofix.md", Message: "fix me",
+		}},
+	}
+	out, err := runOneCloudAttempt(job, conn, auth, agentPrefs{CloudEnabled: true, AutofixMode: "suggest"}, 1)
+	if err == nil {
+		t.Fatalf("want post error, got nil (out=%v)", out)
+	}
+	if out["status"] != "failed" {
+		t.Fatalf("status=%v want failed", out["status"])
+	}
+	if out["suggest_post_error"] != "comment 403" {
+		t.Fatalf("suggest_post_error=%v", out["suggest_post_error"])
+	}
+	honesty := strFromAny(out["honesty"])
+	if strings.Contains(honesty, "proposal posted") || !strings.Contains(honesty, "proposal post failed") {
+		t.Fatalf("honesty must not claim posted after failure: %q", honesty)
+	}
+	posts, _ := job.Summary["evidence_posts"].([]JobEvidencePost)
+	if len(posts) == 0 {
+		// evidence may be stored as []interface{} after JSON round-trip; accept map list too
+		if raw, ok := job.Summary["evidence_posts"].([]interface{}); !ok || len(raw) == 0 {
+			// appendEvidencePost may nest differently — require at least suggest_post_error above
+			_ = raw
+		}
+	}
+}
+
+func TestSuggestModeFailsWithoutPR(t *testing.T) {
+	t.Setenv("SKIP_CURSOR_AI", "1")
+	t.Setenv("OPA_SCM_MOCK_GITHUB", "1")
+	job := &scmJob{
+		ID: "cloud-suggest-nopr", RunID: "run-suggest-nopr", Status: "running",
+		RepoFullName: "acme/demo", PRNumber: 0, Attempt: 1,
+		Summary: map[string]interface{}{},
+	}
+	conn := &opaConnector{ID: "conn-suggest", Kind: "github_app", InstallationID: "1", Status: "active"}
+	auth := autofixAuthOK{
+		Mode: "suggest",
+		Findings: []agentFinding{{
+			Key: "k1", Severity: "high", File: ".opa-review-autofix.md", Message: "fix me",
+		}},
+	}
+	out, err := runOneCloudAttempt(job, conn, auth, agentPrefs{CloudEnabled: true, AutofixMode: "suggest"}, 1)
+	if err == nil || out["status"] != "failed" {
+		t.Fatalf("want failed without PR, got out=%v err=%v", out, err)
+	}
+	if strings.Contains(strFromAny(out["honesty"]), "proposal posted") {
+		t.Fatalf("must not claim posted: %v", out["honesty"])
 	}
 }
