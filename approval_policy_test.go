@@ -113,6 +113,18 @@ func TestEvaluateApprovalConfidenceVetoOnly(t *testing.T) {
 	if d.Bugbot.Verdict != "needs_context" {
 		t.Fatalf("needs_context must not be rewritten, got %q", d.Bugbot.Verdict)
 	}
+	// High confidence + needs_context must still REQUEST_CHANGES (hard gate).
+	highNeeds := aiReviewResult{
+		Status: "ok", AutoMergeConfidence: 90, Verdict: "needs_context",
+		ConfidenceRationale: "Need prod config dump before merge",
+	}
+	d = evaluateApproval(approvalEvidence{
+		Bugbot: highNeeds, BugbotOK: true, SecurityOK: true,
+		Prefs: agentPrefs{AutoApprove: true}, MinScore: 70,
+	})
+	if d.Event != "REQUEST_CHANGES" {
+		t.Fatalf("needs_context want REQUEST_CHANGES, got %s (%v)", d.Event, d.Reasons)
+	}
 	// Empty rationale + clean + no priorities → calibrate so clean PRs can APPROVE.
 	lowEmpty := aiReviewResult{
 		Status: "ok", AutoMergeConfidence: 25, Verdict: "approve",

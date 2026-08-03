@@ -434,27 +434,42 @@ func foldRunStatus(children []*scmJob, parentStatus string) string {
 }
 
 // restartMidRunDoesNotDuplicate is the design proof for derived barriers:
-// planning children is idempotent on (runID, kind).
+// planning children is idempotent on (runID, kind). Missing kinds (e.g. cloud
+// on runs planned before cloud was always enqueued) are filled in without
+// duplicating existing children.
 func ensureRunChildren(parent *scmJob) []*scmJob {
 	existing := listRunChildren(parent.ID)
-	if len(existing) > 0 {
-		return existing
-	}
 	prefs := agentPrefsFromSummary(parent)
-	children := planRunChildren(parent, prefs, false, "")
-	ids := make([]string, 0, len(children))
-	for _, c := range children {
+	planned := planRunChildren(parent, prefs, false, "")
+	have := map[agentKind]bool{}
+	for _, c := range existing {
+		have[agentKind(c.Kind)] = true
+	}
+	ids := make([]string, 0, len(existing)+len(planned))
+	for _, c := range existing {
+		ids = append(ids, c.ID)
+	}
+	added := false
+	for _, c := range planned {
+		k := agentKind(c.Kind)
+		if have[k] {
+			continue
+		}
 		if getSCMJob(c.ID) == nil {
 			scmJobLive.Store(c.ID, c)
 			persistSCMJob(c)
 		}
 		ids = append(ids, c.ID)
+		have[k] = true
+		added = true
 	}
-	if parent.Summary == nil {
-		parent.Summary = map[string]interface{}{}
+	if len(existing) == 0 || added {
+		if parent.Summary == nil {
+			parent.Summary = map[string]interface{}{}
+		}
+		parent.Summary["child_ids"] = ids
+		persistSCMJob(parent)
 	}
-	parent.Summary["child_ids"] = ids
-	persistSCMJob(parent)
 	return listRunChildren(parent.ID)
 }
 
