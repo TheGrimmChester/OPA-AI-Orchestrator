@@ -29,6 +29,18 @@ func githubPermsChecksWrite() map[string]string {
 	return map[string]string{"checks": "write", "metadata": "read"}
 }
 
+// githubPermsPRReview is enough for PR reviews, requested reviewers, and
+// PATCH pull body. Does not require issues (many installs grant pull_requests
+// without issues — requiring both used to block APPROVE entirely).
+func githubPermsPRReview() map[string]string {
+	return map[string]string{
+		"pull_requests": "write",
+		"metadata":      "read",
+	}
+}
+
+// githubPermsPRWrite includes issues:write for /issues/.../comments (PR
+// conversation comments). Prefer githubPermsPRReview when issues is optional.
 func githubPermsPRWrite() map[string]string {
 	return map[string]string{
 		"pull_requests": "write",

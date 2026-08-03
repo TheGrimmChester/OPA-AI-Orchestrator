@@ -28,7 +28,15 @@ const (
 
 var (
 	egressProxyMu       sync.Mutex
-	defaultAIAllowHosts = []string{"api.cursor.sh", "api2.cursor.sh"}
+	// Cursor agent endpoints rotate (api, api2, api5 / agentn.global.api5…).
+	// Suffix match covers regional hosts like agentn.global.api5.cursor.sh.
+	defaultAIAllowHosts = []string{
+		"api.cursor.sh",
+		"api2.cursor.sh",
+		"api3.cursor.sh",
+		"api4.cursor.sh",
+		"api5.cursor.sh",
+	}
 	// npm registry hosts — off by default for AI; enable with OPA_JOB_EGRESS_NPM=1
 	// or OPA_JOB_EGRESS_CHECKUP=1 (checkup defaults ON so npm ci / go test work).
 	npmEgressAllowHosts = []string{
@@ -163,6 +171,45 @@ func egressNetworkName() string {
 	return "opa-egress-" + opaInstanceID()
 }
 
+// egressStackNetworks are extra docker networks the shared proxy must join so
+// outbound routing/DNS matches the compose stack (NAS: opa-stack_opa_internal).
+// Override with OPA_JOB_EGRESS_STACK_NETWORKS=net1,net2 (empty disables).
+func egressStackNetworks() []string {
+	if v, ok := os.LookupEnv("OPA_JOB_EGRESS_STACK_NETWORKS"); ok {
+		return parseEgressAllowlist(v)
+	}
+	return []string{"opa-stack_opa_internal", "opa_network"}
+}
+
+// attachEgressProxyToStackNetworks connects the proxy to compose/stack bridges.
+// Missing networks are skipped; "already connected" is OK.
+func attachEgressProxyToStackNetworks(ctx context.Context, proxyName string) {
+	proxyName = strings.TrimSpace(proxyName)
+	if proxyName == "" {
+		return
+	}
+	for _, netName := range egressStackNetworks() {
+		netName = strings.TrimSpace(netName)
+		if netName == "" {
+			continue
+		}
+		if _, err := dockerCmd(ctx, "network", "inspect", netName); err != nil {
+			continue
+		}
+		out, err := dockerCmd(ctx, "network", "connect", netName, proxyName)
+		if err != nil {
+			low := strings.ToLower(string(out) + err.Error())
+			if strings.Contains(low, "already") {
+				continue
+			}
+			LogWarn("egress proxy stack network connect failed", map[string]interface{}{
+				"network": netName, "proxy": proxyName,
+				"error": truncateStr(string(out)+" "+err.Error(), 160),
+			})
+		}
+	}
+}
+
 func jobNetworkName(jobID string) string {
 	return "opa-job-" + sanitizeDockerName(jobID)
 }
@@ -193,9 +240,17 @@ func ensureSharedEgressProxy(ctx context.Context) (string, error) {
 	defer egressProxyMu.Unlock()
 
 	name := egressProxyContainerName()
+	wantAllow := strings.Join(aiEgressAllowlist(), ",")
 	if id, err := dockerContainerIDByName(ctx, name); err == nil && id != "" {
 		if running, _ := dockerContainerRunning(ctx, name); running {
-			return name, nil
+			if got, ok := dockerContainerEnv(ctx, name, "OPA_EGRESS_ALLOWLIST"); ok && got == wantAllow {
+				attachEgressProxyToStackNetworks(ctx, name)
+				return name, nil
+			}
+			// Allowlist drifted (e.g. new Cursor API hosts) — recreate.
+			LogInfo("egress proxy allowlist drift — recreating", map[string]interface{}{
+				"name": name, "want": wantAllow,
+			})
 		}
 		_ = dockerRmForce(ctx, name)
 	}
@@ -208,7 +263,7 @@ func ensureSharedEgressProxy(ctx context.Context) (string, error) {
 		}
 	}
 
-	allow := strings.Join(aiEgressAllowlist(), ",")
+	allow := wantAllow
 	image := egressProxyImage()
 	argv := []string{
 		"run", "-d",
@@ -224,16 +279,26 @@ func ensureSharedEgressProxy(ctx context.Context) (string, error) {
 	}
 	out, err := dockerCmd(ctx, argv...)
 	if err != nil {
+		low := strings.ToLower(string(out) + err.Error())
+		// Concurrent ensure / prior rm race: name still held → force remove and retry once.
+		if strings.Contains(low, "already in use") || strings.Contains(low, "conflict") {
+			_ = dockerRmForce(ctx, name)
+			out, err = dockerCmd(ctx, argv...)
+		}
+	}
+	if err != nil {
 		return "", fmt.Errorf("egress proxy start: %w (%s)", err, truncateStr(string(out), 240))
 	}
 	// Brief ready wait — CONNECT listener.
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		if running, _ := dockerContainerRunning(ctx, name); running {
+			attachEgressProxyToStackNetworks(ctx, name)
 			return name, nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+	attachEgressProxyToStackNetworks(ctx, name)
 	return name, nil
 }
 
@@ -260,6 +325,26 @@ func dockerContainerRunning(ctx context.Context, name string) (bool, error) {
 		return false, err
 	}
 	return strings.TrimSpace(string(out)) == "true", nil
+}
+
+// dockerContainerEnv returns one container env value when present.
+func dockerContainerEnv(ctx context.Context, name, key string) (string, bool) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", false
+	}
+	out, err := dockerCmd(ctx, "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", name)
+	if err != nil {
+		return "", false
+	}
+	prefix := key + "="
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimPrefix(line, prefix), true
+		}
+	}
+	return "", false
 }
 
 // attachEgressProxyToJobNetwork connects the shared proxy to a per-job --internal

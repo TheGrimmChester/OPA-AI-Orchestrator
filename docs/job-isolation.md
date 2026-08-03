@@ -23,7 +23,9 @@ export OPA_INSTANCE_ID=laptop-dev   # reaper only kills this instance's labels
 # Optional: OPA_SKIP_PHP_IMAGE=1 / OPA_SKIP_AI_IMAGE=1  # fast rebuild loops
 # Optional: OPA_REVIEW_TMP=/opa-jobs  # identity path shared with container binds
 # Optional: OPA_JOB_EGRESS_NPM=1      # add registry.npmjs.org (prefer image-pinned deps)
-# Optional: OPA_JOB_EGRESS_ALLOWLIST=api.cursor.sh,api2.cursor.sh  # override defaults
+# Optional: OPA_JOB_EGRESS_ALLOWLIST=api.cursor.sh,api5.cursor.sh  # override defaults
+# Optional: OPA_JOB_EGRESS_STACK_NETWORKS=opa-stack_opa_internal,opa_network
+#   (default) also join compose bridges so NAS egress routing/DNS matches the stack
 ```
 
 Enable checkup via agent prefs (`checkup_enabled: true` at org/installation/repo).
@@ -99,7 +101,7 @@ when present.
   process can unset proxy env (and Chromium ignores it without `--proxy-server`).
   Job boxes have no default route; only the shared `opa.role=egress-proxy`
   container also joins `opa-egress-<instance>` and can dial the allowlist
-  (`api.cursor.sh`, `api2.cursor.sh` by default). `OPA_JOB_EGRESS_PROXY=0`
+  (`api.cursor.sh` … `api5.cursor.sh` by default; covers `*.api5.cursor.sh`). `OPA_JOB_EGRESS_PROXY=0`
   falls back to unrestricted `bridge` for AI (break-glass).
 - Prompt injection survives the container. Agent stdout can reach check runs /
   comments; masking is heuristic, not a boundary.

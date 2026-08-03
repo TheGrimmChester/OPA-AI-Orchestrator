@@ -10,6 +10,7 @@ func TestGitHubPermMapsNeverRequestWorkflows(t *testing.T) {
 		githubPermsCloneRead(),
 		githubPermsPRRead(),
 		githubPermsChecksWrite(),
+		githubPermsPRReview(),
 		githubPermsPRWrite(),
 		githubPermsPush(),
 		githubPermsCreatePR(),
@@ -65,12 +66,25 @@ func TestRequireGrantedPerms(t *testing.T) {
 		t.Fatalf("clone read: err=%v got=%+v", err, ok)
 	}
 
-	_, err = requireGrantedPerms("inst-1", githubPermsPRWrite())
+	_, err = requireGrantedPerms("inst-1", githubPermsPRReview())
 	if err == nil || !strings.Contains(err.Error(), "lacks required") {
 		t.Fatalf("want refuse for missing pull_requests, got %v", err)
 	}
 	if !strings.Contains(err.Error(), "refusing full-scope") {
 		t.Fatalf("honesty must refuse full-scope fallback: %v", err)
+	}
+
+	// Reviews must work when pull_requests is granted but issues is not
+	// (historical App installs often omit issues).
+	setInstallationPermCacheForTest("inst-pr", map[string]string{
+		"pull_requests": "write", "metadata": "read", "checks": "write",
+	})
+	if _, err = requireGrantedPerms("inst-pr", githubPermsPRReview()); err != nil {
+		t.Fatalf("PR review perms should pass without issues: %v", err)
+	}
+	_, err = requireGrantedPerms("inst-pr", githubPermsPRWrite())
+	if err == nil || !strings.Contains(err.Error(), "issues") {
+		t.Fatalf("want refuse for missing issues on PRWrite, got %v", err)
 	}
 
 	// write>read refused.

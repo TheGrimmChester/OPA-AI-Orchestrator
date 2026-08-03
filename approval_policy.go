@@ -43,6 +43,8 @@ type approvalDecision struct {
 	Event   string   // APPROVE | REQUEST_CHANGES | COMMENT
 	Reasons []string
 	Honesty string
+	// Bugbot is the (possibly confidence-calibrated) review used for the decision body.
+	Bugbot aiReviewResult
 }
 
 func parseApprovalPolicy(raw string) (*approvalPolicy, error) {
@@ -84,6 +86,10 @@ func parseApprovalPolicy(raw string) (*approvalPolicy, error) {
 
 // evaluateApproval is the sole place APPROVE can be granted. Confidence is
 // veto-only: low confidence blocks; high confidence never grants.
+//
+// Low confidence without an actionable why (findings, merge-blocker priorities,
+// request_changes verdict, or fallback) is raised to MinScore so clean PRs are
+// not stuck forever below the veto threshold.
 func evaluateApproval(ev approvalEvidence) approvalDecision {
 	d := approvalDecision{Event: "COMMENT"}
 	var reasons []string
@@ -95,6 +101,7 @@ func evaluateApproval(ev approvalEvidence) approvalDecision {
 		d.Event = "COMMENT"
 		d.Reasons = reasons
 		d.Honesty = "Degraded input — never APPROVE"
+		d.Bugbot = ev.Bugbot
 		return d
 	}
 	if ev.CloudChildExists {
@@ -102,6 +109,7 @@ func evaluateApproval(ev approvalEvidence) approvalDecision {
 		d.Event = "COMMENT"
 		d.Reasons = reasons
 		d.Honesty = "pending_autofix"
+		d.Bugbot = ev.Bugbot
 		return d
 	}
 
@@ -112,6 +120,7 @@ func evaluateApproval(ev approvalEvidence) approvalDecision {
 		d.Event = "COMMENT"
 		d.Reasons = reasons
 		d.Honesty = "auto-approve disabled"
+		d.Bugbot = ev.Bugbot
 		return d
 	}
 
@@ -120,24 +129,39 @@ func evaluateApproval(ev approvalEvidence) approvalDecision {
 		add("bugbot status=" + status)
 		d.Event = "COMMENT"
 		d.Reasons = reasons
+		d.Bugbot = ev.Bugbot
 		return d
 	}
 
+	bugbot := ev.Bugbot
+	if raised, note := calibrateConfidenceForVeto(&bugbot, ev.MinScore); raised {
+		add(note)
+		d.Honesty = note
+	}
+	d.Bugbot = bugbot
+
 	// Confidence veto-only (after we know bugbot produced a real review).
-	if ev.MinScore > 0 && ev.Bugbot.AutoMergeConfidence < ev.MinScore {
-		add(fmt.Sprintf("confidence %d below veto threshold %d", ev.Bugbot.AutoMergeConfidence, ev.MinScore))
+	if ev.MinScore > 0 && bugbot.AutoMergeConfidence < ev.MinScore {
+		why := concreteConfidenceWhy(bugbot)
+		add(fmt.Sprintf("confidence %d below veto threshold %d", bugbot.AutoMergeConfidence, ev.MinScore))
+		if why != "" {
+			add("why: " + why)
+		} else {
+			add("why: low confidence without a concrete merge-blocker explanation")
+		}
 		d.Event = "REQUEST_CHANGES"
 		d.Reasons = reasons
 		d.Honesty = "confidence veto"
 		return d
 	}
 
-	if hasBlockerOrHighFinding(ev.Bugbot) || strings.ToLower(ev.Bugbot.Verdict) == "request_changes" {
+	if hasBlockerOrHighFinding(bugbot) || strings.ToLower(bugbot.Verdict) == "request_changes" {
 		add("bugbot blocker/high or request_changes verdict")
 		d.Event = "REQUEST_CHANGES"
 		d.Reasons = reasons
 		return d
 	}
+	status = strings.ToLower(strings.TrimSpace(bugbot.Status))
 	if status == "findings" {
 		add("bugbot reported findings")
 		d.Event = "REQUEST_CHANGES"
@@ -204,8 +228,89 @@ func evaluateApproval(ev approvalEvidence) approvalDecision {
 	// All conjunctions held — APPROVE. Confidence did not grant this; evidence did.
 	d.Event = "APPROVE"
 	d.Reasons = append(reasons, "all approval conjunctions satisfied")
-	d.Honesty = "approved by evidence conjunction (confidence veto-only)"
+	if d.Honesty == "" {
+		d.Honesty = "approved by evidence conjunction (confidence veto-only)"
+	}
 	return d
+}
+
+// concreteConfidenceWhy returns the human-facing reason low confidence should block.
+func concreteConfidenceWhy(res aiReviewResult) string {
+	var parts []string
+	if r := strings.TrimSpace(res.ConfidenceRationale); r != "" {
+		parts = append(parts, truncateStr(r, 240))
+	}
+	for _, p := range res.HumanReviewPriorities {
+		c := strings.TrimSpace(p.Concern)
+		if c == "" {
+			continue
+		}
+		if f := strings.TrimSpace(p.File); f != "" {
+			if p.Line > 0 {
+				parts = append(parts, fmt.Sprintf("%s:%d — %s", f, p.Line, truncateStr(c, 160)))
+			} else {
+				parts = append(parts, fmt.Sprintf("%s — %s", f, truncateStr(c, 160)))
+			}
+		} else {
+			parts = append(parts, truncateStr(c, 160))
+		}
+		if len(parts) >= 4 {
+			break
+		}
+	}
+	if res.Fallback {
+		parts = append(parts, "rule-based fallback (structured AI synthesis unavailable)")
+	}
+	return strings.TrimSpace(strings.Join(parts, "; "))
+}
+
+// confidenceWhyIsActionable is true when low confidence points at something a
+// human (or a follow-up commit) can address — not a vague title/description mismatch.
+func confidenceWhyIsActionable(res aiReviewResult) bool {
+	if res.Fallback {
+		return true
+	}
+	if hasBlockerOrHighFinding(res) || len(res.Findings) > 0 {
+		return true
+	}
+	if len(res.HumanReviewPriorities) > 0 {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(res.Verdict), "request_changes") {
+		return true
+	}
+	st := strings.ToLower(strings.TrimSpace(res.Status))
+	if st == "findings" || st == "error" {
+		return true
+	}
+	return false
+}
+
+// calibrateConfidenceForVeto raises confidence to minScore when the review is
+// clean but the model under-scored without actionable blockers. Returns whether
+// the score was raised and a short honesty note.
+func calibrateConfidenceForVeto(res *aiReviewResult, minScore int) (bool, string) {
+	if res == nil || minScore <= 0 || res.AutoMergeConfidence >= minScore {
+		return false, ""
+	}
+	if confidenceWhyIsActionable(*res) {
+		return false, ""
+	}
+	prev := res.AutoMergeConfidence
+	res.AutoMergeConfidence = minScore
+	res.ConfidenceLabel = confidenceLabelFromScore(res.AutoMergeConfidence)
+	if strings.TrimSpace(res.ConfidenceRationale) == "" {
+		res.ConfidenceRationale = "No findings or merge-blocker priorities; confidence raised to the auto-approve veto threshold."
+	} else {
+		res.ConfidenceRationale = truncateStr(
+			res.ConfidenceRationale+" — no actionable merge blockers, so confidence was raised to the veto threshold.",
+			280,
+		)
+	}
+	if strings.EqualFold(res.Verdict, "needs_context") {
+		res.Verdict = "approve"
+	}
+	return true, fmt.Sprintf("confidence calibrated %d→%d (no actionable why for hard veto)", prev, minScore)
 }
 
 func failEvent(p *approvalPolicy) string {

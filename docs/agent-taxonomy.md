@@ -67,6 +67,7 @@ See also [job-isolation.md](./job-isolation.md).
 - `capRunRepoCode` hard-requires docker sandbox (never silent host exec).
 - Prompt injection and publish-path exfil remain residual risks bounded by
   the capability envelope, not eliminated.
+- Approval waits for cloud (plus bugbot/security) so `pending_autofix` cannot race.
 - AI docker egress uses a **shared allowlist proxy** on `--internal` job nets;
   `HTTP(S)_PROXY` is unsettable by the guest and only a hint — network boundary
   is `--internal` (see job-isolation Honesty).

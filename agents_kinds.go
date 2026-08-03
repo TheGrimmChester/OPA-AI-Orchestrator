@@ -29,7 +29,9 @@ var agentDependsOn = map[agentKind][]agentKind{
 	kindSecurity: {kindPrepare},
 	kindBugbot:   {kindPrepare},
 	kindCheckup:  {kindPrepare},
-	kindApproval: {kindBugbot, kindSecurity}, // checkup is sibling; does not gate approval
+	// Approval waits for cloud so pending_autofix cannot race a premature COMMENT.
+	// Checkup remains a sibling and does not gate approval.
+	kindApproval: {kindBugbot, kindSecurity, kindCloud},
 	kindCloud:    {kindBugbot, kindSecurity},
 }
 

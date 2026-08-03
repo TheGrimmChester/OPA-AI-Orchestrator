@@ -93,8 +93,10 @@ func buildDockerRunArgv(spec dockerRunSpec) ([]string, error) {
 		"--read-only",
 		// uid/gid required: default tmpfs is root:root 0755, so UID 65532 cannot
 		// mkdir under /home/opa (Cursor CLI → EACCES on ~/.cursor/projects/…).
-		"--tmpfs", "/tmp:rw,nosuid,nodev,uid=65532,gid=65532,mode=1777,size=1g",
-		"--tmpfs", "/home/opa:rw,nosuid,nodev,uid=65532,gid=65532,mode=1777,size=256m",
+		// exec required on /tmp: go test writes binaries under GOCACHE and fails
+		// with "permission denied" when the mount is noexec (docker tmpfs default).
+		"--tmpfs", "/tmp:rw,exec,nosuid,nodev,uid=65532,gid=65532,mode=1777,size=1g",
+		"--tmpfs", "/home/opa:rw,exec,nosuid,nodev,uid=65532,gid=65532,mode=1777,size=256m",
 		"--pids-limit", strconv.Itoa(pids),
 		"--memory", mem,
 		"--memory-swap", mem, // equal ⇒ swap disabled

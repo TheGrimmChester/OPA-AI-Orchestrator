@@ -41,3 +41,16 @@ func TestExecStagesHoldNoGitHubWrite(t *testing.T) {
 		}
 	}
 }
+
+func TestApprovalWaitsForCloud(t *testing.T) {
+	deps := agentDependsOn[kindApproval]
+	hasCloud := false
+	for _, d := range deps {
+		if d == kindCloud {
+			hasCloud = true
+		}
+	}
+	if !hasCloud {
+		t.Fatalf("approval must depend on cloud to avoid pending_autofix race; deps=%v", deps)
+	}
+}
