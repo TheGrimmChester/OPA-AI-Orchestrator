@@ -14,6 +14,9 @@ func TestGitHubPermMapsNeverRequestWorkflows(t *testing.T) {
 		githubPermsPRWrite(),
 		githubPermsPush(),
 		githubPermsCreatePR(),
+		githubPermsIssuesWrite(),
+		githubPermsProjectsWrite(),
+		githubAppRequiredPermsForAIIssues(),
 	}
 	for i, m := range maps {
 		if _, ok := m["workflows"]; ok {

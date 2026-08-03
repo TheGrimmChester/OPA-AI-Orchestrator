@@ -63,6 +63,7 @@ func main() {
 
 	registerSecurityRunsMux(mux, authView, authAdmin)
 	registerRepoWatchMux(mux, authView, authAdmin)
+	registerRoadmapMux(mux, authView, authAdmin)
 	registerAIMux(mux, authView, authAdmin)
 	registerAgentsPrefsMux(mux, authView, authAdmin)
 	loadAISettingsFromFileOnBoot()

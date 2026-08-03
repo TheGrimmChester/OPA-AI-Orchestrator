@@ -100,6 +100,12 @@ func handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		handlePushWebhook(w, raw, rec)
 	case "installation", "installation_repositories":
 		handleInstallationWebhook(w, event, raw, rec)
+	case "issues":
+		handleIssuesWebhook(w, raw, rec)
+	case "issue_comment":
+		handleIssueCommentWebhook(w, raw, rec)
+	case "label":
+		handleLabelWebhook(w, raw, rec)
 	default:
 		finishWebhookReceipt(rec, "ignored", "Unhandled GitHub event type — no action taken.", 200, "")
 		writeJSON(w, map[string]interface{}{"ok": true, "ignored": event, "webhook_id": rec.ID})
@@ -990,6 +996,36 @@ func handleSCMJobSub(w http.ResponseWriter, r *http.Request) {
 		handleSCMJobAutoFix(w, r, job)
 		return
 	}
+	if len(parts) >= 2 && (parts[1] == "approve-coding" || parts[1] == "approve_coding") && r.Method == http.MethodPost {
+		job := getSCMJob(id)
+		if job == nil {
+			http.Error(w, "not found", 404)
+			return
+		}
+		a := actorFromRequest(r)
+		if !canSeeSCMJob(a, job, "") && !canSeeSCMJob(a, job, strings.TrimSpace(job.ConnectorID)) {
+			http.Error(w, "not found", 404)
+			return
+		}
+		if agentKind(job.Kind) != kindIssueRun {
+			http.Error(w, "approve-coding only for issue_run jobs", 400)
+			return
+		}
+		if uid := strings.TrimSpace(a.Username); uid != "" {
+			job.ActorUserID = uid
+		}
+		child, err := enqueueIssueImplement(job)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		go processSCMJob(job.ID)
+		writeJSON(w, map[string]interface{}{
+			"ok": true, "job_id": job.ID, "implement_job_id": child.ID, "status": child.Status,
+			"honesty": "Implement child enqueued; no auto-merge — human review still required on the PR.",
+		})
+		return
+	}
 	http.Error(w, "not found", 404)
 }
 
@@ -1301,7 +1337,7 @@ func processSCMJob(jobID string) {
 // dispatch wiring is unit-testable without running agents.
 func scmJobProcessor(k agentKind) string {
 	switch {
-	case k == kindRun:
+	case k == kindRun || k == kindIssueRun || k == kindRoadmapRun:
 		return "run"
 	case isAgentChildKind(k):
 		return "agent"
@@ -1316,7 +1352,9 @@ func scmJobProcessor(k agentKind) string {
 // parent and not the continuous monolith).
 func isAgentChildKind(k agentKind) bool {
 	switch k {
-	case kindPrepare, kindSecurity, kindBugbot, kindCheckup, kindApproval, kindCloud:
+	case kindPrepare, kindSecurity, kindBugbot, kindCheckup, kindApproval, kindCloud,
+		kindIssuePrepare, kindIssueInvestigate, kindIssuePublish, kindIssueImplement,
+		kindRoadmapGenerate, kindRoadmapPublish:
 		return true
 	default:
 		return false

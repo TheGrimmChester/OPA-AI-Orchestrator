@@ -20,9 +20,17 @@ Harness: `OPA-stack/harness/appsec-pr-check.sh`
 
 ### Production — GitHub App
 
-1. Create a GitHub App with Contents (read), Metadata, Pull requests (read/write), Checks (write). Prefer Issues (write) for PR conversation comments; reviews/APPROVE only need Pull requests.
-2. Events: `pull_request`, `push`, `installation`, `installation_repositories`.
+1. Create a GitHub App with:
+   - **Contents:** read (clone) and **write** (autofix land / issue implement)
+   - **Metadata:** read
+   - **Pull requests:** read/write
+   - **Checks:** write
+   - **Issues:** read/write (**required** for AI Issues, milestones, roadmap publish, and PR conversation comments)
+   - **Organization projects:** read/write — **optional**, only when `roadmap_projects_v2` is enabled
+2. Events: `pull_request`, `push`, `installation`, `installation_repositories`, **`issues`**, **`issue_comment`**, **`label`**. Optionally `projects_v2_item` when Projects v2 is on.
 3. Webhook URL: `$OPA_PUBLIC_URL/v1/scm/github/webhook`
+4. Dashboard: `GET /api/connectors/{id}/permissions` probes installation grants and lists missing keys (Issues write, etc.).
+5. AI Issues / roadmap: see [ai-issues-roadmap.md](ai-issues-roadmap.md). Only Issues labelled `AI` (configurable) are auto-processed.
 4. Agent env:
 
 | Env | Purpose |
