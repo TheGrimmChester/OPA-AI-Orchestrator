@@ -630,7 +630,7 @@ func githubUpdatePRReviewComment(c *opaConnector, owner, repo string, commentID 
 		return nil
 	}
 	payload, _ := json.Marshal(map[string]string{"body": body})
-	raw, code, err := githubWriteAPI(c, owner, repo, githubPermsPRWrite(), http.MethodPatch, fmt.Sprintf("/repos/%s/%s/pulls/comments/%d", owner, repo, commentID), strings.NewReader(string(payload)))
+	raw, code, err := githubWriteAPI(c, owner, repo, githubPermsPRReview(), http.MethodPatch, fmt.Sprintf("/repos/%s/%s/pulls/comments/%d", owner, repo, commentID), strings.NewReader(string(payload)))
 	if err != nil {
 		return err
 	}
@@ -652,7 +652,7 @@ func githubReplyPRReviewComment(c *opaConnector, owner, repo string, pr int, com
 		payload["commit_id"] = commitSHA
 	}
 	raw, _ := json.Marshal(payload)
-	resp, code, err := githubWriteAPI(c, owner, repo, githubPermsPRWrite(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/comments", owner, repo, pr), strings.NewReader(string(raw)))
+	resp, code, err := githubWriteAPI(c, owner, repo, githubPermsPRReview(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/comments", owner, repo, pr), strings.NewReader(string(raw)))
 	if err != nil {
 		return err
 	}
@@ -678,7 +678,7 @@ func githubPRInlineComment(c *opaConnector, owner, repo string, pr int, commitSH
 		"line":      line,
 		"side":      "RIGHT",
 	})
-	raw, code, err := githubWriteAPI(c, owner, repo, githubPermsPRWrite(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/comments", owner, repo, pr), strings.NewReader(string(payload)))
+	raw, code, err := githubWriteAPI(c, owner, repo, githubPermsPRReview(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/comments", owner, repo, pr), strings.NewReader(string(payload)))
 	if err != nil {
 		return err
 	}
@@ -723,12 +723,84 @@ func githubCreatePRReview(c *opaConnector, owner, repo string, pr int, commitSHA
 		}
 	}
 	raw, _ := json.Marshal(payload)
-	resp, code, err := githubWriteAPI(c, owner, repo, githubPermsPRWrite(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews", owner, repo, pr), strings.NewReader(string(raw)))
+	resp, code, err := githubWriteAPI(c, owner, repo, githubPermsPRReview(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews", owner, repo, pr), strings.NewReader(string(raw)))
 	if err != nil {
 		return err
 	}
 	if code >= 300 {
 		return fmt.Errorf("pr review %d: %s", code, truncateStr(string(resp), 240))
+	}
+	return nil
+}
+
+type githubPRReview struct {
+	ID    int64
+	Body  string
+	State string // APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED | PENDING
+	User  string
+}
+
+// githubListPRReviews returns submitted PR reviews (oldest first across pages).
+func githubListPRReviews(c *opaConnector, owner, repo string, pr int) ([]githubPRReview, error) {
+	if c == nil || pr <= 0 {
+		return nil, nil
+	}
+	if githubUseMockAPI(c) {
+		return nil, nil
+	}
+	out := []githubPRReview{}
+	page := 1
+	for page <= 10 {
+		raw, code, err := githubAPI(c, http.MethodGet, fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews?per_page=100&page=%d", owner, repo, pr, page), nil)
+		if err != nil {
+			return out, err
+		}
+		if code >= 300 {
+			return out, fmt.Errorf("list reviews %d: %s", code, truncateStr(string(raw), 160))
+		}
+		var rows []struct {
+			ID    int64  `json:"id"`
+			Body  string `json:"body"`
+			State string `json:"state"`
+			User  struct {
+				Login string `json:"login"`
+			} `json:"user"`
+		}
+		if err := json.Unmarshal(raw, &rows); err != nil {
+			return out, err
+		}
+		if len(rows) == 0 {
+			break
+		}
+		for _, r := range rows {
+			out = append(out, githubPRReview{
+				ID: r.ID, Body: r.Body, State: strings.ToUpper(strings.TrimSpace(r.State)), User: r.User.Login,
+			})
+		}
+		if len(rows) < 100 {
+			break
+		}
+		page++
+	}
+	return out, nil
+}
+
+// githubUpdatePRReviewBody updates an existing review's body (state is immutable).
+func githubUpdatePRReviewBody(c *opaConnector, owner, repo string, pr int, reviewID int64, body string) error {
+	if c == nil || pr <= 0 || reviewID == 0 {
+		return nil
+	}
+	if githubUseMockAPI(c) {
+		return nil
+	}
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	resp, code, err := githubWriteAPI(c, owner, repo, githubPermsPRReview(), http.MethodPut,
+		fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews/%d", owner, repo, pr, reviewID), strings.NewReader(string(payload)))
+	if err != nil {
+		return err
+	}
+	if code >= 300 {
+		return fmt.Errorf("update review body %d: %s", code, truncateStr(string(resp), 240))
 	}
 	return nil
 }
@@ -743,7 +815,7 @@ func githubUpdatePullBody(c *opaConnector, owner, repo string, pr int, body stri
 		return nil
 	}
 	payload, _ := json.Marshal(map[string]string{"body": body})
-	resp, code, err := githubWriteAPI(c, owner, repo, githubPermsPRWrite(), http.MethodPatch, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, pr), strings.NewReader(string(payload)))
+	resp, code, err := githubWriteAPI(c, owner, repo, githubPermsPRReview(), http.MethodPatch, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, pr), strings.NewReader(string(payload)))
 	if err != nil {
 		return err
 	}
@@ -803,7 +875,7 @@ func githubRequestPRReviewersEx(c *opaConnector, owner, repo string, pr int, rev
 		payloadMap["team_reviewers"] = teams
 	}
 	payload, _ := json.Marshal(payloadMap)
-	resp, code, err := githubWriteAPI(c, owner, repo, githubPermsPRWrite(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/requested_reviewers", owner, repo, pr), strings.NewReader(string(payload)))
+	resp, code, err := githubWriteAPI(c, owner, repo, githubPermsPRReview(), http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/requested_reviewers", owner, repo, pr), strings.NewReader(string(payload)))
 	if err != nil {
 		return err
 	}

@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -26,13 +27,31 @@ func TestParseEgressAllowlist(t *testing.T) {
 	}
 }
 
+func TestEgressStackNetworks(t *testing.T) {
+	t.Setenv("OPA_JOB_EGRESS_STACK_NETWORKS", "")
+	if len(egressStackNetworks()) != 0 {
+		t.Fatalf("empty override should disable: %v", egressStackNetworks())
+	}
+	t.Setenv("OPA_JOB_EGRESS_STACK_NETWORKS", "opa-stack_opa_internal, opa_network")
+	got := egressStackNetworks()
+	if len(got) != 2 || got[0] != "opa-stack_opa_internal" || got[1] != "opa_network" {
+		t.Fatalf("got %v", got)
+	}
+	t.Setenv("OPA_JOB_EGRESS_STACK_NETWORKS", "")
+	_ = os.Unsetenv("OPA_JOB_EGRESS_STACK_NETWORKS")
+	got = egressStackNetworks()
+	if len(got) < 1 || got[0] != "opa-stack_opa_internal" {
+		t.Fatalf("defaults: %v", got)
+	}
+}
+
 func TestAIEgressAllowlistDefaults(t *testing.T) {
 	t.Setenv("OPA_JOB_EGRESS_ALLOWLIST", "")
 	t.Setenv("OPA_JOB_EGRESS_NPM", "")
 	t.Setenv("OPA_JOB_EGRESS_CHECKUP", "0")
 	t.Setenv("OPA_JOB_SANDBOX", "")
 	got := aiEgressAllowlist()
-	if len(got) < 2 || got[0] != "api.cursor.sh" || got[1] != "api2.cursor.sh" {
+	if len(got) < 5 || got[0] != "api.cursor.sh" || got[1] != "api2.cursor.sh" || got[4] != "api5.cursor.sh" {
 		t.Fatalf("defaults: %v", got)
 	}
 	for _, h := range got {
@@ -90,6 +109,9 @@ func TestHostOnEgressAllowlist(t *testing.T) {
 	}
 	if !hostOnEgressAllowlist("west.api.cursor.sh", allow) {
 		t.Fatal("allow subdomain suffix")
+	}
+	if !hostOnEgressAllowlist("agentn.global.api5.cursor.sh", []string{"api5.cursor.sh"}) {
+		t.Fatal("allow Cursor agentn.global.api5 host via api5 suffix")
 	}
 }
 

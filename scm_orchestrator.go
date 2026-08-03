@@ -1745,10 +1745,7 @@ func processContinuousSCMJob(jobID string) {
 		job.Summary["review_event"] = decision.Event
 		job.Summary["approval_reasons"] = decision.Reasons
 		job.Summary["approval_honesty"] = decision.Honesty
-		decisionBody := formatOPAReviewDecisionBody(aiResult, decision.Event, autoApproveMinScore)
-		if decision.Honesty != "" {
-			decisionBody = decisionBody + "\n\n_" + decision.Honesty + "_"
-		}
+		decisionBody := formatOPAReviewDecisionBody(decision.Bugbot, decision.Event, autoApproveMinScore)
 		if err := publishPRReview(conn, owner, repoName, job, decisionBody, decision.Event, nil); err != nil {
 			job.Summary["approval_publish_error"] = err.Error()
 		}

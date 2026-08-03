@@ -784,13 +784,8 @@ func runApprovalAgent(job *scmJob) error {
 		}
 	}
 
-	body := formatOPAReviewDecisionBody(res, decision.Event, minScore)
-	if decision.Honesty != "" {
-		body = body + "\n\n_" + decision.Honesty + "_"
-	}
-	if prefs.PostPRRiskScore {
-		body = body + fmt.Sprintf("\n\n_Risk score: %d/100_", risk.Score)
-	}
+	body := formatOPAReviewDecisionBody(decision.Bugbot, decision.Event, minScore)
+	// Honesty / risk stay in job summary + résumé / PR fence — not as stacked review cards.
 	if err := publishPRReview(conn, owner, repoName, job, body, decision.Event, nil); err != nil {
 		job.Summary["approval_publish_error"] = err.Error()
 	}

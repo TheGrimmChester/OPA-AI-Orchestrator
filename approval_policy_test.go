@@ -43,13 +43,18 @@ func TestEvaluateApprovalConfidenceVetoOnly(t *testing.T) {
 	if d.Event != "COMMENT" || d.Honesty == "" {
 		t.Fatalf("degraded want COMMENT+honesty got %+v", d)
 	}
-	// Low confidence vetoes to REQUEST_CHANGES.
-	low := aiReviewResult{Status: "ok", AutoMergeConfidence: 20, Verdict: "approve"}
+	// Low confidence with no actionable why is calibrated up (see later cases).
+	// Low confidence WITH findings still vetoes to REQUEST_CHANGES.
+	low := aiReviewResult{
+		Status: "findings", AutoMergeConfidence: 20, Verdict: "request_changes",
+		ConfidenceRationale: "high severity issue",
+		Findings:            []map[string]interface{}{{"severity": "high", "file": "a.go", "line": 1}},
+	}
 	d = evaluateApproval(approvalEvidence{
 		Bugbot: low, BugbotOK: true, Prefs: agentPrefs{AutoApprove: true}, MinScore: 70,
 	})
 	if d.Event != "REQUEST_CHANGES" {
-		t.Fatalf("low conf want REQUEST_CHANGES got %s", d.Event)
+		t.Fatalf("low conf with findings want REQUEST_CHANGES got %s", d.Event)
 	}
 	// Security gate failure blocks APPROVE.
 	d = evaluateApproval(approvalEvidence{
@@ -91,6 +96,38 @@ func TestEvaluateApprovalConfidenceVetoOnly(t *testing.T) {
 	})
 	if d.Event != "COMMENT" {
 		t.Fatalf("pending autofix want COMMENT got %s", d.Event)
+	}
+	// Low confidence without actionable why → raise so clean PRs can APPROVE.
+	lowVague := aiReviewResult{
+		Status: "clean", AutoMergeConfidence: 25, Verdict: "needs_context",
+		ConfidenceRationale: "PR title claims UI work not in this diff",
+	}
+	d = evaluateApproval(approvalEvidence{
+		Bugbot: lowVague, BugbotOK: true, SecurityOK: true,
+		Prefs: agentPrefs{AutoApprove: true}, MinScore: 70,
+	})
+	if d.Event != "APPROVE" {
+		t.Fatalf("vague low conf want APPROVE after calibrate got %s (%v)", d.Event, d.Reasons)
+	}
+	if d.Bugbot.AutoMergeConfidence < 70 {
+		t.Fatalf("calibrated conf want ≥70 got %d", d.Bugbot.AutoMergeConfidence)
+	}
+	// Low confidence WITH merge-blocker priority stays REQUEST_CHANGES and keeps why.
+	lowActionable := aiReviewResult{
+		Status: "clean", AutoMergeConfidence: 25, Verdict: "needs_context",
+		ConfidenceRationale: "Missing authz check",
+		HumanReviewPriorities: []aiReviewPriority{{File: "auth.go", Line: 10, Concern: "Missing authz check on admin route"}},
+	}
+	d = evaluateApproval(approvalEvidence{
+		Bugbot: lowActionable, BugbotOK: true, SecurityOK: true,
+		Prefs: agentPrefs{AutoApprove: true}, MinScore: 70,
+	})
+	if d.Event != "REQUEST_CHANGES" {
+		t.Fatalf("actionable low conf want REQUEST_CHANGES got %s", d.Event)
+	}
+	joined := strings.Join(d.Reasons, " ")
+	if !strings.Contains(joined, "why:") {
+		t.Fatalf("REQUEST_CHANGES must include why in reasons: %v", d.Reasons)
 	}
 }
 

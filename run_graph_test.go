@@ -184,15 +184,17 @@ func TestReadyChildrenDerivedBarrier(t *testing.T) {
 	prep := &scmJob{ID: "c-prep", Kind: string(kindPrepare), RunID: "run-1", ParentID: "run-1", Status: "queued"}
 	sec := &scmJob{ID: "c-sec", Kind: string(kindSecurity), RunID: "run-1", ParentID: "run-1", Status: "queued"}
 	bot := &scmJob{ID: "c-bot", Kind: string(kindBugbot), RunID: "run-1", ParentID: "run-1", Status: "queued"}
+	cld := &scmJob{ID: "c-cld", Kind: string(kindCloud), RunID: "run-1", ParentID: "run-1", Status: "queued"}
 	apr := &scmJob{ID: "c-apr", Kind: string(kindApproval), RunID: "run-1", ParentID: "run-1", Status: "queued"}
-	parent.Summary["child_ids"] = []string{prep.ID, sec.ID, bot.ID, apr.ID}
+	parent.Summary["child_ids"] = []string{prep.ID, sec.ID, bot.ID, cld.ID, apr.ID}
 	scmJobLive.Store(parent.ID, parent)
 	scmJobLive.Store(prep.ID, prep)
 	scmJobLive.Store(sec.ID, sec)
 	scmJobLive.Store(bot.ID, bot)
+	scmJobLive.Store(cld.ID, cld)
 	scmJobLive.Store(apr.ID, apr)
 	defer func() {
-		for _, id := range []string{parent.ID, prep.ID, sec.ID, bot.ID, apr.ID} {
+		for _, id := range []string{parent.ID, prep.ID, sec.ID, bot.ID, cld.ID, apr.ID} {
 			scmJobLive.Delete(id)
 		}
 	}()
@@ -208,15 +210,21 @@ func TestReadyChildrenDerivedBarrier(t *testing.T) {
 	for _, c := range ready {
 		got[agentKind(c.Kind)] = true
 	}
-	if !got[kindSecurity] || !got[kindBugbot] || got[kindApproval] {
+	if !got[kindSecurity] || !got[kindBugbot] || got[kindApproval] || got[kindCloud] {
 		t.Fatalf("after prepare: want security+bugbot, got %#v", kindsOf(ready))
 	}
 
 	sec.Status = "completed"
 	bot.Status = "completed"
 	ready = readyChildren("run-1")
+	if len(ready) != 1 || agentKind(ready[0].Kind) != kindCloud {
+		t.Fatalf("after bugbot+security: want cloud, got %#v", kindsOf(ready))
+	}
+
+	cld.Status = "completed"
+	ready = readyChildren("run-1")
 	if len(ready) != 1 || agentKind(ready[0].Kind) != kindApproval {
-		t.Fatalf("after parents: want approval, got %#v", kindsOf(ready))
+		t.Fatalf("after cloud: want approval, got %#v", kindsOf(ready))
 	}
 }
 
@@ -250,7 +258,7 @@ func TestReadyChildrenIncludesCheckupSibling(t *testing.T) {
 		t.Fatalf("after prepare: want security+bugbot+checkup, got %#v", kindsOf(ready))
 	}
 	if got[kindApproval] {
-		t.Fatalf("approval must wait for security+bugbot, got %#v", kindsOf(ready))
+		t.Fatalf("approval must wait for security+bugbot+cloud, got %#v", kindsOf(ready))
 	}
 }
 

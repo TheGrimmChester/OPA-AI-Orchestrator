@@ -20,7 +20,7 @@ Harness: `OPA-stack/harness/appsec-pr-check.sh`
 
 ### Production — GitHub App
 
-1. Create a GitHub App with Contents (read), Metadata, Pull requests (read/write), Checks (write).
+1. Create a GitHub App with Contents (read), Metadata, Pull requests (read/write), Checks (write). Prefer Issues (write) for PR conversation comments; reviews/APPROVE only need Pull requests.
 2. Events: `pull_request`, `push`, `installation`, `installation_repositories`.
 3. Webhook URL: `$OPA_PUBLIC_URL/v1/scm/github/webhook`
 4. Agent env:

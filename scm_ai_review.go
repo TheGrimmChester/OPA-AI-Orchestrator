@@ -498,6 +498,9 @@ func reviewOneUnit(job *scmJob, key, agentBin, model string, baseArgs []string, 
 	if err != nil {
 		part.Fallback = true
 		part.Error = err.Error()
+		if snip := truncateStr(strings.TrimSpace(string(out)), 480); snip != "" {
+			part.Error += ": " + snip
+		}
 		part = mergePartHeuristic(part, unit, string(out))
 		return part
 	}
@@ -505,6 +508,9 @@ func reviewOneUnit(job *scmJob, key, agentBin, model string, baseArgs []string, 
 	if parsed.Summary == "" && parsed.Comment == "" && len(parsed.Findings) == 0 {
 		part.Fallback = true
 		part.Error = "unparseable OPA Review output"
+		if snip := truncateStr(strings.TrimSpace(string(out)), 480); snip != "" {
+			part.Error += ": " + snip
+		}
 		part = mergePartHeuristic(part, unit, string(out))
 		return part
 	}
@@ -681,14 +687,25 @@ func formatOPAReviewDecisionBody(res aiReviewResult, event string, minScore int)
 	case "APPROVE":
 		fmt.Fprintf(&b, "**OPA Review — approved**\n\n")
 		fmt.Fprintf(&b, "Auto-merge confidence **%d/100** (%s) meets threshold **%d**.\n", conf, label, minScore)
-	case "REQUEST_CHANGES":
-		fmt.Fprintf(&b, "**OPA Review — changes requested**\n\n")
-		fmt.Fprintf(&b, "Auto-merge confidence **%d/100** (%s); threshold **%d**.\n", conf, label, minScore)
 		if res.ConfidenceRationale != "" {
 			fmt.Fprintf(&b, "\n%s\n", res.ConfidenceRationale)
 		}
+	case "REQUEST_CHANGES":
+		fmt.Fprintf(&b, "**OPA Review — changes requested**\n\n")
+		fmt.Fprintf(&b, "Auto-merge confidence **%d/100** (%s); threshold **%d**.\n", conf, label, minScore)
+		why := concreteConfidenceWhy(res)
+		if why != "" {
+			fmt.Fprintf(&b, "\n**Why:** %s\n", why)
+		} else if res.ConfidenceRationale != "" {
+			fmt.Fprintf(&b, "\n**Why:** %s\n", res.ConfidenceRationale)
+		} else {
+			b.WriteString("\n**Why:** confidence below threshold without a detailed rationale — re-run review or address open findings.\n")
+		}
 	default:
 		fmt.Fprintf(&b, "**OPA Review**\n\nConfidence **%d/100** (%s).\n", conf, label)
+		if res.ConfidenceRationale != "" {
+			fmt.Fprintf(&b, "\n%s\n", res.ConfidenceRationale)
+		}
 	}
 	if res.Verdict != "" {
 		fmt.Fprintf(&b, "\nVerdict: `%s`\n", res.Verdict)
@@ -931,8 +948,8 @@ func packOPAReviewSynthesisBrief(job *scmJob, res aiReviewResult, understanding 
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString(`## Required JSON
-{
+	b.WriteString("## Required JSON\n")
+	b.WriteString(`{
   "narrative": "2–4 short paragraphs (optionally end with one sentence on the strongest aspect)",
   "auto_merge_confidence": 0,
   "confidence_label": "low|medium|high",
@@ -941,8 +958,12 @@ func packOPAReviewSynthesisBrief(job *scmJob, res aiReviewResult, understanding 
   "verdict": "approve|request_changes|needs_context",
   "understanding": ["…"]
 }
-confidence_label MUST match auto_merge_confidence bands: low = 0–39, medium = 40–69, high = 70–100.
 `)
+	b.WriteString("confidence_label MUST match auto_merge_confidence bands: low = 0–39, medium = 40–69, high = 70–100.\n")
+	b.WriteString("Rules for confidence:\n")
+	b.WriteString("- If there are **no findings** and **no merge-blocker priorities**, auto_merge_confidence MUST be **≥ 70**, confidence_label **high**, and verdict **approve** (do not under-score for title/description mismatch alone).\n")
+	b.WriteString("- Low/medium confidence is allowed **only** when you list concrete human_review_priorities (merge blockers a human can fix) or findings warrant it — always explain in confidence_rationale.\n")
+	b.WriteString("- Verdict needs_context requires at least one human_review_priority stating what context is missing.\n")
 	return b.String()
 }
 
