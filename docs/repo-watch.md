@@ -1,4 +1,6 @@
-# GitHub Repo Watch + AI PR checks
+# Repo Watch (ORA)
+
+GitHub Repo Watch + AI PR checks
 
 ## Today (no GitHub App yet)
 
@@ -181,7 +183,7 @@ Legacy CI without Repo Watch can still call `harness/appsec-pr-check.sh` (tenant
 - `GET /api/scm/opa-review/stacks/{id}` — stack progress (`waiting` | `queued` | `running` | `completed` | `failed`)
 - `OPA_REVIEW_STACK_CONCURRENCY` — parallel SCM jobs (default 1, max 4); drain promotes waiting → queued → running as slots free
 - Global OPA Review comment = narrative résumé only; line findings are inline; stack waiting semantics as above
-- **UI visual MCP (required for UI diffs):** orchestrator image must ship Node.js (`node`/`npx`), Playwright Chromium + system libs, and set `OPA_REVIEW_BROWSER_DEPS_OK=1`. CLI already uses `--approve-mcps`. Env:
+- **UI visual MCP (required for UI diffs):** ora-api / ora-orchestrator image must ship Node.js (`node`/`npx`), Playwright Chromium + system libs, and set `OPA_REVIEW_BROWSER_DEPS_OK=1`. CLI already uses `--approve-mcps`. Env:
   - `OPA_REVIEW_BROWSER_MCP` — `1` (default) enables browser MCP for UI-touched PRs; `0` disables
   - `OPA_REVIEW_BROWSER_DEPS_OK` — must be `1` when Chromium/deps are provisioned (image default); otherwise visual MCP is skipped as unmet requirement
   - `OPA_REVIEW_PREVIEW_URL` — optional preview URL for the agent to open

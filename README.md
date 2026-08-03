@@ -1,15 +1,26 @@
-# OPA AI Orchestrator
+# ORA-API
 
-Owns Repo Watch / SCM / OPA Review and Security runs (profiles + scan orchestration).
+Go API for **Open Review Agent** — Repo Watch, SCM connectors, automated code review, review check-runs, coding agents, and roadmaps.
 
 | Port (smoke) | Service |
 |---|---|
-| **8091** | This service |
-| 8080 | OPA-Agent (APM / remaining APIs) |
-| 8092 | OPA-Perf-Lab |
+| **8091** | `ora-api` |
+| 8080 | `opa-hub` / `opa-agent` (observability) |
+| 8092 | `opl-api` |
+| 8093 | `osa-api` |
 
-**Shared:** ClickHouse (`CLICKHOUSE_URL`), JWT (`JWT_SECRET` — same secret as Agent).
+**Shared when co-deployed:** ClickHouse (`CLICKHOUSE_URL`), user JWT (`JWT_SECRET`).
 
-**Not here:** Perf Lab (`/api/perf/*`), APM ingest, vulns/IAST list APIs (Agent Vulnerability / IAST and AppSec surfaces).
+**Not here:** AppSec findings / vulns / IAST / AppSec CI gate (**OSA**), load tests (**OPL**), APM ingest (**OPA**).
 
-Dashboard routes `/api/scm/*`, `/api/connectors/*`, `/api/security/runs*`, `/api/security/profiles` here (via `VITE_ORCHESTRATOR_URL` or nginx path proxy).
+## Documentation
+
+See [docs/index.md](docs/index.md).
+
+## Build
+
+```bash
+go build -o ora-api .
+```
+
+Image tags: `ora-api:smoke` (laptop) · `ora-api:nas` (production / NAS only).

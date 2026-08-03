@@ -1,4 +1,5 @@
-# Job isolation (sandboxed runners)
+# Job isolation (ORA)
+
 
 When `OPA_JOB_SANDBOX=docker`, untrusted phases (secrets scan, AI review, autofix)
 run in short-lived containers built from the runner targets in the Dockerfile.

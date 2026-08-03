@@ -383,7 +383,7 @@ func closeSCMJobGitHubChecks(job *scmJob, reason string) {
 	if job.CheckRunIDs == nil {
 		job.CheckRunIDs = map[string]int64{}
 	}
-	if id, err := githubCreateCheckRun(conn, owner, repo, "OPA AppSec Gate", sha, "completed", conclusion, title, linkSum, details, nil); err == nil && id != 0 {
+	if id, err := githubCreateCheckRun(conn, owner, repo, "AppSec Gate", sha, "completed", conclusion, title, linkSum, details, nil); err == nil && id != 0 {
 		job.CheckRunIDs["appsec"] = id
 	}
 	if id, err := githubCreateCheckRun(conn, owner, repo, "OPA Review", sha, "completed", conclusion, title, linkSum, details, nil); err == nil && id != 0 {
