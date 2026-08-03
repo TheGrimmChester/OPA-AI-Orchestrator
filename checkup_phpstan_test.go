@@ -88,10 +88,10 @@ func TestNormalizePHPStanStep(t *testing.T) {
 }
 
 func TestIntersectPolicyNormalizesPHPStan(t *testing.T) {
-	t.Setenv("OPA_JOB_IMAGE_ALLOW", "opa-runner-*")
+	t.Setenv("OPA_JOB_IMAGE_ALLOW", "ora-runner-*")
 	raw := &checkupPlan{
 		Version: 1,
-		Image:   "opa-runner-php:smoke",
+		Image:   "ora-runner-php:smoke",
 		Steps: []checkupStep{{
 			ID:            "stan",
 			Argv:          []string{"phpstan", "analyse", "src"},

@@ -5,11 +5,20 @@ ORA may call OSA for findings / `security_run_id` linkage and AppSec gate status
 | Variable | Purpose |
 |----------|---------|
 | `PEER_OSA_URL` | OSA API base URL (required for AppSec runs from review jobs) |
-| `PEER_OPA_URL` | Optional OPA hub deep links |
+| `PEER_OPA_URL` | Optional OPA hub deep links; when set (and `AUTH_MODE` unset) enables co-deployed user auth |
 | `PEER_OPL_URL` | Optional OPL base URL |
 | `OPEN_SERVICE_JWT_SECRET` | Service JWT mint/validate secret |
-| `JWT_SECRET` | User JWT validation |
+| `JWT_SECRET` | User JWT secret |
+| `AUTH_MODE` | `standalone` (local `/api/auth/login`) or `codeployed` (hub-issued tokens) |
+| `CLICKHOUSE_DB` | ClickHouse database for this product (default `ora`) |
 | `ORA_PUBLIC_URL` | Public URL for this product |
+
+## User auth modes
+
+| Mode | Behavior |
+|------|----------|
+| **Standalone** | `ora-api` issues JWTs (`POST /api/auth/login`, `GET /api/auth/status`). Lab admin: `admin`/`admin`. |
+| **Co-deployed** | Share `JWT_SECRET` with **OPA-Hub**; hub issues tokens; `ora-api` validates only. Local login returns `503`. |
 
 ## Service JWT
 

@@ -258,10 +258,10 @@ func defaultCheckupImage() string {
 		return v
 	}
 	tag := nz(strings.TrimSpace(os.Getenv("OPA_JOB_IMAGE_TAG")), "smoke")
-	return "opa-runner-ai:" + tag
+	return "ora-runner-ai:" + tag
 }
 
-// defaultGoCheckupImage picks a Go toolchain image (opa-runner-git has git only).
+// defaultGoCheckupImage picks a Go toolchain image (ora-runner-git has git only).
 func defaultGoCheckupImage() string {
 	if v := strings.TrimSpace(os.Getenv("OPA_JOB_IMAGE_GO")); v != "" {
 		return v
@@ -270,7 +270,7 @@ func defaultGoCheckupImage() string {
 }
 
 // defaultPHPCheckupImage is the checkup box for composer/phpunit trees.
-// OPA_JOB_IMAGE_PHP overrides; else opa-runner-php:<tag>. Operators may point
+// OPA_JOB_IMAGE_PHP overrides; else ora-runner-php:<tag>. Operators may point
 // OPA_JOB_IMAGE_PHP at an allowlisted org image (e.g. hebabil/php-8.4-cli)
 // when a fleet needs extensions beyond the shipped runner.
 func defaultPHPCheckupImage() string {
@@ -278,7 +278,7 @@ func defaultPHPCheckupImage() string {
 		return v
 	}
 	tag := nz(strings.TrimSpace(os.Getenv("OPA_JOB_IMAGE_TAG")), "smoke")
-	return "opa-runner-php:" + tag
+	return "ora-runner-php:" + tag
 }
 
 func fileExists(path string) bool {
