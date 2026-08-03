@@ -53,7 +53,7 @@ func launchAgentSandbox(spec agentLaunchSpec) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
-	bin := resolveAgentBin()
+	bin := resolveAgentBinForRunner(getSandboxRunner().Name())
 	argv := append([]string{bin}, spec.Args...)
 	work := nz(spec.WorktreeRoot, spec.Dir)
 	labelID := resolveSandboxJobID(spec.JobID, work)
@@ -191,15 +191,18 @@ func sandboxMode() string {
 	}
 }
 
-// resolveAgentBin returns the binary used for agent children. Settings
-// cli_cursor.bin is intentionally ignored here so a PUT cannot choose what
-// executes inside review/autofix profiles. Precedence: OPA_CURSOR_AGENT_BIN
-// (allowlisted) → baked /opt/opa/agent → "agent" on PATH.
+// resolveAgentBin returns the host-side agent binary (allowlisted env →
+// /opt/opa/agent if present → "agent" on PATH). Docker job boxes rewrite to
+// /opt/opa/agent via resolveAgentBinForRunner — do not use this helper alone
+// when OPA_JOB_SANDBOX=docker may still fall back to host exec.
 func resolveAgentBin() string {
-	// Docker job boxes bake the agent at /opt/opa/agent. Host OPA_CURSOR_AGENT_BIN
-	// (often /usr/local/bin/agent on the orchestrator image) must not be copied
-	// into argv — that path does not exist inside opa-runner-ai.
-	if sandboxMode() == "docker" {
+	return resolveAgentBinForRunner("host")
+}
+
+// resolveAgentBinForRunner picks the binary for the runner that will exec it.
+// Docker boxes always use the baked /opt/opa/agent path; host keeps env/PATH.
+func resolveAgentBinForRunner(runner string) string {
+	if strings.TrimSpace(runner) == "docker" {
 		return "/opt/opa/agent"
 	}
 	if b := strings.TrimSpace(os.Getenv("OPA_CURSOR_AGENT_BIN")); b != "" {

@@ -111,8 +111,12 @@ when present.
   container also joins `opa-egress-<instance>` and can dial the allowlist.
   Defaults are Cursor API hosts (`api.cursor.sh` … `api5.cursor.sh`). When
   `OPA_JOB_SANDBOX=docker` (and `OPA_JOB_EGRESS_CHECKUP` is not `0`), the same
-  proxy also allowlists checkup registries (npm / proxy.golang.org / packagist).
-  `OPA_JOB_EGRESS_PROXY=0` falls back to unrestricted `bridge` for AI (break-glass).
+  proxy also allowlists checkup registries: npm (`registry.npmjs.org`,
+  `registry.yarnpkg.com`), Go (`proxy.golang.org`, `sum.golang.org`,
+  `storage.googleapis.com`, `github.com`, `objects.githubusercontent.com`,
+  `codeload.github.com`, `proxy.golang.com`), and Composer/Packagist
+  (`repo.packagist.org`, `packagist.org`). `OPA_JOB_EGRESS_PROXY=0` falls back
+  to unrestricted `bridge` for AI (break-glass).
 - Prompt injection survives the container. Agent stdout can reach check runs /
   comments; masking is heuristic, not a boundary.
 - Checkup sidecars and the shared egress proxy are **not** under the job-box
