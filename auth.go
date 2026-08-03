@@ -63,17 +63,7 @@ func (ah *AuthHandler) VerifyToken(tokenString string) (*Claims, error) {
 
 func AuthMiddleware(handler http.HandlerFunc, requiredRole string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token := ""
-		if authHeader := r.Header.Get("Authorization"); authHeader != "" {
-			parts := strings.Split(authHeader, " ")
-			if len(parts) != 2 || parts[0] != "Bearer" {
-				http.Error(w, "invalid authorization header", 401)
-				return
-			}
-			token = parts[1]
-		} else if c, err := r.Cookie(authCookieName); err == nil {
-			token = c.Value
-		}
+		token := bearerOrCookieToken(r)
 		if token == "" {
 			http.Error(w, "unauthorized", 401)
 			return
@@ -92,6 +82,66 @@ func AuthMiddleware(handler http.HandlerFunc, requiredRole string) http.HandlerF
 		r.Header.Set("X-User-Role", claims.Role)
 		handler(w, r)
 	}
+}
+
+// AuthUserOrServiceMiddleware accepts a user JWT or a short-lived service JWT
+// (aud=ora-api). Service callers map to role=admin for connector visibility when
+// org_id / X-Organization-ID is set. requiredServiceScope applies to service JWTs only.
+func AuthUserOrServiceMiddleware(handler http.HandlerFunc, requiredRole, requiredServiceScope string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := bearerOrCookieToken(r)
+		if token == "" {
+			http.Error(w, "unauthorized", 401)
+			return
+		}
+		secret := []byte(strings.TrimSpace(os.Getenv("OPEN_SERVICE_JWT_SECRET")))
+		if len(secret) > 0 {
+			if sc, err := openauth.ValidateServiceJWT(token, secret, "ora-api"); err == nil {
+				if requiredServiceScope != "" {
+					if err := openauth.RequireScope(sc, requiredServiceScope); err != nil {
+						http.Error(w, "missing scope", 403)
+						return
+					}
+				}
+				r.Header.Set("X-User-Username", "service:"+sc.Issuer)
+				r.Header.Set("X-User-Role", "admin")
+				r.Header.Set("X-Service-Issuer", sc.Issuer)
+				r.Header.Set("X-Service-Scope", sc.Scope)
+				if org := strings.TrimSpace(sc.OrgID); org != "" {
+					r.Header.Set("X-Organization-ID", org)
+				}
+				handler(w, r)
+				return
+			}
+		}
+		ah := &AuthHandler{queryClient: queryClient}
+		claims, err := ah.VerifyToken(token)
+		if err != nil {
+			http.Error(w, "invalid token", 401)
+			return
+		}
+		if requiredRole != "" && !hasPermission(claims.Role, requiredRole) {
+			http.Error(w, "forbidden", 403)
+			return
+		}
+		r.Header.Set("X-User-Username", claims.Username)
+		r.Header.Set("X-User-Role", claims.Role)
+		handler(w, r)
+	}
+}
+
+func bearerOrCookieToken(r *http.Request) string {
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		parts := strings.Split(authHeader, " ")
+		if len(parts) == 2 && parts[0] == "Bearer" {
+			return parts[1]
+		}
+		return ""
+	}
+	if c, err := r.Cookie(authCookieName); err == nil {
+		return c.Value
+	}
+	return ""
 }
 
 func hasPermission(userRole, requiredRole string) bool {
