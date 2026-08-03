@@ -22,6 +22,10 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "orchestrator" {
+		runORAOrchestrator()
+		return
+	}
 
 	addr := envOr("HTTP_ADDR", ":8091")
 	chURL := envOr("CLICKHOUSE_URL", "http://127.0.0.1:8123")
@@ -56,12 +60,11 @@ func main() {
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{
 			"status":  "ok",
-			"service": "opa-ai-orchestrator",
+			"service": "ora-api",
 			"version": buildVersion,
 		})
 	})
 
-	registerSecurityRunsMux(mux, authView, authAdmin)
 	registerRepoWatchMux(mux, authView, authAdmin)
 	registerRoadmapMux(mux, authView, authAdmin)
 	registerAIMux(mux, authView, authAdmin)
@@ -85,7 +88,7 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
-	log.Printf("OPA AI Orchestrator listening on %s (CH=%s)", addr, chURL)
+	log.Printf("ora-api listening on %s (CH=%s)", addr, chURL)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("listen: %v", err)
 	}

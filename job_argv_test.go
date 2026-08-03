@@ -9,7 +9,7 @@ import (
 
 func TestBuildDockerRunArgvHardening(t *testing.T) {
 	argv, err := buildDockerRunArgv(dockerRunSpec{
-		Name: "opa-job-test-scan", Image: "opa-runner-scan:smoke",
+		Name: "opa-job-test-scan", Image: "osa-runner-scan:smoke",
 		JobID: "child1", RunID: "run1", WorkHostPath: "/tmp/opa-review/run1/primary",
 		WorkRel: "primary", ReadOnlyBind: true, Network: "none",
 	})
@@ -61,7 +61,7 @@ func TestBuildDockerRunArgvSandboxRemountsPrimaryRO(t *testing.T) {
 		t.Fatal(err)
 	}
 	argv, err := buildDockerRunArgv(dockerRunSpec{
-		Name: "opa-job-test-cloud", Image: "opa-runner-ai:smoke",
+		Name: "opa-job-test-cloud", Image: "ora-runner-ai:smoke",
 		JobID: "child1", RunID: "run1", WorkHostPath: sandbox,
 		WorkRel: "sandbox", ReadOnlyBind: false, Network: "none",
 	})
@@ -87,7 +87,7 @@ func TestBuildDockerRunArgvSandboxRequiresPrimary(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := buildDockerRunArgv(dockerRunSpec{
-		Name: "opa-job-test-cloud", Image: "opa-runner-ai:smoke",
+		Name: "opa-job-test-cloud", Image: "ora-runner-ai:smoke",
 		JobID: "child1", RunID: "run1", WorkHostPath: sandbox,
 		WorkRel: "sandbox", ReadOnlyBind: false, Network: "none",
 	})

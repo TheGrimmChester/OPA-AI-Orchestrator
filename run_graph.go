@@ -545,7 +545,7 @@ func runSecurityAgent(job *scmJob) error {
 			return err
 		}
 	}
-	appSecID, _ := githubCreateCheckRun(conn, owner, repoName, "OPA AppSec Gate", job.CommitSHA, "in_progress", "", "Scanning…", checkRunSummaryWithJobLink("Repo Watch scanners running", job.RunID), jobDashURL, nil)
+	appSecID, _ := githubCreateCheckRun(conn, owner, repoName, "AppSec Gate", job.CommitSHA, "in_progress", "", "Scanning…", checkRunSummaryWithJobLink("Repo Watch scanners running", job.RunID), jobDashURL, nil)
 	if job.CheckRunIDs == nil {
 		job.CheckRunIDs = map[string]int64{}
 	}

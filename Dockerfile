@@ -1,4 +1,4 @@
-# OPA AI Orchestrator — Security runs + Repo Watch / OPA Review
+# ORA-API — Open Review Agent control plane
 FROM golang:1.25-alpine AS builder
 RUN apk --no-cache add git ca-certificates
 WORKDIR /app
@@ -8,11 +8,11 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY *.go ./
 COPY gitleaks.toml ./
-RUN CGO_ENABLED=0 GOOS=linux go build -o opa-orchestrator .
+RUN CGO_ENABLED=0 GOOS=linux go build -o ora-api .
 
 # Default compose target — keep this stage named; later runner/egress stages must
 # not become the default image (docker build uses the last stage otherwise).
-FROM debian:bookworm-slim AS opa-orchestrator
+FROM debian:bookworm-slim AS ora-api
 ARG TARGETARCH
 ARG GITLEAKS_VERSION=8.30.0
 ARG PLAYWRIGHT_VERSION=1.50.1
@@ -50,7 +50,7 @@ RUN apt-get update \
  && rm -rf /root/.npm /tmp/*
 
 WORKDIR /root/
-COPY --from=builder /app/opa-orchestrator .
+COPY --from=builder /app/ora-api .
 COPY gitleaks.toml /etc/opa/gitleaks.toml
 COPY scripts/ /opt/opa/scripts/
 
@@ -62,30 +62,12 @@ ENV HTTP_ADDR=:8091 \
     OPA_JOB_SANDBOX=off
 
 EXPOSE 8091
-CMD ["./opa-orchestrator"]
+CMD ["./ora-api"]
 
 # --- Runner images (OPA_JOB_SANDBOX=docker) ---
-# Scan-only: gitleaks + config. No node/chromium/agent. Non-root via docker --user.
-FROM debian:bookworm-slim AS opa-runner-scan
-ARG TARGETARCH
-ARG GITLEAKS_VERSION=8.30.0
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates wget \
- && rm -rf /var/lib/apt/lists/* \
- && arch="$TARGETARCH" \
- && case "$arch" in amd64|x86_64) gl_arch=x64 ;; arm64|aarch64) gl_arch=arm64 ;; *) gl_arch=x64 ;; esac \
- && wget -qO /tmp/gitleaks.tgz \
-      "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${gl_arch}.tar.gz" \
- && tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks \
- && rm -f /tmp/gitleaks.tgz \
- && test -x /usr/local/bin/gitleaks
-COPY gitleaks.toml /etc/opa/gitleaks.toml
-USER 65532:65532
-WORKDIR /home/opa
-CMD ["sleep", "infinity"]
-
+# AppSec scan runners live in OSA-API (osa-runner-scan).
 # Git-only runner for prepare-adjacent host tools that still need a box.
-FROM debian:bookworm-slim AS opa-runner-git
+FROM debian:bookworm-slim AS ora-runner-git
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates git \
  && rm -rf /var/lib/apt/lists/* \
@@ -96,7 +78,7 @@ CMD ["sleep", "infinity"]
 
 # AI runner: Cursor agent at a baked fixed path + Playwright for browser MCP.
 # Chromium needs --no-sandbox inside an already-hardened box (accepted).
-FROM debian:bookworm-slim AS opa-runner-ai
+FROM debian:bookworm-slim AS ora-runner-ai
 ARG TARGETARCH
 ARG PLAYWRIGHT_VERSION=1.50.1
 ARG PLAYWRIGHT_MCP_VERSION=0.0.28
@@ -125,7 +107,7 @@ RUN apt-get update \
       && chmod -R a+rX /opt/opa/cursor-agent-dist \
       && chmod 0755 /opt/opa/agent \
       && test -x /opt/opa/agent) \
- || (echo "ERROR: Cursor Agent CLI required for opa-runner-ai" >&2; exit 1) \
+ || (echo "ERROR: Cursor Agent CLI required for ora-runner-ai" >&2; exit 1) \
  && PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
       npx --yes "playwright@${PLAYWRIGHT_VERSION}" install-deps chromium \
  && PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
@@ -147,7 +129,7 @@ CMD ["sleep", "infinity"]
 # Prefer this over third-party images; org-private hebabil/php-8.4-cli remains
 # allowlisted when operators need full extension parity for a specific fleet.
 # phpunit/phpstan/php-cs-fixer are expected from project vendor/ after composer install.
-FROM php:8.4-cli-bookworm AS opa-runner-php
+FROM php:8.4-cli-bookworm AS ora-runner-php
 COPY --from=mlocati/php-extension-installer /usr/bin/install-php-extensions /usr/local/bin/
 COPY --from=composer:2 /usr/bin/composer /usr/local/bin/composer
 RUN apt-get update \
@@ -172,14 +154,14 @@ USER 65532:65532
 WORKDIR /home/opa
 CMD ["sleep", "infinity"]
 
-# Shared allowlist HTTPS CONNECT proxy for AI job boxes on --internal networks.
+# Shared allowlist HTTPS CONNECT proxy for review job boxes on --internal networks.
 # Only this container joins both the egress network and per-job bridges.
-FROM alpine:3.20 AS opa-egress-proxy
+FROM alpine:3.20 AS ora-egress-proxy
 RUN apk --no-cache add ca-certificates \
  && adduser -D -u 65532 -g 65532 opa
-COPY --from=builder /app/opa-orchestrator /opa-orchestrator
+COPY --from=builder /app/ora-api /ora-api
 USER 65532:65532
 ENV OPA_EGRESS_PROXY_LISTEN=:3128 \
     OPA_EGRESS_ALLOWLIST=api.cursor.sh,api2.cursor.sh
 EXPOSE 3128
-ENTRYPOINT ["/opa-orchestrator", "egress-proxy"]
+ENTRYPOINT ["/ora-api", "egress-proxy"]

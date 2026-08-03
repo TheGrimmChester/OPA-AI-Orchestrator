@@ -1596,7 +1596,7 @@ func processContinuousSCMJob(jobID string) {
 	jobDashURL := scmJobDashboardURL(job.ID)
 	var appSecID int64
 	if !job.AIOnly {
-		appSecID, _ = githubCreateCheckRun(conn, owner, repoName, "OPA AppSec Gate", job.CommitSHA, "in_progress", "", "Scanning…", checkRunSummaryWithJobLink("Repo Watch lite/stub scanners running", job.ID), jobDashURL, nil)
+		appSecID, _ = githubCreateCheckRun(conn, owner, repoName, "AppSec Gate", job.CommitSHA, "in_progress", "", "Scanning…", checkRunSummaryWithJobLink("Repo Watch lite/stub scanners running", job.ID), jobDashURL, nil)
 		job.CheckRunIDs["appsec"] = appSecID
 	}
 	var aiCheckID int64
@@ -1949,93 +1949,6 @@ func processContinuousSCMJob(jobID string) {
 	// Cleanup old worktrees (best-effort)
 	go cleanupOldSCMWorktrees(securityWorkspaceRoot(), 24*time.Hour)
 	_ = absRoot
-}
-
-func evaluateScopedGate(org, runID, minSev string) map[string]interface{} {
-	fail := false
-	reasons := []string{}
-	softNotes := []string{}
-	if queryClient != nil && runID != "" {
-		sevFilter := "severity IN ('critical','high')"
-		switch strings.ToLower(minSev) {
-		case "critical":
-			sevFilter = "severity = 'critical'"
-		case "medium":
-			sevFilter = "severity IN ('critical','high','medium')"
-		case "low":
-			sevFilter = "1=1"
-		}
-		rid := escapeSQL(runID)
-		for _, table := range []string{"secret_findings", "sast_findings", "iac_findings"} {
-			rows, err := queryClient.Query(fmt.Sprintf(`SELECT count() AS c FROM opa.%s WHERE security_run_id = '%s' AND %s`, table, rid, sevFilter))
-			if err == nil && len(rows) > 0 && getFloat64(rows[0], "c") > 0 {
-				fail = true
-				reasons = append(reasons, table+" findings present")
-			}
-		}
-	}
-	// Immediate path: live run summary (insertAsync may lag behind CH queries).
-	if !fail {
-		if live := liveSecurityRun(runID); live != nil {
-			if sj, _ := live["summary_json"].(string); sj != "" {
-				var sm struct {
-					Counts          map[string]int            `json:"counts"`
-					SeverityCounts  map[string]map[string]int `json:"severity_counts"`
-					FilteredSecrets int                       `json:"secrets_filtered_fp"`
-				}
-				_ = json.Unmarshal([]byte(sj), &sm)
-				if blocking := liveBlockingCount(sm.SeverityCounts, "secrets", minSev); blocking > 0 {
-					fail = true
-					reasons = append(reasons, "secret findings present (live)")
-				} else if sm.Counts["secrets"] > 0 {
-					// Counts exist but none meet min_severity (e.g. medium generic-api-key only).
-					softNotes = append(softNotes, fmt.Sprintf("secrets below gate threshold (min=%s, filtered_fp=%d)", minSev, sm.FilteredSecrets))
-				}
-				if sm.Counts["sast"] > 0 && strings.ToLower(minSev) != "critical" {
-					if blocking := liveBlockingCount(sm.SeverityCounts, "sast", minSev); blocking > 0 || sm.SeverityCounts["sast"] == nil {
-						fail = true
-						reasons = append(reasons, "sast findings present (live)")
-					}
-				}
-				if sm.Counts["iac"] > 0 && (minSev == "medium" || minSev == "low") {
-					fail = true
-					reasons = append(reasons, "iac findings present (live)")
-				}
-			}
-		}
-	}
-	status := "pass"
-	if fail {
-		status = "fail"
-	}
-	_ = org
-	out := map[string]interface{}{
-		"status": status, "fail": fail, "reasons": reasons, "scope": "security_run",
-		"security_run_id": runID, "min_severity": minSev,
-	}
-	if len(softNotes) > 0 {
-		out["soft_notes"] = softNotes
-	}
-	return out
-}
-
-// liveBlockingCount returns how many findings at/above minSev are in severity_counts[kind].
-func liveBlockingCount(sev map[string]map[string]int, kind, minSev string) int {
-	if sev == nil || sev[kind] == nil {
-		return 0
-	}
-	m := sev[kind]
-	n := m["critical"]
-	switch strings.ToLower(minSev) {
-	case "critical":
-		return n
-	case "medium":
-		return n + m["high"] + m["medium"]
-	case "low":
-		return n + m["high"] + m["medium"] + m["low"] + m["info"]
-	default: // high
-		return n + m["high"]
-	}
 }
 
 func checkoutSCMRepo(c *opaConnector, fullName, sha string, pr int, relPath string) (string, error) {
