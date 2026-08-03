@@ -87,13 +87,24 @@ func TestHandleAgentPrefsPutOrgWithoutScopeKey(t *testing.T) {
 	if prefs == nil {
 		t.Fatal("missing prefs")
 	}
-	// JSON numbers/bools via RawMessage round-trip as decoded values in map after unmarshal of response
-	raw := string(mustJSON(prefs["pr_summaries"]))
-	if !strings.Contains(raw, "false") {
-		// prefs values may already be bool
-		if prefs["pr_summaries"] != false {
-			t.Fatalf("stored pr_summaries want false, got %#v", prefs["pr_summaries"])
-		}
+	if prefs["pr_summaries"] != false {
+		t.Fatalf("stored pr_summaries want false, got %#v", prefs["pr_summaries"])
+	}
+}
+
+func TestHandleAgentPrefsPutRequiresLevel(t *testing.T) {
+	t.Setenv("OPA_SCM_STATE_DIR", t.TempDir())
+	prev := authEnforced
+	authEnforced = false
+	defer func() { authEnforced = prev }()
+
+	body := []byte(`{"prefs":{"pr_summaries":true}}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/agents/prefs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	handleAgentPrefs(rr, req)
+	if rr.Code != 400 || !strings.Contains(rr.Body.String(), "level required") {
+		t.Fatalf("want 400 level required, got %d %s", rr.Code, rr.Body.String())
 	}
 }
 

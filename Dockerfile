@@ -134,7 +134,7 @@ RUN apt-get update \
  && chown -R 65532:65532 /home/opa /opt/ms-playwright \
  && rm -rf /root/.npm /tmp/* /root/.local \
  && test -x /opt/opa/agent \
- && /opt/opa/agent --help >/dev/null 2>&1 || /opt/opa/agent --version >/dev/null 2>&1 || true
+ && (/opt/opa/agent --help >/dev/null 2>&1 || /opt/opa/agent --version >/dev/null 2>&1 || true)
 ENV PATH="/opt/opa:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
     NO_OPEN_BROWSER=1 \

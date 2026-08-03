@@ -43,6 +43,12 @@ type agentPrefs struct {
 	CloudEnabled             bool   `json:"cloud_enabled"`
 	CloudRunTests            bool   `json:"cloud_run_tests"`
 	CheckupEnabled           bool   `json:"checkup_enabled"`
+	// AI Issues / roadmap (Aperant-style autonomy). Fail-closed capabilities.
+	AIIssueLabels            []string `json:"ai_issue_labels"`
+	IssueAutoImplement       bool     `json:"issue_auto_implement"`
+	RoadmapProjectsV2        bool     `json:"roadmap_projects_v2"`
+	RequireHumanBeforeCoding bool     `json:"require_human_before_coding"`
+	AIIssuesEnabled          bool     `json:"ai_issues_enabled"`
 }
 
 func builtinAgentPrefs() agentPrefs {
@@ -67,6 +73,11 @@ func builtinAgentPrefs() agentPrefs {
 		CloudEnabled:             true,
 		CloudRunTests:            false,
 		CheckupEnabled:           false,
+		AIIssueLabels:            []string{"AI"},
+		IssueAutoImplement:       false,
+		RoadmapProjectsV2:        false,
+		RequireHumanBeforeCoding: true,
+		AIIssuesEnabled:          true,
 	}
 }
 
@@ -74,6 +85,8 @@ func builtinAgentPrefs() agentPrefs {
 var agentPrefsCapabilityFields = map[string]bool{
 	"cloud_enabled": true, "cloud_run_tests": true, "autofix_mode": true,
 	"auto_approve": true, "learned_rules": true, "checkup_enabled": true,
+	"issue_auto_implement": true, "roadmap_projects_v2": true,
+	"ai_issues_enabled": true,
 }
 
 type agentPrefsRow struct {
@@ -201,6 +214,38 @@ func applyPrefsPatch(out *agentPrefs, sources map[string]string, patch map[strin
 	takeBool("cloud_enabled", &out.CloudEnabled)
 	takeBool("cloud_run_tests", &out.CloudRunTests)
 	takeBool("checkup_enabled", &out.CheckupEnabled)
+	takeBool("issue_auto_implement", &out.IssueAutoImplement)
+	takeBool("roadmap_projects_v2", &out.RoadmapProjectsV2)
+	takeBool("require_human_before_coding", &out.RequireHumanBeforeCoding)
+	takeBool("ai_issues_enabled", &out.AIIssuesEnabled)
+	if raw, ok := patch["ai_issue_labels"]; ok && string(raw) != "null" {
+		var labels []string
+		if json.Unmarshal(raw, &labels) == nil && labels != nil {
+			out.AIIssueLabels = labels
+			sources["ai_issue_labels"] = level
+		}
+	}
+}
+
+// issueLabelMatchesPrefs reports whether any of the issue's labels is in the
+// configured AI gate list (case-insensitive). Empty prefs list → no match.
+func issueLabelMatchesPrefs(prefs agentPrefs, labels []string) bool {
+	want := prefs.AIIssueLabels
+	if len(want) == 0 {
+		want = []string{"AI"}
+	}
+	for _, l := range labels {
+		ln := strings.TrimSpace(l)
+		if ln == "" {
+			continue
+		}
+		for _, w := range want {
+			if strings.EqualFold(ln, strings.TrimSpace(w)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func loadAgentPrefsJSON(org, proj, level, scope string) string {
@@ -432,7 +477,11 @@ func handleAgentPrefsPut(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, _ := ExtractTenantContext(r, queryClient)
 	org, proj := ctx.WriteTenant()
-	level := strings.ToLower(strings.TrimSpace(nz(body.Level, "org")))
+	level := strings.ToLower(strings.TrimSpace(body.Level))
+	if level == "" {
+		http.Error(w, "level required — use org, installation, or repo (omit only on GET, which defaults to org)", 400)
+		return
+	}
 	switch level {
 	case "org", "installation", "repo":
 	default:
