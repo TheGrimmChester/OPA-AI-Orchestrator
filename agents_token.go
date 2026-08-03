@@ -62,6 +62,114 @@ func githubPermsCreatePR() map[string]string {
 	}
 }
 
+// githubPermsIssuesWrite is required for standalone Issues (labels, body,
+// milestones, comments) and for AI-issue / roadmap automation.
+func githubPermsIssuesWrite() map[string]string {
+	return map[string]string{
+		"issues":   "write",
+		"metadata": "read",
+	}
+}
+
+// githubPermsProjectsWrite is org Projects (classic + v2 GraphQL). Only
+// requested when roadmap_projects_v2 is enabled.
+func githubPermsProjectsWrite() map[string]string {
+	return map[string]string{
+		"organization_projects": "write",
+		"metadata":              "read",
+	}
+}
+
+// githubAppRequiredPermsForAIIssues lists App permission keys/levels needed for
+// AI-labelled issue + roadmap (milestones) features. Projects is optional.
+func githubAppRequiredPermsForAIIssues() map[string]string {
+	return map[string]string{
+		"contents":      "write",
+		"metadata":      "read",
+		"pull_requests": "write",
+		"issues":        "write",
+		"checks":        "write",
+	}
+}
+
+// githubAppOptionalPermsForProjects is probed separately; missing is OK unless
+// roadmap_projects_v2 is on.
+func githubAppOptionalPermsForProjects() map[string]string {
+	return map[string]string{
+		"organization_projects": "write",
+	}
+}
+
+// installationPermHealth compares granted installation permissions against
+// required/optional maps. Safe for PAT connectors (reports kind=pat).
+type installationPermHealth struct {
+	Kind            string            `json:"kind"`
+	InstallationID  string            `json:"installation_id,omitempty"`
+	Granted         map[string]string `json:"granted"`
+	Missing         []string          `json:"missing"`
+	OptionalMissing []string          `json:"optional_missing"`
+	OK              bool              `json:"ok"`
+	ProjectsOK      bool              `json:"projects_ok"`
+	Notes           []string          `json:"notes,omitempty"`
+}
+
+func assessInstallationPermHealth(conn *opaConnector) installationPermHealth {
+	out := installationPermHealth{
+		Granted: map[string]string{}, Missing: []string{}, OptionalMissing: []string{},
+	}
+	if conn == nil {
+		out.Notes = append(out.Notes, "connector not found")
+		return out
+	}
+	out.Kind = conn.Kind
+	out.InstallationID = conn.InstallationID
+	if conn.Kind == "github_pat" {
+		out.OK = true
+		out.ProjectsOK = false
+		out.Notes = append(out.Notes, "PAT connectors are not probed; ensure classic repo scope or fine-grained Issues+Contents+PRs")
+		return out
+	}
+	if conn.InstallationID == "" {
+		out.Notes = append(out.Notes, "no installation_id")
+		return out
+	}
+	granted, err := probeGitHubInstallationPermissions(conn.InstallationID)
+	if err != nil {
+		out.Notes = append(out.Notes, err.Error())
+		return out
+	}
+	out.Granted = granted
+	for k, want := range githubAppRequiredPermsForAIIssues() {
+		g, ok := granted[k]
+		if !ok || g == "" {
+			out.Missing = append(out.Missing, k)
+			continue
+		}
+		if want == "write" && g == "read" {
+			out.Missing = append(out.Missing, k+"(write>read)")
+		}
+	}
+	for k, want := range githubAppOptionalPermsForProjects() {
+		g, ok := granted[k]
+		if !ok || g == "" {
+			out.OptionalMissing = append(out.OptionalMissing, k)
+			continue
+		}
+		if want == "write" && g == "read" {
+			out.OptionalMissing = append(out.OptionalMissing, k+"(write>read)")
+		}
+	}
+	out.OK = len(out.Missing) == 0
+	out.ProjectsOK = len(out.OptionalMissing) == 0
+	if !out.OK {
+		out.Notes = append(out.Notes, "grant Issues write (+ Contents write, PRs, Checks) on the GitHub App and re-accept permissions")
+	}
+	if !out.ProjectsOK {
+		out.Notes = append(out.Notes, "organization_projects write required only when roadmap_projects_v2 is enabled")
+	}
+	return out
+}
+
 // stripWorkflowsPerm copies perms without a workflows key.
 func stripWorkflowsPerm(perms map[string]string) map[string]string {
 	if len(perms) == 0 {

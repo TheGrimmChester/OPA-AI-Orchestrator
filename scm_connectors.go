@@ -388,7 +388,29 @@ func handleConnectorSub(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if len(parts) >= 2 && parts[1] == "permissions" && r.Method == http.MethodGet {
+		handleConnectorPermissions(w, r, id)
+		return
+	}
 	http.Error(w, "not found", 404)
+}
+
+// GET /api/connectors/{id}/permissions — installation permission health for
+// AI Issues / roadmap (Dashboard banner).
+func handleConnectorPermissions(w http.ResponseWriter, r *http.Request, id string) {
+	c := getOrHydrateConnector(id)
+	if denyConnectorIfInvisible(w, r, c) {
+		return
+	}
+	health := assessInstallationPermHealth(c)
+	writeJSON(w, map[string]interface{}{
+		"ok": true, "connector_id": id, "permissions": health,
+		"required_events": []string{
+			"pull_request", "push", "installation", "installation_repositories",
+			"issues", "issue_comment", "label",
+		},
+		"optional_events": []string{"projects_v2_item"},
+	})
 }
 
 // denyConnectorIfInvisible writes 404 when the connector is missing or the
