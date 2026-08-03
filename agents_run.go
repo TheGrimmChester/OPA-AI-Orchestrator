@@ -439,6 +439,13 @@ func foldRunStatus(children []*scmJob, parentStatus string) string {
 // duplicating existing children.
 func ensureRunChildren(parent *scmJob) []*scmJob {
 	existing := listRunChildren(parent.ID)
+	// Issue/roadmap graphs are planned at enqueue — do not inject PR children.
+	if parent != nil {
+		switch agentKind(parent.Kind) {
+		case kindIssueRun, kindRoadmapRun:
+			return existing
+		}
+	}
 	prefs := agentPrefsFromSummary(parent)
 	planned := planRunChildren(parent, prefs, false, "")
 	have := map[agentKind]bool{}

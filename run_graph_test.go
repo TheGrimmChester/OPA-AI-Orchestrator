@@ -28,12 +28,16 @@ func TestProcessSCMJobDispatchesAgentChildren(t *testing.T) {
 		want string
 	}{
 		{kindRun, "run"},
+		{kindIssueRun, "run"},
+		{kindRoadmapRun, "run"},
 		{kindPrepare, "agent"},
 		{kindSecurity, "agent"},
 		{kindBugbot, "agent"},
 		{kindCheckup, "agent"},
 		{kindApproval, "agent"},
 		{kindCloud, "agent"},
+		{kindIssueInvestigate, "agent"},
+		{kindRoadmapGenerate, "agent"},
 		{kindContinuous, "continuous"},
 		{agentKind(""), "unknown"},
 		{agentKind("unknown"), "unknown"},

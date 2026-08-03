@@ -327,6 +327,23 @@ func buildKindResults(job *scmJob) map[string]interface{} {
 		if v, ok := sum["publish_refused"]; ok {
 			out["publish_refused"] = v
 		}
+	case kindIssueRun, kindIssueInvestigate, kindIssuePublish, kindIssueImplement:
+		for _, k := range []string{
+			"findings", "spec_draft", "implement", "issue_status", "issue_number",
+			"issue_labels", "plan_comment_id", "skip_reason", "publish_refused",
+		} {
+			if v, ok := sum[k]; ok {
+				out[k] = v
+			}
+		}
+	case kindRoadmapRun, kindRoadmapGenerate, kindRoadmapPublish:
+		for _, k := range []string{
+			"discovery", "competitor_analysis", "roadmap", "publish", "contexts", "auto_publish",
+		} {
+			if v, ok := sum[k]; ok {
+				out[k] = v
+			}
+		}
 	case kindRun:
 		for _, k := range []string{"child_ids", "child_status", "prefs", "prefs_sources", "gate", "ai", "ledger", "auto_fixes"} {
 			if v, ok := sum[k]; ok {
