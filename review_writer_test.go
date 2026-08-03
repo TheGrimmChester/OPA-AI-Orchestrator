@@ -29,12 +29,12 @@ func TestReviewStateMatchesEvent(t *testing.T) {
 }
 
 func TestFindFirstOPADecisionReview(t *testing.T) {
-	t.Setenv("OPA_GITHUB_APP_SLUG", "opa-ai-orchestrator")
+	t.Setenv("OPA_GITHUB_APP_SLUG", "ora")
 	reviews := []githubPRReview{
 		{ID: 1, User: "someone", Body: "**OPA Review**", State: "COMMENTED"},
-		{ID: 2, User: "opa-ai-orchestrator[bot]", Body: "noise", State: "COMMENTED"},
-		{ID: 3, User: "opa-ai-orchestrator[bot]", Body: "**OPA Review**\n\nConfidence **25/100**.", State: "COMMENTED"},
-		{ID: 4, User: "opa-ai-orchestrator[bot]", Body: opaReviewDecisionMarker + "\nlater", State: "CHANGES_REQUESTED"},
+		{ID: 2, User: "ora[bot]", Body: "noise", State: "COMMENTED"},
+		{ID: 3, User: "ora[bot]", Body: "**OPA Review**\n\nConfidence **25/100**.", State: "COMMENTED"},
+		{ID: 4, User: "ora[bot]", Body: opaReviewDecisionMarker + "\nlater", State: "CHANGES_REQUESTED"},
 	}
 	first := findFirstOPADecisionReview(reviews)
 	if first == nil || first.ID != 3 {

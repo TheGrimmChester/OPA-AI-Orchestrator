@@ -892,7 +892,7 @@ func githubRequestPRReviewersEx(c *opaConnector, owner, repo string, pr int, rev
 func githubAppReviewerLogin() string {
 	slug := strings.TrimSpace(os.Getenv("OPA_GITHUB_APP_SLUG"))
 	if slug == "" {
-		slug = "opa-ai-orchestrator"
+		slug = "ora"
 	}
 	return slug
 }

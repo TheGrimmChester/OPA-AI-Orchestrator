@@ -22,7 +22,7 @@ import (
 const (
 	egressProxyRoleLabel     = "egress-proxy"
 	egressProxyPort          = 3128
-	egressProxyAlias         = "opa-egress-proxy"
+	egressProxyAlias         = "open-egress-proxy"
 	networkModeInternalProxy = "internal+proxy" // sentinel for networkForPhase / runner
 )
 
@@ -160,11 +160,11 @@ func egressProxyImage() string {
 		return v
 	}
 	tag := nz(strings.TrimSpace(os.Getenv("OPA_JOB_IMAGE_TAG")), "smoke")
-	return "opa-egress-proxy:" + tag
+	return "open-egress-proxy:" + tag
 }
 
 func egressProxyContainerName() string {
-	return "opa-egress-proxy-" + opaInstanceID()
+	return "open-egress-proxy-" + opaInstanceID()
 }
 
 func egressNetworkName() string {
