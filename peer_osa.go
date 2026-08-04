@@ -39,17 +39,22 @@ func peerOSAEvaluateGate(ctx context.Context, org, runID, minSev string) (map[st
 	return out, err
 }
 
-func runSecurityScanViaOSA(runID, org, proj, service, profile string, scanners []string, targetPath, repo string, pr int, sha, scmJob string) bool {
+// runSecurityScanViaOSA reports whether OSA owns this scan (peer configured) and
+// whether the run was actually created. A create failure must surface: OSA has no
+// run to scan, so a later gate query finds no findings and would otherwise read
+// as a clean pass.
+func runSecurityScanViaOSA(runID, org, proj, service, profile string, scanners []string, targetPath, repo string, pr int, sha, scmJob string) (bool, error) {
 	if strings.TrimSpace(os.Getenv("PEER_OSA_URL")) == "" {
-		return false
+		return false, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	_, err := peerOSACreateSecurityRun(ctx, org, proj, service, profile, scanners, targetPath, repo, pr, sha, scmJob, runID)
 	if err != nil {
 		openlogger.LogWarn("peer OSA security run failed", map[string]interface{}{"error": err.Error(), "security_run_id": runID})
+		return true, err
 	}
-	return true
+	return true, nil
 }
 
 func evaluateScopedGateViaOSA(org, runID, minSev string) (map[string]interface{}, bool) {
@@ -61,11 +66,16 @@ func evaluateScopedGateViaOSA(org, runID, minSev string) (map[string]interface{}
 	out, err := peerOSAEvaluateGate(ctx, org, runID, minSev)
 	if err != nil {
 		openlogger.LogWarn("peer OSA gate failed", map[string]interface{}{"error": err.Error(), "security_run_id": runID})
-		return map[string]interface{}{
-			"status": "error", "fail": true, "reasons": []string{"peer_unavailable"},
-			"scope": "security_run", "security_run_id": runID, "min_severity": minSev,
-			"error": err.Error(),
-		}, true
+		g := gateNotRun(runID, minSev, "peer_unavailable",
+			"OSA gate call failed — nothing was evaluated; this is not a clean scan")
+		g["error"] = err.Error()
+		return g, true
 	}
+	if out == nil {
+		out = map[string]interface{}{}
+	}
+	// Mark that OSA really answered, so a zero finding count means "scanned and
+	// clean" rather than "never scanned".
+	out["evaluated"] = true
 	return out, true
 }
