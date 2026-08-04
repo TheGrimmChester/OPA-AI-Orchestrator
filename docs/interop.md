@@ -26,8 +26,6 @@ User JWTs and standalone `/api/auth/*` come from **Open-Auth-Go** (`Gate`); this
 
 When `OPA_AUTH_REQUIRED=1`, send **`X-Organization-ID`** and **`X-Project-ID`** on control-plane calls so ClickHouse scopes match the dashboard tenant picker. Omitting them (or sending `"all"`) scopes to **`default-org` / `default-project`** — the same write tenant used for INSERT (Open-Tenant-Go ≥ 0.2.2). Prefer always sending concrete headers so scripts match the UI.
 
-Some SCM admin lists (for example connectors / jobs with honesty text for tenant All) may still return broader rows when headers are omitted.
-
 ```bash
 TOKEN=$(curl -sf -X POST http://127.0.0.1:18080/api/auth/login \
   -H 'Content-Type: application/json' \

@@ -75,7 +75,7 @@ func handleReviewContextsList(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	list := listReviewContexts(repo, group)
+	list := listReviewContexts(actorFromRequest(r), r, repo, group)
 	writeJSON(w, map[string]interface{}{"contexts": list})
 }
 
@@ -639,18 +639,31 @@ func getReviewContext(id string) *opaReviewContext {
 	return rc
 }
 
-func listReviewContexts(repoFilter, groupFilter string) []opaReviewContext {
+func listReviewContexts(a credActor, r *http.Request, repoFilter, groupFilter string) []opaReviewContext {
 	seen := map[string]struct{}{}
 	out := []opaReviewContext{}
-	reviewContextLive.Range(func(_, v interface{}) bool {
-		rc, ok := v.(*opaReviewContext)
-		if !ok || rc.Deleted {
-			return true
+	visible := func(rc *opaReviewContext) bool {
+		if rc == nil || rc.Deleted {
+			return false
 		}
 		if repoFilter != "" && rc.RepoFullName != repoFilter {
-			return true
+			return false
 		}
 		if groupFilter != "" && rc.LinkGroupID != groupFilter {
+			return false
+		}
+		if !authEnforced {
+			return true
+		}
+		sel := strings.TrimSpace(a.OrganizationID)
+		if sel == "" {
+			sel = defaultOrgID
+		}
+		return normalizeTenantOrg(rc.OrganizationID) == normalizeTenantOrg(sel)
+	}
+	reviewContextLive.Range(func(_, v interface{}) bool {
+		rc, ok := v.(*opaReviewContext)
+		if !ok || !visible(rc) {
 			return true
 		}
 		out = append(out, *rc)
@@ -658,9 +671,23 @@ func listReviewContexts(repoFilter, groupFilter string) []opaReviewContext {
 		return true
 	})
 	if queryClient != nil {
-		q := `SELECT id, organization_id, project_id, connector_id, repo_full_name, title, body_markdown,
+		scopeSQL := ""
+		switch {
+		case r != nil:
+			scopeSQL = tenantScopeSQL(r, queryClient, "")
+		case authEnforced:
+			ctx := TenantContext{OrganizationID: a.OrganizationID, ProjectID: a.ProjectID}
+			if ctx.OrganizationID == "" {
+				ctx.OrganizationID = defaultOrgID
+			}
+			if ctx.ProjectID == "" {
+				ctx.ProjectID = defaultProjectID
+			}
+			scopeSQL = ctx.ScopeAnd("")
+		}
+		q := fmt.Sprintf(`SELECT id, organization_id, project_id, connector_id, repo_full_name, title, body_markdown,
 		             tags_json, link_group_id, source, updated_at, created_at, deleted
-		      FROM opa.review_contexts WHERE deleted = 0`
+		      FROM opa.review_contexts WHERE deleted = 0%s`, scopeSQL)
 		if repoFilter != "" {
 			q += fmt.Sprintf(` AND repo_full_name = '%s'`, escapeSQL(repoFilter))
 		}
@@ -675,6 +702,9 @@ func listReviewContexts(repoFilter, groupFilter string) []opaReviewContext {
 					continue
 				}
 				if _, ok := seen[rc.ID]; ok {
+					continue
+				}
+				if !visible(rc) {
 					continue
 				}
 				out = append(out, *rc)
@@ -759,13 +789,17 @@ func linkGroupForRepo(repo string) string {
 }
 
 func resolveReviewContextsForRepo(org, proj, repo string) appliedReviewContexts {
-	_ = org
-	_ = proj
 	applied := appliedReviewContexts{
 		Primary: []opaReviewContext{}, Linked: []opaReviewContext{}, Org: []opaReviewContext{},
 		GroupID: linkGroupForRepo(repo),
 	}
-	all := listReviewContexts("", "")
+	wantOrg := normalizeTenantOrg(org)
+	wantProj := strings.TrimSpace(proj)
+	if wantProj == "" || strings.EqualFold(wantProj, tenantAll) {
+		wantProj = defaultProjectID
+	}
+	actor := credActor{OrganizationID: wantOrg, ProjectID: wantProj}
+	all := listReviewContexts(actor, nil, "", "")
 	for _, rc := range all {
 		if rc.RepoFullName == "*" || rc.RepoFullName == "" {
 			applied.Org = append(applied.Org, rc)
