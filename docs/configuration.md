@@ -16,6 +16,7 @@
 | `OPA_GITHUB_APP_SLUG` | GitHub App slug for install URLs and reviewer login. Fallback `ora`; set to the **installed** App slug in production (do not force-rename a live App). |
 | `OPA_GITHUB_APP_PRIVATE_KEY` | GitHub App PEM |
 | `OPA_GITHUB_WEBHOOK_SECRET` | Webhook HMAC secret |
+| `OPA_GITHUB_GRAPHQL_URL` | GitHub GraphQL endpoint used by the Projects v2 surface (default `https://api.github.com/graphql`). Override for a GitHub Enterprise host or a test stub. |
 | `ORA_RUNNER_TAG` | Runner image tag (`smoke` or `nas`) |
 | `ORCHESTRATOR_LISTEN_ADDR` | Orchestrator health listen (default `:8096`) |
 | `OPA_GATE_WAIT_TIMEOUT_SEC` | How long the AppSec Gate waits for the OSA security run to finish before reporting `scan_incomplete` (default `600`) |

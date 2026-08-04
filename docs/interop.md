@@ -74,16 +74,45 @@ Failures are machine-readable rather than a generic `502`, so the caller can rep
 | `issue_not_found` | 404 | The issue was deleted, transferred, or is invisible to this connector. |
 | `upstream_error` | 502 | Anything else; `error` carries GitHub's own status and body. |
 
-**GitHub permissions for `scm:pm`:** Issues write covers milestones and the Issues surface above. Organization projects write is needed for Projects v2 only (optional — without it milestone and Issues routes still work; projects list returns `missing_organization_projects`).
+### Projects v2 peer surface (`scm:pm`)
 
-**Projects v2 `sync-item` covers create and status only.** `POST /api/peer/scm/projects/sync-item` creates a
-draft item when no `item_id` is supplied (`github_projects.go:274-292`) and can set the Status single-select
-from a column hint (`githubSetProjectV2ItemStatus`). It does **not** update the title or body of an item that
-already exists: `githubUpdateProjectV2DraftIssue` (`github_projects.go:294-302`) returns `nil` without calling
-the API — updating a draft issue needs the draft's content id, which callers do not have — and the caller
-discards its return value (`peer_scm_pm.go:268`). A rename therefore comes back `{"ok": true}` while the board
-is unchanged, with no `status_note` to hint at it. Callers should not treat a successful `sync-item` as
-confirmation that the item's title matches.
+| Endpoint | Body | Returns |
+|----------|------|---------|
+| `POST /api/peer/scm/projects/list` | `owner` or `repo_full_name` | `projects` (id, title, number, url) |
+| `POST /api/peer/scm/projects/items/upsert` | `project_id`, `item_id` (optional), `title`, `body`, `status_hint` | `item_id`, `title_synced`, `title_status`, `title_note`, `status_synced`, `status_note` |
+| `POST /api/peer/scm/projects/items/status` | `project_id`, `item_id`, `status_hint` | `status_synced`, `status` |
+
+`items/upsert` creates a draft item when no `item_id` is supplied, and **does now refresh the title and body of
+an item that already exists.** Projects v2 has no mutation that renames a board item directly:
+`updateProjectV2DraftIssue` takes the draft's own content id, so `githubUpdateProjectV2DraftIssue` first resolves
+the `PVTI_…` item id to its backing `DraftIssue.id` (`ProjectV2Item.content` is a `DraftIssue | Issue |
+PullRequest` union) and then mutates. A blank `title` or `body` means "leave that field unchanged".
+
+The outcome is always reported — the caller must not assume a rename landed:
+
+| `title_status` | `title_synced` | Meaning |
+|----------------|----------------|---------|
+| `ok` | `true` | GitHub confirmed the draft was updated, or the item was just created with this title. |
+| `nothing_to_sync` | `false` | Neither title nor body was supplied. |
+| `title_sync_unsupported` | `false` | The card is backed by a real Issue or PR. Its title lives on the issue and **cannot** be changed through Projects v2 — use the Issues surface above instead. |
+| `item_not_found` | `false` | The project item, or its draft content, is gone. |
+| `missing_organization_projects` | `false` | The installation lacks organization projects write. |
+| `upstream_error` | `false` | Anything else GitHub returned; `title_note` carries the detail. |
+
+Hard failures (the item could not be created, or the installation cannot use Projects v2 at all) are real
+non-2xx responses carrying `status`, mirroring the Issues contract: `403 missing_organization_projects`,
+`404 item_not_found`, `422 title_sync_unsupported`, `502 upstream_error`.
+
+**GitHub permissions for `scm:pm`:** Issues write covers milestones and the Issues surface above.
+
+Projects v2 additionally requires **Organization permissions › Projects: Read and write**
+(`organization_projects: write`) on the GitHub App installation. This is *not* granted by the current
+installation, so every Projects v2 route — list, `items/upsert`, `items/status` — pre-flights the installation
+permission probe and refuses with `403 missing_organization_projects` (carrying `missing`, `granted`, and a
+`note` naming the permission) before contacting GitHub. Until that permission is granted and the installation
+permissions re-accepted, the whole Projects v2 path is unreachable in practice; milestone and Issues routes are
+unaffected. PAT connectors cannot be probed and instead surface GitHub's own answer, classified into the same
+statuses. A deployment with the permission granted is required to prove the live update end to end.
 
 ## Review vs AppSec gate
 
