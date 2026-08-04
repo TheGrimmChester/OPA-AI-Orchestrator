@@ -22,6 +22,30 @@ User JWTs and standalone `/api/auth/*` come from **Open-Auth-Go** (`Gate`); this
 | **Standalone** | `ora-api` issues JWTs (`POST /api/auth/login`, `GET /api/auth/status`). Lab admin: `admin`/`admin`. |
 | **Co-deployed** | Share `JWT_SECRET` with **OPA-Hub**; hub issues tokens; `ora-api` validates only. Local login returns `503`. |
 
+## Tenant headers
+
+When `OPA_AUTH_REQUIRED=1`, send **`X-Organization-ID`** and **`X-Project-ID`** on control-plane calls so ClickHouse scopes match the dashboard tenant picker. Open-Tenant treats missing headers as a no-access filter on scoped queries (empty result), not as “all tenants”.
+
+Some SCM admin lists (for example connectors / jobs with honesty text for tenant All) may still return broader rows when headers are omitted — prefer always sending headers so scripts match the UI.
+
+```bash
+TOKEN=$(curl -sf -X POST http://127.0.0.1:18080/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin"}' | jq -r .token)
+
+curl -sf "http://127.0.0.1:8091/api/scm/jobs?limit=5" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Organization-ID: default-org" \
+  -H "X-Project-ID: default-project" | jq '{honesty, n:(.jobs|length)}'
+
+curl -sf http://127.0.0.1:8091/api/connectors \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Organization-ID: default-org" \
+  -H "X-Project-ID: default-project" | jq '.connectors | length'
+```
+
+From the LAN use `192.168.100.101` instead of `127.0.0.1`. Family overview: [OPA-Stack interop](https://github.com/TheGrimmChester/OPA-Stack/blob/main/docs/interop.md#tenant-headers-required-when-auth-is-on). Sibling products (OSA security runs, OPL perf scenarios/runs) return empty lists without these headers — see that doc.
+
 ## Service JWT
 
 Caller mints with `Open-Auth-Go` / `Open-Client-Go` peer helpers:
