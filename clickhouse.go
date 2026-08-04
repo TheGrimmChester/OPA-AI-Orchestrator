@@ -350,3 +350,16 @@ func (q *ClickHouseQuery) Execute(query string) error {
 	}
 	return nil
 }
+
+// ExecuteExact runs DDL/DML without opa.* → product-DB rewriting. Use when SQL
+// mixes hub and product qualifiers (legacy backfill INSERT SELECT).
+func (q *ClickHouseQuery) ExecuteExact(query string) error {
+	if q == nil || q.ch == nil {
+		return fmt.Errorf("clickhouse query client not configured")
+	}
+	if err := q.ch.Exec(query); err != nil {
+		openlogger.LogError(err, "ClickHouse ExecuteExact failed", nil)
+		return err
+	}
+	return nil
+}
