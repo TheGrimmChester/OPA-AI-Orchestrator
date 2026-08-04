@@ -49,10 +49,12 @@ From the LAN use `192.168.100.101` instead of `127.0.0.1`. Family overview: [OPA
 Caller mints with `Open-Auth-Go` / `Open-Client-Go` peer helpers:
 
 - `iss=ora-api`, `aud=osa-api` — scopes: `runs:write`, `findings:read`, `health:read`
-- `iss=opm-api`, `aud=ora-api` — scopes: `connectors:read`, `scm:clone`, `health:read`
+- `iss=opm-api`, `aud=ora-api` — scopes: `connectors:read`, `scm:clone`, `scm:pm`, `health:read`
 - `iss=osa-api`, `aud=ora-api` — scopes: `connectors:read`, `scm:clone`, `health:read`
 
-OPM and OSA discover GitHub repos via `GET /api/connectors` and `GET /api/connectors/{id}/repos` (user JWT or service JWT with `connectors:read`). Ephemeral clones use `POST /api/peer/scm/clone-credentials` (service JWT + `scm:clone` only). GitHub App/PAT secrets never leave ORA.
+OPM and OSA discover GitHub repos via `GET /api/connectors` and `GET /api/connectors/{id}/repos` (user JWT or service JWT with `connectors:read`). Ephemeral clones use `POST /api/peer/scm/clone-credentials` (service JWT + `scm:clone` only). Milestone list/upsert and Projects v2 list/item sync use `POST /api/peer/scm/milestones/*` and `POST /api/peer/scm/projects/*` (service JWT + `scm:pm`). GitHub App/PAT secrets never leave ORA.
+
+**GitHub permissions for `scm:pm`:** Issues write (milestones); Organization projects write for Projects v2 (optional — without it milestone routes still work; projects list returns `missing_organization_projects`).
 
 ## Review vs AppSec gate
 
