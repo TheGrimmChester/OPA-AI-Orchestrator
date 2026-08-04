@@ -8,10 +8,10 @@ OPA splits PR work into kinds on the existing `scmJob` row (`kind`, `run_id`,
 | `run` | Parent folder for children | No | No |
 | `prepare` | Worktree + related checkouts | No (git only) | No |
 | `security` | Lite scanners + gitleaks | Yes (scan) | Publish only (in-process) |
-| `bugbot` | Cursor agent review | Yes (review) | Publish only (in-process) |
+| `bugbot` | Automated code review (review runner) | Yes (review) | Publish only (in-process) |
 | `approval` | Policy + review event | No | Yes (sole APPROVE path) |
 | `cloud` | Autofix (patch → gate → clean land) | Yes (patch/verify) | Land only (in-process) |
-| `checkup` | AI-planned repo tests (opt-in) | Yes (sandbox required) | Check run only (in-process) |
+| `checkup` | Model-planned repo tests (opt-in) | Yes (sandbox required) | Check run only (in-process) |
 
 Invariant enforced at init: no stage combines `capExecUntrusted` with
 `capGitHubWrite` / `capGitPush` (`assertNoConfusedProfile`).
@@ -25,13 +25,13 @@ Capability prefs (default off): `checkup_enabled`, `cloud_run_tests`.
 
 Increments 1–7 are landed in this service: hardening (`jobEnv`, timeouts,
 scoped tokens), run graph + prefs, approval integrity, product surface (risk /
-summaries / rules), sandbox substrate, AI-planned checkup (incl. **phpstan
+summaries / rules), sandbox substrate, model-planned checkup (incl. **phpstan
 checkstyle** + baseline best-effort new-errors-only), and cloud branch mode
 (authorize → patch → `gateCloudDiff` → optional verify → **clean-tree land**,
 bounded re-auth iterations, babysit deleted).
 
-**Dashboard Agents UI** (tri-state prefs, run DAG detail) ships in OPA-Dashboard
-against the prefs/promote APIs — not a remaining orchestrator gap.
+**Agents UI** (tri-state prefs, run DAG detail) ships in ORA-Dashboard against
+the prefs/promote APIs — not a remaining orchestrator gap.
 
 ## Job evidence (structured history)
 
@@ -75,14 +75,14 @@ See also [job-isolation.md](./job-isolation.md).
   via `OPA_JOB_IMAGE_PHP` when exact fleet parity is required; see job-isolation
   Honesty.
 - Cloud land applies a **gated** patch onto a fresh checkout (never trusts the
-  agent WD). Suggest mode posts a proposal without land. Multi-iteration is
+  runner working directory). Suggest mode posts a proposal without land. Multi-iteration is
   bounded (not babysit); gate/auth failures stop the loop.
 - `capRunRepoCode` hard-requires docker sandbox (never silent host exec).
 - Prompt injection and publish-path exfil remain residual risks bounded by
   the capability envelope, not eliminated.
 - Approval waits for cloud (plus bugbot/security) so `pending_autofix` cannot race.
   When Cloud is disabled, the cloud child is still planned as `skipped`.
-- AI docker egress uses a **shared allowlist proxy** on `--internal` job nets;
+- Review-runner docker egress uses a **shared allowlist proxy** on `--internal` job nets;
   `HTTP(S)_PROXY` is unsettable by the guest and only a hint — network boundary
   is `--internal` (see job-isolation Honesty).
 - Checkup **phpstan** is best-effort new-errors-only when a baseline file exists
