@@ -236,6 +236,56 @@ func githubFindOrCreateMilestone(c *opaConnector, owner, repo, title, descriptio
 	return githubCreateMilestone(c, owner, repo, title, description)
 }
 
+func githubUpdateMilestone(c *opaConnector, owner, repo string, number int, title, description, state string) (*githubMilestoneMeta, error) {
+	if c == nil || number <= 0 {
+		return nil, fmt.Errorf("missing connector or milestone number")
+	}
+	if githubUseMockAPI(c) {
+		out := &githubMilestoneMeta{
+			Number: number, Title: nz(title, "Mock Milestone"), Description: description,
+			State: nz(state, "open"),
+			HTMLURL: fmt.Sprintf("https://github.com/%s/%s/milestone/%d", owner, repo, number),
+		}
+		return out, nil
+	}
+	payload := map[string]interface{}{}
+	if strings.TrimSpace(title) != "" {
+		payload["title"] = strings.TrimSpace(title)
+	}
+	if description != "" || title != "" {
+		payload["description"] = description
+	}
+	if state == "open" || state == "closed" {
+		payload["state"] = state
+	}
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("nothing to update")
+	}
+	rawBody, _ := json.Marshal(payload)
+	raw, code, err := githubWriteAPI(c, owner, repo, githubPermsIssuesWrite(), http.MethodPatch,
+		fmt.Sprintf("/repos/%s/%s/milestones/%d", owner, repo, number), strings.NewReader(string(rawBody)))
+	if err != nil {
+		return nil, err
+	}
+	if code >= 300 {
+		return nil, fmt.Errorf("update milestone %d: %s", code, truncateStr(string(raw), 200))
+	}
+	var m struct {
+		Number      int    `json:"number"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		State       string `json:"state"`
+		HTMLURL     string `json:"html_url"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	return &githubMilestoneMeta{
+		Number: m.Number, Title: m.Title, Description: m.Description,
+		State: m.State, HTMLURL: m.HTMLURL,
+	}, nil
+}
+
 // mergeIssueLabels unions existing + add without duplicates (case-insensitive).
 func mergeIssueLabels(existing, add []string) []string {
 	seen := map[string]string{}

@@ -196,3 +196,217 @@ mutation($projectId:ID!, $contentId:ID!) {
 }`, map[string]interface{}{"projectId": projectID, "contentId": contentID})
 	return err
 }
+
+type githubProjectV2Meta struct {
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	URL    string `json:"url,omitempty"`
+	Number int    `json:"number,omitempty"`
+}
+
+func githubListProjectsV2(conn *opaConnector, owner string) ([]githubProjectV2Meta, error) {
+	if githubUseMockAPI(conn) {
+		return []githubProjectV2Meta{{
+			ID: "PVT_mock1", Title: "Mock Project", URL: "https://github.com/orgs/" + owner + "/projects/1", Number: 1,
+		}}, nil
+	}
+	// Prefer organization projects; fall back to user.
+	data, err := githubGraphQL(conn, `
+query($login:String!) {
+  organization(login:$login) {
+    projectsV2(first:40) { nodes { id title number url } }
+  }
+}`, map[string]interface{}{"login": owner})
+	nodes := extractProjectsV2Nodes(data, "organization")
+	if err != nil || len(nodes) == 0 {
+		data2, err2 := githubGraphQL(conn, `
+query($login:String!) {
+  user(login:$login) {
+    projectsV2(first:40) { nodes { id title number url } }
+  }
+}`, map[string]interface{}{"login": owner})
+		if err2 != nil && err != nil {
+			return nil, err
+		}
+		if err2 == nil {
+			nodes = extractProjectsV2Nodes(data2, "user")
+			err = nil
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make([]githubProjectV2Meta, 0, len(nodes))
+	for _, n := range nodes {
+		m, _ := n.(map[string]interface{})
+		if m == nil {
+			continue
+		}
+		out = append(out, githubProjectV2Meta{
+			ID: strFromAny(m["id"]), Title: strFromAny(m["title"]),
+			URL: strFromAny(m["url"]), Number: intFromAny(m["number"]),
+		})
+	}
+	return out, nil
+}
+
+func extractProjectsV2Nodes(data map[string]interface{}, key string) []interface{} {
+	if data == nil {
+		return nil
+	}
+	root, _ := data[key].(map[string]interface{})
+	if root == nil {
+		return nil
+	}
+	pv, _ := root["projectsV2"].(map[string]interface{})
+	if pv == nil {
+		return nil
+	}
+	nodes, _ := pv["nodes"].([]interface{})
+	return nodes
+}
+
+// githubAddProjectV2DraftIssue creates a draft issue item on a Projects v2 board.
+func githubAddProjectV2DraftIssue(conn *opaConnector, projectID, title, body string) (string, error) {
+	if githubUseMockAPI(conn) {
+		return "PVTI_mock_item", nil
+	}
+	data, err := githubGraphQL(conn, `
+mutation($projectId:ID!, $title:String!, $body:String) {
+  addProjectV2DraftIssue(input:{projectId:$projectId, title:$title, body:$body}) {
+    projectItem { id }
+  }
+}`, map[string]interface{}{"projectId": projectID, "title": title, "body": body})
+	if err != nil {
+		return "", err
+	}
+	if add, ok := data["addProjectV2DraftIssue"].(map[string]interface{}); ok {
+		if item, ok := add["projectItem"].(map[string]interface{}); ok {
+			id := strFromAny(item["id"])
+			if id != "" {
+				return id, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("addProjectV2DraftIssue returned no item id")
+}
+
+func githubUpdateProjectV2DraftIssue(conn *opaConnector, itemID, title, body string) error {
+	// Draft issue title updates require the draftIssue content id, which callers may not have.
+	// Item create path is the primary sync; title refresh is best-effort no-op for now.
+	_ = conn
+	_ = itemID
+	_ = title
+	_ = body
+	return nil
+}
+
+// githubSetProjectV2ItemStatus maps an OPM column hint onto a Project "Status" single-select option.
+func githubSetProjectV2ItemStatus(conn *opaConnector, projectID, itemID, statusHint string) error {
+	if githubUseMockAPI(conn) {
+		return nil
+	}
+	fieldID, options, err := githubProjectV2StatusField(conn, projectID)
+	if err != nil {
+		return err
+	}
+	optionID := matchStatusOption(options, statusHint)
+	if optionID == "" {
+		return fmt.Errorf("no Status option matched hint %q (have %d options)", statusHint, len(options))
+	}
+	_, err = githubGraphQL(conn, `
+mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!) {
+  updateProjectV2ItemFieldValue(input:{
+    projectId:$projectId, itemId:$itemId, fieldId:$fieldId,
+    value:{ singleSelectOptionId:$optionId }
+  }) { projectV2Item { id } }
+}`, map[string]interface{}{
+		"projectId": projectID, "itemId": itemID, "fieldId": fieldID, "optionId": optionID,
+	})
+	return err
+}
+
+func githubProjectV2StatusField(conn *opaConnector, projectID string) (fieldID string, options []map[string]string, err error) {
+	data, err := githubGraphQL(conn, `
+query($id:ID!) {
+  node(id:$id) {
+    ... on ProjectV2 {
+      fields(first:40) {
+        nodes {
+          ... on ProjectV2SingleSelectField {
+            id name
+            options { id name }
+          }
+        }
+      }
+    }
+  }
+}`, map[string]interface{}{"id": projectID})
+	if err != nil {
+		return "", nil, err
+	}
+	node, _ := data["node"].(map[string]interface{})
+	if node == nil {
+		return "", nil, fmt.Errorf("project node missing")
+	}
+	fields, _ := node["fields"].(map[string]interface{})
+	nodes, _ := fields["nodes"].([]interface{})
+	for _, n := range nodes {
+		m, _ := n.(map[string]interface{})
+		if m == nil {
+			continue
+		}
+		name := strings.ToLower(strFromAny(m["name"]))
+		if name != "status" {
+			continue
+		}
+		fieldID = strFromAny(m["id"])
+		rawOpts, _ := m["options"].([]interface{})
+		for _, o := range rawOpts {
+			om, _ := o.(map[string]interface{})
+			if om == nil {
+				continue
+			}
+			options = append(options, map[string]string{
+				"id": strFromAny(om["id"]), "name": strFromAny(om["name"]),
+			})
+		}
+		if fieldID != "" {
+			return fieldID, options, nil
+		}
+	}
+	return "", nil, fmt.Errorf("no Status single-select field on project")
+}
+
+func matchStatusOption(options []map[string]string, hint string) string {
+	hint = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(hint, "_", " ")))
+	aliases := map[string][]string{
+		"backlog":      {"backlog", "todo", "to do", "new"},
+		"queue":        {"queue", "ready", "ready for work", "up next"},
+		"in progress":  {"in progress", "in_progress", "doing", "active"},
+		"review":       {"review", "in review", "code review"},
+		"human review": {"human review", "human_review", "needs review", "waiting"},
+		"done":         {"done", "complete", "completed", "closed", "finished"},
+	}
+	wanted := aliases[hint]
+	if wanted == nil {
+		wanted = []string{hint}
+	}
+	for _, w := range wanted {
+		for _, o := range options {
+			if strings.EqualFold(strings.TrimSpace(o["name"]), w) {
+				return o["id"]
+			}
+		}
+	}
+	// Fuzzy contains
+	for _, w := range wanted {
+		for _, o := range options {
+			n := strings.ToLower(o["name"])
+			if strings.Contains(n, w) || strings.Contains(w, n) {
+				return o["id"]
+			}
+		}
+	}
+	return ""
+}
