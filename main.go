@@ -36,7 +36,7 @@ func main() {
 	initAuthMode()
 
 	authRequired := authRequiredEnv()
-	authEnforced = authRequired
+	setAuthEnforced(authRequired)
 	if authRequired {
 		log.Printf("auth: ENABLED (OPA_AUTH_REQUIRED)")
 	} else {
