@@ -255,17 +255,37 @@ func handlePeerProjectItemUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Projects v2 needs organization projects write. Refuse before contacting GitHub so
+	// the caller gets "grant organization projects" instead of a GraphQL FORBIDDEN.
+	if !peerProjectsPreflight(w, c) {
+		return
+	}
+
 	itemID := strings.TrimSpace(body.ItemID)
-	var err error
+	titleSynced := false
+	titleStatus := projectsStatusNothingToSync
+	titleNote := ""
 	if itemID == "" {
-		itemID, err = githubAddProjectV2DraftIssue(c, body.ProjectID, body.Title, body.Body)
+		created, err := githubAddProjectV2DraftIssue(c, body.ProjectID, body.Title, body.Body)
 		if err != nil {
-			http.Error(w, "add draft item: "+err.Error(), 502)
+			peerProjectsError(w, c, "add draft item", err)
 			return
 		}
-	} else if body.Title != "" {
-		// Title edits on draft issues are best-effort via updateProjectV2DraftIssue
-		_ = githubUpdateProjectV2DraftIssue(c, itemID, body.Title, body.Body)
+		itemID = created
+		// A freshly created draft carries exactly the title we just sent.
+		titleSynced = true
+		titleStatus = projectsStatusOK
+		titleNote = "draft item created with this title"
+	} else {
+		// Refresh the existing draft item's title/body. The error is reported, never
+		// discarded: a rename that did not reach the board must not look like success.
+		if terr := githubUpdateProjectV2DraftIssue(c, itemID, body.Title, body.Body); terr != nil {
+			titleStatus = projectsSyncStatus(terr)
+			titleNote = terr.Error()
+		} else {
+			titleSynced = true
+			titleStatus = projectsStatusOK
+		}
 	}
 
 	statusSynced := false
@@ -281,7 +301,54 @@ func handlePeerProjectItemUpsert(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{
 		"ok": true, "connector_id": c.ID, "project_id": body.ProjectID,
 		"item_id": itemID, "status_synced": statusSynced, "status_note": statusNote,
+		"title_synced": titleSynced, "title_status": titleStatus, "title_note": titleNote,
 	})
+}
+
+// peerProjectsPreflight refuses a Projects v2 write when the App installation
+// demonstrably lacks organization projects, so the caller gets a grantable reason
+// instead of an opaque GraphQL error. PAT connectors cannot be probed and fall
+// through to surface GitHub's own answer.
+func peerProjectsPreflight(w http.ResponseWriter, c *opaConnector) bool {
+	if c == nil || c.Kind != "github_app" || githubUseMockAPI(c) {
+		return true
+	}
+	health := assessInstallationPermHealth(c)
+	if health.ProjectsOK {
+		return true
+	}
+	writeJSONStatus(w, http.StatusForbidden, map[string]interface{}{
+		"ok":      false,
+		"status":  projectsStatusMissingPermission,
+		"error":   "GitHub App installation is missing organization projects write, required for Projects v2",
+		"missing": health.OptionalMissing,
+		"granted": health.Granted,
+		"note":    "Grant Organization permissions › Projects: Read and write on the GitHub App, then re-accept the installation permissions.",
+	})
+	return false
+}
+
+// peerProjectsError maps a Projects v2 failure onto an honest status + HTTP code.
+func peerProjectsError(w http.ResponseWriter, c *opaConnector, op string, err error) {
+	status := projectsSyncStatus(classifyProjectsGraphQLError(op, err))
+	code := http.StatusBadGateway
+	switch status {
+	case projectsStatusMissingPermission:
+		code = http.StatusForbidden
+	case projectsStatusItemNotFound:
+		code = http.StatusNotFound
+	case projectsStatusTitleUnsupported:
+		code = http.StatusUnprocessableEntity
+	}
+	payload := map[string]interface{}{
+		"ok": false, "status": status, "error": op + ": " + err.Error(),
+	}
+	if status == projectsStatusMissingPermission && c != nil && c.Kind == "github_app" && !githubUseMockAPI(c) {
+		h := assessInstallationPermHealth(c)
+		payload["missing"] = h.OptionalMissing
+		payload["granted"] = h.Granted
+	}
+	writeJSONStatus(w, code, payload)
 }
 
 func handlePeerProjectItemStatus(w http.ResponseWriter, r *http.Request) {
@@ -310,12 +377,16 @@ func handlePeerProjectItemStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "project_id, item_id, and status_hint required", 400)
 		return
 	}
+	if !peerProjectsPreflight(w, c) {
+		return
+	}
 	if err := githubSetProjectV2ItemStatus(c, body.ProjectID, body.ItemID, body.StatusHint); err != nil {
 		writeJSON(w, map[string]interface{}{
 			"ok": false, "status_synced": false, "error": err.Error(),
-			"note": "Status field must exist on the Project (single-select). Map OPM columns to option names best-effort.",
+			"status": projectsSyncStatus(classifyProjectsGraphQLError("set item status", err)),
+			"note":   "Status field must exist on the Project (single-select). Map OPM columns to option names best-effort.",
 		})
 		return
 	}
-	writeJSON(w, map[string]interface{}{"ok": true, "status_synced": true})
+	writeJSON(w, map[string]interface{}{"ok": true, "status_synced": true, "status": projectsStatusOK})
 }
