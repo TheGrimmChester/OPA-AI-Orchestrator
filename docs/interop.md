@@ -15,6 +15,8 @@ ORA may call OSA for findings / `security_run_id` linkage and AppSec gate status
 
 ## User auth modes
 
+User JWTs and standalone `/api/auth/*` come from **Open-Auth-Go** (`Gate`); this repo keeps thin wiring in `auth_wire.go`.
+
 | Mode | Behavior |
 |------|----------|
 | **Standalone** | `ora-api` issues JWTs (`POST /api/auth/login`, `GET /api/auth/status`). Lab admin: `admin`/`admin`. |
