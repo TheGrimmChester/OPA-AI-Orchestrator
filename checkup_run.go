@@ -11,28 +11,55 @@ import (
 
 // checkupStepResult is one executed step's outcome.
 type checkupStepResult struct {
-	ID           string `json:"id"`
-	OK           bool   `json:"ok"`
-	ExitOK       bool   `json:"exit_ok"`
-	PostOK       bool   `json:"post_ok"`
-	Error        string `json:"error,omitempty"`
-	StdoutBytes  int    `json:"stdout_bytes"`
-	DurationMS   int64  `json:"duration_ms"`
-	PostKind     string `json:"post_kind,omitempty"`
-	JUnitTests   int    `json:"junit_tests,omitempty"`
+	ID            string `json:"id"`
+	OK            bool   `json:"ok"`
+	ExitOK        bool   `json:"exit_ok"`
+	PostOK        bool   `json:"post_ok"`
+	Error         string `json:"error,omitempty"`
+	StdoutBytes   int    `json:"stdout_bytes"`
+	DurationMS    int64  `json:"duration_ms"`
+	PostKind      string `json:"post_kind,omitempty"`
+	JUnitTests    int    `json:"junit_tests,omitempty"`
 	DroppedReason string `json:"dropped_reason,omitempty"`
+	// LogExcerpt is the step's captured output around the failure, so a reviewer
+	// can see why a check failed without opening the job dashboard.
+	LogExcerpt string `json:"log_excerpt,omitempty"`
+}
+
+// checkupLogExcerpt keeps the head and tail of captured output. Compile errors
+// appear first, assertion failures last, so both ends matter.
+func checkupLogExcerpt(out []byte, max int) string {
+	s := strings.TrimSpace(string(out))
+	if s == "" || len(s) <= max {
+		return s
+	}
+	half := max / 2
+	return s[:half] + "\n…\n" + s[len(s)-half:]
 }
 
 // checkupRunResult is the full checkup outcome recorded on the job summary.
+// status=blocked means the workspace could not be prepared, so no step ran; it
+// reports neutral, never failure — an unprepared runner is not a bad commit.
 type checkupRunResult struct {
-	Status      string              `json:"status"` // passed|failed|skipped|refused
-	Honesty     string              `json:"honesty,omitempty"`
-	PlanSource  string              `json:"plan_source,omitempty"`
-	Image       string              `json:"image,omitempty"`
-	Drops       []string            `json:"drops,omitempty"`
-	Steps       []checkupStepResult `json:"steps,omitempty"`
-	Annotations int                 `json:"annotations,omitempty"`
-	PlanDiff    string              `json:"plan_diff,omitempty"`
+	Status      string                  `json:"status"` // passed|failed|skipped|refused|blocked
+	Honesty     string                  `json:"honesty,omitempty"`
+	PlanSource  string                  `json:"plan_source,omitempty"`
+	Image       string                  `json:"image,omitempty"`
+	Drops       []string                `json:"drops,omitempty"`
+	Steps       []checkupStepResult     `json:"steps,omitempty"`
+	Annotations int                     `json:"annotations,omitempty"`
+	PlanDiff    string                  `json:"plan_diff,omitempty"`
+	Workspace   *checkupWorkspaceReport `json:"workspace,omitempty"`
+}
+
+// FailingStep returns the first step that did not pass.
+func (r checkupRunResult) FailingStep() (checkupStepResult, bool) {
+	for _, s := range r.Steps {
+		if !s.OK {
+			return s, true
+		}
+	}
+	return checkupStepResult{}, false
 }
 
 // evaluatePostCondition checks artifacts after a step. Exit 0 alone is
@@ -159,10 +186,29 @@ func runCheckupPlan(ctx context.Context, jobID, workRoot string, plan *checkupPl
 		}
 	}
 
+	// Clear state from an earlier attempt on this layout before anything runs.
+	purgeCheckupState(workRoot)
+
+	// Resolve go.mod filesystem replacements into the job layout. Without this a
+	// family service cannot compile in its own isolated checkout.
+	wsRep := prepareCheckupWorkspace(workRoot)
+	if wsRep.SourceRoot != "" || len(wsRep.Required) > 0 {
+		out.Workspace = &wsRep
+	}
+	if wsRep.Blocked() {
+		out.Status = "blocked"
+		out.Honesty = wsRep.Honesty()
+		return out, nil
+	}
+	siblings := checkupModuleSiblingDirs(workRoot, wsRep)
+	if note := wsRep.Honesty(); note != "" {
+		out.Honesty = note
+	}
+
 	secrets := resolveCheckupSecrets(plan.Secrets)
 	allOK := true
 	for _, step := range plan.Steps {
-		sr := runCheckupStep(ctx, jobID, workRoot, netName, plan.Image, plan.Env, secrets, step)
+		sr := runCheckupStep(ctx, jobID, workRoot, netName, plan.Image, plan.Env, secrets, step, siblings)
 		out.Steps = append(out.Steps, sr)
 		stepAnns := checkupAnnotationsFromStepOutput(step, nil, workRoot)
 		// Re-read stdout is not retained; for checkstyle-from-stdout we keep empty here
@@ -191,7 +237,7 @@ func checkupStepStdoutPath(workRoot, stepID string) string {
 	return filepath.Join(workRoot, ".opa-checkup", safe+".stdout")
 }
 
-func runCheckupStep(ctx context.Context, jobID, workRoot, network, image string, planEnv map[string]string, secrets map[string]string, step checkupStep) checkupStepResult {
+func runCheckupStep(ctx context.Context, jobID, workRoot, network, image string, planEnv map[string]string, secrets map[string]string, step checkupStep, siblingDirs []string) checkupStepResult {
 	res := checkupStepResult{ID: step.ID, PostKind: step.PostCondition.Kind}
 	start := time.Now()
 	timeout := time.Duration(nzInt(step.TimeoutSec, checkupDefaultStepTimeoutSec)) * time.Second
@@ -237,6 +283,7 @@ func runCheckupStep(ctx context.Context, jobID, workRoot, network, image string,
 		Timeout:     0,
 		Image:       image,
 		Ephemeral:   false,
+		SiblingDirs: siblingDirs,
 	})
 	res.DurationMS = time.Since(start).Milliseconds()
 	res.StdoutBytes = len(out)
@@ -250,13 +297,10 @@ func runCheckupStep(ctx context.Context, jobID, workRoot, network, image string,
 	res.OK = postOK
 	if !postOK {
 		res.Error = detail
-		if strings.HasPrefix(detail, "nonzero exit") {
-			if err != nil {
-				res.Error = detail + ": " + err.Error() + " — " + truncateStr(string(out), 200)
-			} else {
-				res.Error = detail + ": " + truncateStr(string(out), 300)
-			}
+		if err != nil {
+			res.Error = detail + ": " + err.Error()
 		}
+		res.LogExcerpt = checkupLogExcerpt(out, checkupLogExcerptMax)
 	}
 	return res
 }
@@ -366,10 +410,20 @@ func runCheckupAgent(job *scmJob) error {
 
 	conclusion := "success"
 	title := "OPA Checkup passed"
-	if result.Status == "failed" {
+	switch result.Status {
+	case "failed":
 		conclusion = "failure"
 		title = "OPA Checkup failed"
-	} else if result.Status == "skipped" || result.Status == "refused" {
+		// Name the step that failed so the check title is actionable.
+		if s, ok := result.FailingStep(); ok {
+			title = "OPA Checkup failed: " + s.ID
+		}
+	case "blocked":
+		// The workspace could not be prepared, so nothing was verified. Neutral
+		// keeps the pull request honest instead of blaming the commit.
+		conclusion = "neutral"
+		title = "OPA Checkup could not run"
+	case "skipped", "refused":
 		conclusion = "neutral"
 		title = "OPA Checkup " + result.Status
 	}
@@ -381,6 +435,9 @@ func runCheckupAgent(job *scmJob) error {
 	}
 	persistSCMJob(job)
 	if result.Status == "failed" {
+		if s, ok := result.FailingStep(); ok {
+			return fmt.Errorf("checkup failed: step %s: %s", s.ID, nz(s.Error, "post-condition not met"))
+		}
 		return fmt.Errorf("checkup failed: %s", nz(result.Honesty, "step post-condition"))
 	}
 	return nil
@@ -401,12 +458,20 @@ func formatCheckupCheckSummary(r checkupRunResult, drops []string) string {
 	for _, d := range drops {
 		b.WriteString("\ndrop: " + d)
 	}
+	if r.Status == "blocked" {
+		b.WriteString("\n\nNo step ran, so this commit was not verified — this is a runner setup issue, not a test failure.")
+		return truncateStr(b.String(), 60000)
+	}
 	for _, s := range r.Steps {
-		line := fmt.Sprintf("\nstep %s: ok=%v exit=%v post=%v", s.ID, s.OK, s.ExitOK, s.PostOK)
+		fmt.Fprintf(&b, "\nstep %s: ok=%v exit=%v post=%v %dms", s.ID, s.OK, s.ExitOK, s.PostOK, s.DurationMS)
 		if s.Error != "" {
-			line += " err=" + truncateStr(s.Error, 120)
+			b.WriteString("\n  reason: " + truncateStr(s.Error, 300))
 		}
-		b.WriteString(line)
+	}
+	// Full excerpt for the first failing step: the reason alone rarely says which
+	// assertion or package broke.
+	if s, ok := r.FailingStep(); ok && s.LogExcerpt != "" {
+		fmt.Fprintf(&b, "\n\nOutput from failing step %s:\n\n```\n%s\n```\n", s.ID, s.LogExcerpt)
 	}
 	return truncateStr(b.String(), 60000)
 }

@@ -555,12 +555,12 @@ func runSecurityAgent(job *scmJob) error {
 
 	// scmJob label = security child id so cancelSCMJob(teardown opa.job) hits scan boxes;
 	// checkout layout stays under the parent run (relPath already absolute).
-	runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, profile, scanList, relPath, "", job.RepoFullName, job.PRNumber, job.CommitSHA, job.ID)
+	scanStartErr := runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, profile, scanList, relPath, "", job.RepoFullName, job.PRNumber, job.CommitSHA, job.ID)
 
-	gate := evaluateScopedGate(job.OrganizationID, runID, minSev)
+	gate := gateAfterScan(job.OrganizationID, runID, minSev, scanStartErr)
 	if job.AIOnly {
 		gate = map[string]interface{}{
-			"status": "pass", "fail": false, "reasons": []string{"ai_only"},
+			"status": gateStatusPass, "fail": false, "reasons": []string{"ai_only"},
 			"scope": "security_run", "security_run_id": runID, "min_severity": minSev,
 		}
 	}
@@ -568,15 +568,10 @@ func runSecurityAgent(job *scmJob) error {
 		job.Summary = map[string]interface{}{}
 	}
 	job.Summary["gate"] = gate
-	conclusion := "success"
-	title := "AppSec Gate passed"
-	if gate["fail"] == true {
-		conclusion = "failure"
-		title = "AppSec Gate failed"
-	}
+	conclusion, title := gateCheckOutcome(gate)
 	if appSecID != 0 {
 		_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", conclusion, title,
-			checkRunSummaryWithJobLink(fmt.Sprintf("scope=%v reasons=%v security_run_id=%s", gate["scope"], gate["reasons"], runID), job.RunID), jobDashURL, nil)
+			checkRunSummaryWithJobLink(gateCheckSummary(gate, runID), job.RunID), jobDashURL, nil)
 	}
 	persistSCMJob(job)
 	return nil

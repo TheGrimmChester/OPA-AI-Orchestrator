@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Checks: `OPA AppSec Gate` and `OPA Checkup` distinguish "could not evaluate" from "policy violation". An unreachable security service, a security run that never started, or a run that did not finish within `OPA_GATE_WAIT_TIMEOUT_SEC` now reports **neutral** with the cause, instead of `failure`. Verdict reasons: `peer_not_configured`, `peer_unavailable`, `scan_not_started`, `scan_incomplete`.
+- Gate: wait for the OSA security run to reach a terminal state before reading findings. The gate previously evaluated immediately after creating the run, completing in under a second against an empty findings set.
+- Checkup: resolve `go.mod` filesystem `replace` targets into the job layout and bind them read-only, so services that pin sibling module directories compile in their isolated checkout. Unresolvable replacements report **neutral** (`status=blocked`) with the module names and `OPA_CHECKUP_MODULE_SRC` guidance — no step runs, so no failure is claimed.
+- Checkup: clear `primary/.opa-checkup/` step captures before each run so a retry on a reused layout cannot report a previous attempt's output.
+- Checkup: failed checks name the failing step in the check title and include a head-and-tail excerpt of that step's output in the summary.
+- Config: add `OPA_GATE_WAIT_TIMEOUT_SEC`, `OPA_GATE_RUN_APPEAR_TIMEOUT_SEC` and `OPA_CHECKUP_MODULE_SRC`.
+
 - Auth: adopt Open-Auth-Go per-user project ACLs (`project_ids` / `EnforceProjectACL` on Gate middleware). Restricted JWTs get **403** on non-member `X-Project-ID`; role `admin` stays unrestricted. No second membership store — hub-minted claims only.
 - Scope: under auth, missing/`all` tenant headers collapse to `default-org`/`default-project` for in-memory lists (connectors, jobs, webhooks, review contexts) — matching Open-Tenant-Go v0.2.2 `WriteTenant` / `ScopePredicate`. User-scoped credentials no longer cross orgs.
 - Bump `open-tenant-go` to v0.2.2 so auth-enforced list scope matches `WriteTenant` defaults.

@@ -29,29 +29,54 @@ func securityRunIDFromBody(raw []byte) string {
 
 // runSecurityScanJob delegates to OSA when PEER_OSA_URL is set.
 // Empty peer URL skips local AppSec execution (OSA owns scanners).
-func runSecurityScanJob(runID, org, proj, service, profile string, scanners []string, targetPath, image, repo string, pr int, sha, scmJob string) {
+// The returned error reports a failed hand-off so the caller can mark the gate
+// unavailable rather than reading findings from a run that never started.
+func runSecurityScanJob(runID, org, proj, service, profile string, scanners []string, targetPath, image, repo string, pr int, sha, scmJob string) error {
 	_ = image
-	if runSecurityScanViaOSA(runID, org, proj, service, profile, scanners, targetPath, repo, pr, sha, scmJob) {
-		return
+	peered, err := runSecurityScanViaOSA(runID, org, proj, service, profile, scanners, targetPath, repo, pr, sha, scmJob)
+	if peered {
+		return err
 	}
 	openlogger.LogWarn("security scan skipped — set PEER_OSA_URL for AppSec runs", map[string]interface{}{
 		"security_run_id": runID, "repo": repo,
 	})
+	return nil
 }
 
-// evaluateScopedGate prefers OSA AppSec gate via peer; otherwise fail-closed peer_unavailable.
+// gateAfterScan waits for the OSA run to finish, then evaluates the gate.
+// startErr is the hand-off error from runSecurityScanJob, if any. Every path
+// that cannot produce a real verdict returns an unavailable one.
+func gateAfterScan(org, runID, minSev string, startErr error) map[string]interface{} {
+	if startErr != nil {
+		v := gateUnavailable(runID, minSev, "scan_not_started",
+			"the security run could not be created on OSA")
+		v["error"] = startErr.Error()
+		return v
+	}
+	if status, terminal := awaitOSASecurityRun(org, runID); !terminal {
+		// No peer configured falls through to evaluateScopedGate, which reports
+		// peer_not_configured. A configured peer that never finished is a timeout.
+		if strings.TrimSpace(os.Getenv("PEER_OSA_URL")) != "" {
+			v := gateUnavailable(runID, minSev, "scan_incomplete",
+				"the security run did not reach a terminal state before the gate timeout")
+			if status != "" {
+				v["last_status"] = status
+			}
+			return v
+		}
+	}
+	return evaluateScopedGate(org, runID, minSev)
+}
+
+// evaluateScopedGate asks the OSA AppSec gate over the peer link. When no peer
+// is configured the gate is unavailable, not failing — ORA owns review and must
+// not invent a security verdict it cannot obtain.
 func evaluateScopedGate(org, runID, minSev string) map[string]interface{} {
 	if out, ok := evaluateScopedGateViaOSA(org, runID, minSev); ok {
 		return out
 	}
-	return map[string]interface{}{
-		"status": "error", "fail": true,
-		"reasons":         []string{"peer_unavailable"},
-		"scope":           "security_run",
-		"security_run_id": runID,
-		"min_severity":    minSev,
-		"honesty":         "AppSec gate is owned by OSA; configure PEER_OSA_URL",
-	}
+	return gateUnavailable(runID, minSev, "peer_not_configured",
+		"AppSec gate is owned by OSA; configure PEER_OSA_URL")
 }
 
 // securityWorkspaceRoot is the review checkout root (not AppSec ownership).

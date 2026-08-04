@@ -48,6 +48,9 @@ var checkupDeniedSecretNames = map[string]bool{
 }
 
 const (
+	// checkupLogExcerptMax bounds the failing-step output copied into the check
+	// run. Large enough to hold a Go build failure or a phpunit failure block.
+	checkupLogExcerptMax         = 3000
 	checkupDefaultStepTimeoutSec = 600
 	checkupMaxStepTimeoutSec     = 1800
 	checkupDefaultServiceTimeout = 120
