@@ -12,8 +12,10 @@ import (
 
 // registerPeerSCMMux exposes service-JWT-only SCM helpers for peer products (OPM, OSA).
 // GitHub App/PAT secrets stay in ORA; peers receive short-lived clone credentials only.
+// PM helpers (milestones / Projects v2) live in peer_scm_pm.go under scope scm:pm.
 func registerPeerSCMMux(mux *http.ServeMux) {
 	mux.HandleFunc("/api/peer/scm/clone-credentials", handlePeerCloneCredentials)
+	registerPeerSCMPMMux(mux)
 }
 
 func handlePeerCloneCredentials(w http.ResponseWriter, r *http.Request) {
