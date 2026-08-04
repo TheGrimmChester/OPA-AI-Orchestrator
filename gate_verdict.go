@@ -54,6 +54,22 @@ func gateIsUnavailable(gate map[string]interface{}) bool {
 	return false
 }
 
+// gateStatusLabel is the gate status for user-visible copy. Unavailable
+// verdicts read as not_evaluated rather than a bare "error", which readers
+// otherwise conflate with "scanned, and something went wrong".
+func gateStatusLabel(gate map[string]interface{}) string {
+	if gate == nil {
+		return "unknown"
+	}
+	if gateIsUnavailable(gate) {
+		return "not_evaluated"
+	}
+	if s, _ := gate["status"].(string); s != "" {
+		return s
+	}
+	return "unknown"
+}
+
 // gateCheckOutcome maps a verdict to a GitHub check-run conclusion and title.
 // Only a real policy decision produces failure.
 func gateCheckOutcome(gate map[string]interface{}) (conclusion, title string) {
