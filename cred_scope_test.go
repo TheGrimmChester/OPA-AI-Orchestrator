@@ -1,14 +1,22 @@
 package main
 
-import "testing"
+import (
+	"net/http"
+	"testing"
+)
 
 func TestCanSeeCredScope(t *testing.T) {
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+
 	member := credActor{Username: "alice", Role: "viewer", OrganizationID: "org-a"}
 	memberNoOrg := credActor{Username: "alice", Role: "viewer", OrganizationID: ""}
 	otherOrg := credActor{Username: "bob", Role: "editor", OrganizationID: "org-b"}
 	adminInA := credActor{Username: "root", Role: "admin", OrganizationID: "org-a"}
 	adminNoOrg := credActor{Username: "root", Role: "admin", OrganizationID: ""}
 	owner := credActor{Username: "alice", Role: "viewer", OrganizationID: "org-a"}
+	ownerDefault := credActor{Username: "admin", Role: "admin", OrganizationID: defaultOrgID}
 
 	cases := []struct {
 		name      string
@@ -24,12 +32,13 @@ func TestCanSeeCredScope(t *testing.T) {
 		{"org_other_denied", otherOrg, credScopeOrg, "", "org-a", false},
 		{"org_empty_owner_denied_member", member, credScopeOrg, "", "", false},
 		{"org_empty_owner_admin_ok", adminInA, credScopeOrg, "", "", true},
-		{"org_all_admin_ok", adminNoOrg, credScopeOrg, "", "org-a", true},
+		{"org_all_admin_denied_under_auth", adminNoOrg, credScopeOrg, "", "org-a", false},
 		{"org_all_member_denied", memberNoOrg, credScopeOrg, "", "org-a", false},
 		{"user_owner_ok", owner, credScopeUser, "alice", "org-a", true},
 		{"user_other_denied", otherOrg, credScopeUser, "alice", "org-a", false},
 		{"user_admin_no_peek", adminInA, credScopeUser, "alice", "org-a", false},
 		{"user_legacy_admin_opa_admin", credActor{Username: "opa-admin", Role: "admin", OrganizationID: "nas"}, credScopeUser, "admin", "nas", true},
+		{"user_cross_org_denied", ownerDefault, credScopeUser, "admin", "nas", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -110,8 +119,9 @@ func TestCanSeeSCMJob(t *testing.T) {
 	ownDef := &scmJob{ID: "3", OrganizationID: "default-org", ActorUserID: "alice"}
 	legacy := &scmJob{ID: "4", OrganizationID: "", ActorUserID: ""}
 
-	if !canSeeSCMJob(adminAll, nasJob, "") || !canSeeSCMJob(adminAll, defJob, "") {
-		t.Fatal("admin with All should see every org")
+	// Empty org under auth fails closed (actorFromRequest pins WriteTenant in HTTP).
+	if canSeeSCMJob(adminAll, nasJob, "") || canSeeSCMJob(adminAll, defJob, "") {
+		t.Fatal("admin with empty org must not dump all tenants under auth")
 	}
 	if canSeeSCMJob(adminNas, defJob, "") {
 		t.Fatal("admin scoped to nas must not see default-org")
@@ -119,11 +129,8 @@ func TestCanSeeSCMJob(t *testing.T) {
 	if !canSeeSCMJob(adminNas, nasJob, "") {
 		t.Fatal("admin scoped to nas should see nas")
 	}
-	if canSeeSCMJob(memberAll, defJob, "") {
-		t.Fatal("member with All must not see others' jobs")
-	}
-	if !canSeeSCMJob(memberAll, ownDef, "") {
-		t.Fatal("member with All should see own queued jobs")
+	if canSeeSCMJob(memberAll, defJob, "") || canSeeSCMJob(memberAll, ownDef, "") {
+		t.Fatal("member with empty org must not see jobs under auth")
 	}
 	if !canSeeSCMJob(memberNas, nasJob, "") {
 		t.Fatal("member in nas should see nas jobs")
@@ -147,6 +154,30 @@ func TestCanSeeSCMJob(t *testing.T) {
 	}
 	if canSeeSCMJob(adminNas, defJob, "conn-other") {
 		t.Fatal("connector filter must not match wrong connector")
+	}
+}
+
+func TestActorFromRequestWriteTenant(t *testing.T) {
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+
+	r, _ := http.NewRequest(http.MethodGet, "/api/connectors", nil)
+	a := actorFromRequest(r)
+	if a.OrganizationID != defaultOrgID || a.ProjectID != defaultProjectID {
+		t.Fatalf("missing headers under auth → WriteTenant, got %q/%q", a.OrganizationID, a.ProjectID)
+	}
+	r.Header.Set("X-Organization-ID", "all")
+	r.Header.Set("X-Project-ID", "all")
+	a = actorFromRequest(r)
+	if a.OrganizationID != defaultOrgID || a.ProjectID != defaultProjectID {
+		t.Fatalf("all/all under auth → WriteTenant, got %q/%q", a.OrganizationID, a.ProjectID)
+	}
+	r.Header.Set("X-Organization-ID", "nas")
+	r.Header.Set("X-Project-ID", "infra")
+	a = actorFromRequest(r)
+	if a.OrganizationID != "nas" || a.ProjectID != "infra" {
+		t.Fatalf("concrete tenant kept, got %q/%q", a.OrganizationID, a.ProjectID)
 	}
 }
 

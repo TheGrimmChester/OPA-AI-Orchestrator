@@ -30,16 +30,30 @@ type credActor struct {
 }
 
 func actorFromRequest(r *http.Request) credActor {
+	if r == nil {
+		if authEnforced {
+			return credActor{OrganizationID: defaultOrgID, ProjectID: defaultProjectID}
+		}
+		return credActor{}
+	}
 	ctx, _ := ExtractTenantContext(r, queryClient)
 	org, proj := "", ""
 	if ctx != nil {
-		org, proj = ctx.OrganizationID, ctx.ProjectID
-		if strings.EqualFold(org, tenantAll) {
-			org = ""
+		if authEnforced {
+			// Match Open-Tenant-Go v0.2.2 ScopePredicate / WriteTenant: empty or
+			// "all" collapse to default-org / default-project — never widen.
+			org, proj = ctx.WriteTenant()
+		} else {
+			org, proj = ctx.OrganizationID, ctx.ProjectID
+			if strings.EqualFold(org, tenantAll) {
+				org = ""
+			}
+			if strings.EqualFold(proj, tenantAll) {
+				proj = ""
+			}
 		}
-		if strings.EqualFold(proj, tenantAll) {
-			proj = ""
-		}
+	} else if authEnforced {
+		org, proj = defaultOrgID, defaultProjectID
 	}
 	username := strings.TrimSpace(r.Header.Get("X-User-Username"))
 	role := strings.TrimSpace(r.Header.Get("X-User-Role"))
@@ -60,6 +74,15 @@ func actorFromRequest(r *http.Request) credActor {
 		OrganizationID: org,
 		ProjectID:      proj,
 	}
+}
+
+// normalizeTenantOrg maps empty organization ids to default-org for comparisons.
+func normalizeTenantOrg(org string) string {
+	org = strings.TrimSpace(org)
+	if org == "" || strings.EqualFold(org, tenantAll) {
+		return defaultOrgID
+	}
+	return org
 }
 
 // claimsFromRequestToken parses Authorization Bearer or opa_token cookie without
@@ -158,11 +181,18 @@ func canSeeCredScope(a credActor, scope, ownerUser, ownerOrg string) bool {
 		if sel := strings.TrimSpace(a.OrganizationID); sel != "" {
 			return ownerOrg == sel
 		}
-		// Tenant picker "All" (empty org): admins may list/get across orgs
-		// (same rule as canSeeSCMJob). Non-admins must pick a concrete org.
-		return a.isAdmin()
+		// Auth off + no org selected: admins may list across orgs. Under auth,
+		// actorFromRequest always pins WriteTenant so this path is unreachable.
+		return !authEnforced && a.isAdmin()
 	case credScopeUser:
-		return userCredOwnerMatch(a.Username, ownerUser)
+		if !userCredOwnerMatch(a.Username, ownerUser) {
+			return false
+		}
+		// Personal credentials stay inside their org — no cross-tenant peek.
+		if sel := strings.TrimSpace(a.OrganizationID); sel != "" {
+			return normalizeTenantOrg(ownerOrg) == normalizeTenantOrg(sel)
+		}
+		return !authEnforced
 	default:
 		return false
 	}
