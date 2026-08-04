@@ -850,12 +850,10 @@ func handleSCMJobsList(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if a.OrganizationID != "" {
 		filter = a.OrganizationID
-		honesty = "Filtered to organization " + a.OrganizationID + ". App webhook jobs often land on the org that owns the GitHub App install — pick a connector or tenant All if this list looks empty while reviews are running."
-	} else if authEnforced && !a.isAdmin() {
-		honesty = "Tenant picker is All — showing only jobs you queued. Select an organization to see that org's webhook/manual jobs."
-		filter = "actor"
-	} else if authEnforced && a.isAdmin() {
-		honesty = "Tenant picker is All — admin-wide job list. Select an organization or connector to narrow."
+		honesty = "Filtered to organization " + a.OrganizationID + ". App webhook jobs often land on the org that owns the GitHub App install — pick that connector if this list looks empty while reviews are running."
+	} else if authEnforced {
+		honesty = "Scoped to default-org / default-project (missing tenant headers). Send X-Organization-ID / X-Project-ID to select another tenant."
+		filter = defaultOrgID
 	}
 	writeJSON(w, map[string]interface{}{
 		"jobs": list, "total": total, "counts": counts, "limit": limit,
@@ -870,9 +868,8 @@ func handleSCMJobsList(w http.ResponseWriter, r *http.Request) {
 // canSeeSCMJob applies tenant visibility for SCM / PR jobs.
 //
 //   - Concrete org selected → that org only (legacy empty-org rows count as default-org)
-//   - Picker All + auth off → everything
-//   - Picker All + admin → everything (admin-wide view)
-//   - Picker All + non-admin → jobs this user queued (actor_user_id)
+//   - Auth off + empty org → everything
+//   - Auth on + empty org → fail closed (HTTP actors use WriteTenant / default-org)
 //   - connectorFilter set → that connector's jobs even across org (admin), or if
 //     non-admin's selected org matches the job/connector org
 func canSeeSCMJob(a credActor, j *scmJob, connectorFilter string) bool {
@@ -911,11 +908,9 @@ func canSeeSCMJob(a credActor, j *scmJob, connectorFilter string) bool {
 	if !authEnforced {
 		return true
 	}
-	if a.isAdmin() {
-		return true
-	}
-	uid := strings.TrimSpace(a.Username)
-	return uid != "" && strings.TrimSpace(j.ActorUserID) == uid
+	// Auth on + empty org should not reach here (actorFromRequest → WriteTenant).
+	// Fail closed: never dump all tenants.
+	return false
 }
 
 // handleSCMJobsResume POST /api/scm/jobs/resume — one-shot kick after recreate/stall:
