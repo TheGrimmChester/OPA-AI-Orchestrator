@@ -39,8 +39,8 @@ func ExtractTenantContext(r *http.Request, queryClient *ClickHouseQuery) (*Tenan
 			dsn := strings.TrimPrefix(authHeader, "Bearer ")
 			dsn = strings.TrimPrefix(dsn, "DSN ")
 			query := fmt.Sprintf("SELECT org_id, project_id FROM opa.projects WHERE dsn = '%s' LIMIT 1",
-				escapeSQL(dsn))
-			rows, err := queryClient.Query(query)
+				opentenant.EscapeSQL(dsn))
+			rows, err := queryClient.QueryExact(query)
 			if err == nil && len(rows) > 0 {
 				ctx.OrganizationID = getString(rows[0], "org_id")
 				ctx.ProjectID = getString(rows[0], "project_id")
@@ -57,8 +57,8 @@ func ExtractTenantContext(r *http.Request, queryClient *ClickHouseQuery) (*Tenan
 					keyHash = strings.Join(keyParts[2:], ":")
 				}
 				query := fmt.Sprintf("SELECT org_id, project_id FROM opa.api_keys WHERE key_hash = '%s' LIMIT 1",
-					escapeSQL(keyHash))
-				rows, err := queryClient.Query(query)
+					opentenant.EscapeSQL(keyHash))
+				rows, err := queryClient.QueryExact(query)
 				if err == nil && len(rows) > 0 {
 					ctx.OrganizationID = getString(rows[0], "org_id")
 					ctx.ProjectID = getString(rows[0], "project_id")
@@ -95,16 +95,16 @@ func TenantMiddleware(handler http.HandlerFunc, queryClient *ClickHouseQuery) ht
 		}
 
 		query := fmt.Sprintf("SELECT org_id FROM opa.organizations WHERE org_id = '%s' LIMIT 1",
-			escapeSQL(ctx.OrganizationID))
-		rows, err := queryClient.Query(query)
+			opentenant.EscapeSQL(ctx.OrganizationID))
+		rows, err := queryClient.QueryExact(query)
 		if err != nil || len(rows) == 0 {
 			http.Error(w, "organization not found", 404)
 			return
 		}
 
 		query = fmt.Sprintf("SELECT project_id FROM opa.projects WHERE org_id = '%s' AND project_id = '%s' LIMIT 1",
-			escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
-		rows, err = queryClient.Query(query)
+			opentenant.EscapeSQL(ctx.OrganizationID), opentenant.EscapeSQL(ctx.ProjectID))
+		rows, err = queryClient.QueryExact(query)
 		if err != nil || len(rows) == 0 {
 			http.Error(w, "project not found", 404)
 			return
