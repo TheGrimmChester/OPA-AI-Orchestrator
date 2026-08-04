@@ -331,14 +331,6 @@ func ensureAgentsTables() {
 		return
 	}
 	for _, q := range []string{
-		`CREATE TABLE IF NOT EXISTS opa.agent_prefs (
-			organization_id String, project_id String,
-			level LowCardinality(String), scope_key String,
-			prefs_json String DEFAULT '{}',
-			updated_at DateTime64(3) DEFAULT now64(3),
-			updated_by String DEFAULT '', deleted UInt8 DEFAULT 0
-		) ENGINE = ReplacingMergeTree(updated_at)
-		ORDER BY (organization_id, project_id, level, scope_key)`,
 		`ALTER TABLE opa.scm_jobs ADD COLUMN IF NOT EXISTS kind LowCardinality(String) DEFAULT ''`,
 		`ALTER TABLE opa.scm_jobs ADD COLUMN IF NOT EXISTS run_id String DEFAULT ''`,
 		`ALTER TABLE opa.scm_jobs ADD COLUMN IF NOT EXISTS attempt UInt8 DEFAULT 0`,
