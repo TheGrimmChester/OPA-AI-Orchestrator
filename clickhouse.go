@@ -305,10 +305,28 @@ func (q *ClickHouseQuery) Client() *openclickhouse.Client {
 
 // Query executes a query and returns results (legacy opa.* rewritten to product DB).
 func (q *ClickHouseQuery) Query(query string) ([]map[string]interface{}, error) {
+	return q.queryRows(query, false)
+}
+
+// QueryExact runs SQL without opa.* → product-DB rewriting. Use for hub directory
+// tables (opa.projects, opa.api_keys, opa.organizations).
+func (q *ClickHouseQuery) QueryExact(query string) ([]map[string]interface{}, error) {
+	return q.queryRows(query, true)
+}
+
+func (q *ClickHouseQuery) queryRows(query string, exact bool) ([]map[string]interface{}, error) {
 	if q == nil || q.ch == nil {
 		return nil, fmt.Errorf("clickhouse query client not configured")
 	}
-	rows, err := q.ch.Query(query)
+	var (
+		rows []map[string]any
+		err  error
+	)
+	if exact {
+		rows, err = q.ch.QueryExact(query)
+	} else {
+		rows, err = q.ch.Query(query)
+	}
 	if err != nil {
 		LogError(err, "ClickHouse query failed", nil)
 		return nil, err
