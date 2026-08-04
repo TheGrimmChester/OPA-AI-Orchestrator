@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,10 +40,6 @@ func peerOSAEvaluateGate(ctx context.Context, org, runID, minSev string) (map[st
 	return out, err
 }
 
-// runSecurityScanViaOSA reports whether OSA owns this scan (peer configured) and
-// whether the run was actually created. A create failure must surface: OSA has no
-// run to scan, so a later gate query finds no findings and would otherwise read
-// as a clean pass.
 func runSecurityScanViaOSA(runID, org, proj, service, profile string, scanners []string, targetPath, repo string, pr int, sha, scmJob string) (bool, error) {
 	if strings.TrimSpace(os.Getenv("PEER_OSA_URL")) == "" {
 		return false, nil
@@ -57,6 +54,90 @@ func runSecurityScanViaOSA(runID, org, proj, service, profile string, scanners [
 	return true, nil
 }
 
+func peerOSAGetSecurityRun(ctx context.Context, org, runID string) (map[string]interface{}, error) {
+	cfg := peerOSAConfig(org, "findings:read")
+	var out map[string]interface{}
+	err := openclient.PeerJSON(ctx, cfg, http.MethodGet, "/api/security/runs/"+runID, nil, &out)
+	return out, err
+}
+
+// osaTerminalRunStatus lists the states after which findings are complete.
+var osaTerminalRunStatus = map[string]bool{
+	"completed": true, "complete": true, "passed": true, "failed": true,
+	"error": true, "cancelled": true, "canceled": true, "skipped": true,
+}
+
+// osaGateWaitTimeout bounds how long the gate waits for scanners to finish.
+func osaGateWaitTimeout() time.Duration {
+	return envDurationSec("OPA_GATE_WAIT_TIMEOUT_SEC", 10*time.Minute)
+}
+
+// osaGateRunAppearTimeout bounds how long the gate waits for the run to exist at
+// all. Shorter than the scan budget: a run that never appears is a broken
+// hand-off, and the check should say so quickly.
+func osaGateRunAppearTimeout() time.Duration {
+	return envDurationSec("OPA_GATE_RUN_APPEAR_TIMEOUT_SEC", 90*time.Second)
+}
+
+func envDurationSec(name string, def time.Duration) time.Duration {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return def
+}
+
+// awaitOSASecurityRun blocks until the OSA run reaches a terminal state.
+// Scanners run asynchronously, so evaluating the gate straight after creating
+// the run reads an empty findings set — the check would complete in under a
+// second and report a verdict about a scan that had not happened. Returns the
+// final status and whether a terminal state was actually observed.
+func awaitOSASecurityRun(org, runID string) (string, bool) {
+	if strings.TrimSpace(os.Getenv("PEER_OSA_URL")) == "" {
+		return "", false
+	}
+	start := time.Now()
+	deadline := start.Add(osaGateWaitTimeout())
+	appearBy := start.Add(osaGateRunAppearTimeout())
+	delay := 2 * time.Second
+	lastStatus := ""
+	seen := false
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		run, err := peerOSAGetSecurityRun(ctx, org, runID)
+		cancel()
+		if err == nil && run != nil {
+			status := strings.ToLower(strings.TrimSpace(fmt.Sprint(run["status"])))
+			if status != "" && status != "<nil>" {
+				seen = true
+				lastStatus = status
+				if osaTerminalRunStatus[status] {
+					return status, true
+				}
+			}
+		} else if err != nil {
+			openlogger.LogWarn("peer OSA run status failed", map[string]interface{}{
+				"error": err.Error(), "security_run_id": runID,
+			})
+		}
+		now := time.Now()
+		if now.After(deadline) {
+			return lastStatus, false
+		}
+		// A run that never appears is a broken hand-off, not a slow scan. Give up
+		// on the shorter appearance budget so a misconfigured peer answers in
+		// about a minute instead of holding the check open for the full timeout.
+		if !seen && now.After(appearBy) {
+			return "", false
+		}
+		time.Sleep(delay)
+		if delay < 15*time.Second {
+			delay += 2 * time.Second
+		}
+	}
+}
+
 func evaluateScopedGateViaOSA(org, runID, minSev string) (map[string]interface{}, bool) {
 	if strings.TrimSpace(os.Getenv("PEER_OSA_URL")) == "" {
 		return nil, false
@@ -66,16 +147,12 @@ func evaluateScopedGateViaOSA(org, runID, minSev string) (map[string]interface{}
 	out, err := peerOSAEvaluateGate(ctx, org, runID, minSev)
 	if err != nil {
 		openlogger.LogWarn("peer OSA gate failed", map[string]interface{}{"error": err.Error(), "security_run_id": runID})
-		g := gateNotRun(runID, minSev, "peer_unavailable",
-			"OSA gate call failed — nothing was evaluated; this is not a clean scan")
-		g["error"] = err.Error()
-		return g, true
+		// Transport, auth and 5xx errors all mean "no verdict available". Never
+		// present that as a findings failure.
+		verdict := gateUnavailable(runID, minSev, "peer_unavailable",
+			"could not reach the OSA AppSec gate")
+		verdict["error"] = err.Error()
+		return verdict, true
 	}
-	if out == nil {
-		out = map[string]interface{}{}
-	}
-	// Mark that OSA really answered, so a zero finding count means "scanned and
-	// clean" rather than "never scanned".
-	out["evaluated"] = true
 	return out, true
 }

@@ -101,10 +101,38 @@ curl -X POST "$AGENT/api/scm/simulate" -H 'Content-Type: application/json' \
 
 | Name | Meaning |
 |------|---------|
-| **OPA AppSec Gate** | Lite/stub scanners for this PR/run; fail on severity policy |
+| **OPA AppSec Gate** | Scanner findings for this PR/run, evaluated by OSA; fail on severity policy |
+| **OPA Checkup** | The repository's own build and test commands, run in an isolated per-job checkout |
 | **OPA Review** | Review runner (`agent -p --trust [--force] --model auto`); per-file/package units then aggregate; default non-blocking unless `ai_blocking` on watched repo. **Global PR comment** = narrative résumé (confidence + human priorities); **findings** = inline line comments only. |
 
 **Limitation:** Creating Check Runs generally requires a **GitHub App** with Checks: write. Classic / fine-grained **PATs** often cannot create Check Runs (Agent may mock ids under `OPA_SCM_MOCK_GITHUB` / `OPA_SCM_SKIP_CHECK_RUNS`). PR comments still work when the token has pull-request write.
+
+### Three outcomes, not two
+
+A gate that reports `failure` when it could not reach a verdict is worse than no
+gate: reviewers learn to merge past red checks. Both blocking checks therefore
+separate "this commit violates policy" from "this check could not run".
+
+| Conclusion | AppSec Gate | Checkup |
+|------------|-------------|---------|
+| `success` | No findings at or above `min_severity` | Every step met its post-condition |
+| `failure` | Blocking findings in this run | A step ran and failed — the title names the step and the summary carries its output |
+| `neutral` | The gate could not evaluate | The workspace could not be prepared, so no step ran |
+
+`neutral` conclusions state the cause in the check summary. The AppSec Gate
+reports these reasons:
+
+| Reason | Cause | Fix |
+|--------|-------|-----|
+| `peer_not_configured` | `PEER_OSA_URL` is unset, so no security service owns the verdict | Point `PEER_OSA_URL` at the OSA service |
+| `peer_unavailable` | OSA was unreachable, refused the service token, or returned an error | Check OSA health and that `OPEN_SERVICE_JWT_SECRET` matches on both services |
+| `scan_not_started` | The security run could not be created on OSA | Same as above; the check summary carries the transport error |
+| `scan_incomplete` | Scanners did not finish within `OPA_GATE_WAIT_TIMEOUT_SEC`, or the run never appeared within `OPA_GATE_RUN_APPEAR_TIMEOUT_SEC` | Raise the timeout, or investigate the stalled or missing run |
+
+The gate waits for the security run to reach a terminal state before reading
+findings. Without that wait it would report on an empty findings set within a
+second of the run starting, which looks like a pass or a failure depending on
+timing and is neither.
 
 ## Manual OPA Review
 
@@ -160,7 +188,14 @@ Dashboard: **Repo Watch → Reviewer contexts** — edit markdown, **Generate wi
 Require these Check Runs on protected branches (after GitHub App is installed):
 
 1. **OPA AppSec Gate** — fail closed on high/critical findings for the PR’s security run
-2. **OPA Review** (optional) — default non-blocking; set `ai_blocking` on a watched repo to fail the check when the AI reports findings
+2. **OPA Checkup** — fail closed when the repository's own tests fail
+3. **OPA Review** (optional) — default non-blocking; set `ai_blocking` on a watched repo to fail the check when the AI reports findings
+
+Both blocking checks report `neutral` when they could not evaluate, so branch
+protection treats an unreachable service or an unprepared runner as "no answer
+yet" rather than a merge-blocking violation. Configure required checks to expect
+a conclusion, and investigate repeated `neutral` results as infrastructure
+faults — they mean the commit was never verified.
 
 ### AppSec Gate check outcomes
 
