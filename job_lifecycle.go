@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	openlogger "github.com/TheGrimmChester/open-logger-go"
 )
 
 // reapOrphanJobContainers removes containers labelled opa.owner=opa-orchestrator
@@ -121,16 +122,16 @@ func bootSandboxMaintenance() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if n, err := reapOrphanJobContainers(ctx); err != nil {
-		LogWarn("sandbox reaper", map[string]interface{}{"error": err.Error()})
+		openlogger.LogWarn("sandbox reaper", map[string]interface{}{"error": err.Error()})
 	} else if n > 0 {
-		LogInfo("sandbox reaper removed orphan containers", map[string]interface{}{"removed": n, "instance": opaInstanceID()})
+		openlogger.LogInfo("sandbox reaper removed orphan containers", map[string]interface{}{"removed": n, "instance": opaInstanceID()})
 	}
 	if egressProxyEnabled() {
 		if _, err := ensureSharedEgressProxy(ctx); err != nil {
-			LogWarn("egress proxy ensure", map[string]interface{}{"error": err.Error()})
+			openlogger.LogWarn("egress proxy ensure", map[string]interface{}{"error": err.Error()})
 		}
 	}
 	if err := enforceJobDiskBudget(opaReviewTmpRoot()); err != nil {
-		LogWarn("sandbox disk budget", map[string]interface{}{"error": err.Error()})
+		openlogger.LogWarn("sandbox disk budget", map[string]interface{}{"error": err.Error()})
 	}
 }

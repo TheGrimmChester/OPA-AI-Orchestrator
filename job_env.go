@@ -29,6 +29,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	openlogger "github.com/TheGrimmChester/open-logger-go"
 )
 
 // jobPhase identifies what a child process is for. It selects which secrets the
@@ -174,7 +175,7 @@ func jobEnv(spec jobEnvSpec) []string {
 		if envNameLooksSecret(name) {
 			// A passthrough entry that looks like a credential is a bug in this
 			// file, not a runtime condition. Refuse it loudly rather than ship it.
-			LogError(nil, "jobEnv: refusing secret-looking passthrough name", map[string]interface{}{
+			openlogger.LogError(nil, "jobEnv: refusing secret-looking passthrough name", map[string]interface{}{
 				"name":  name,
 				"phase": string(spec.Phase),
 			})
@@ -203,7 +204,7 @@ func jobEnv(spec jobEnvSpec) []string {
 			continue
 		}
 		if envNameLooksSecret(k) {
-			LogError(nil, "jobEnv: dropped secret-looking Extra variable", map[string]interface{}{
+			openlogger.LogError(nil, "jobEnv: dropped secret-looking Extra variable", map[string]interface{}{
 				"name":  k,
 				"phase": string(spec.Phase),
 				"hint":  "pass credentials via jobEnvSpec.Secrets so the phase allowlist applies",
@@ -222,7 +223,7 @@ func jobEnv(spec jobEnvSpec) []string {
 		if !allowed[k] {
 			// Fail closed: the child loses the capability rather than gaining a
 			// secret its phase was never declared to hold.
-			LogError(nil, "jobEnv: dropped secret not allowed for this phase", map[string]interface{}{
+			openlogger.LogError(nil, "jobEnv: dropped secret not allowed for this phase", map[string]interface{}{
 				"name":  k,
 				"phase": string(spec.Phase),
 			})
