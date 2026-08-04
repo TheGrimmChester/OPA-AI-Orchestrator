@@ -1392,6 +1392,7 @@ func hydrateSCMOnBoot() {
 	ensureCredentialScopeColumns()
 	ensureWatchedRepoReviewColumns()
 	ensureAgentsTables()
+	nBackfill := backfillLegacyTablesOnBoot()
 	n := 0
 	rows, err := queryClient.Query(`
 		SELECT id, organization_id, project_id, scope, user_id, kind, installation_id, account_login,
@@ -1445,8 +1446,8 @@ func hydrateSCMOnBoot() {
 	// resolution uses scm_secrets via resolveCursorAPIKey. Prefer org keys.
 	orgKeyHint := nWide > 0 || resolveCursorAPIKey("default-org", "default-project", "") != "" ||
 		resolveCursorAPIKey("nas", "infra", "") != ""
-	log.Printf("[INFO] SCM hydrate: %d connector(s), %d legacy backfill, %d watched repo(s) from ClickHouse; cursor_key_mem=%v org_cli_keys=%v org_wide_seeded=%d",
-		n+nLegacy, nLegacy, nw, hasCursor, orgKeyHint, nWide)
+	log.Printf("[INFO] SCM hydrate: %d connector(s), %d connector legacy backfill, %d table rows backfilled, %d watched repo(s) from ClickHouse; cursor_key_mem=%v org_cli_keys=%v org_wide_seeded=%d",
+		n+nLegacy, nLegacy, nBackfill, nw, hasCursor, orgKeyHint, nWide)
 }
 
 func ensureWatchedRepoReviewColumns() {
