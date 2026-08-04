@@ -197,6 +197,21 @@ yet" rather than a merge-blocking violation. Configure required checks to expect
 a conclusion, and investigate repeated `neutral` results as infrastructure
 faults — they mean the commit was never verified.
 
+### AppSec Gate check outcomes
+
+The check distinguishes three states, so a gate that never ran is never mistaken
+for a clean scan:
+
+| Title | Conclusion | Meaning |
+| --- | --- | --- |
+| `AppSec Gate passed` | success | OSA evaluated the run; no findings at or above `min_severity` |
+| `AppSec Gate failed` | failure | OSA evaluated the run; blocking findings present |
+| `AppSec Gate could not run — not scanned` | failure | The scan was never dispatched or the gate query failed (`peer_unavailable`, `scan_not_dispatched`). No finding count exists — an empty result here means nothing was scanned |
+
+The gate result carries `evaluated` (bool). `evaluated=false` is reported as
+`not_evaluated` in the PR résumé rather than a bare `error`. Results persisted
+before `evaluated` existed, and the synthetic `ai_only` result, count as evaluated.
+
 Legacy CI without Repo Watch can still call `harness/appsec-pr-check.sh` (tenant or `SECURITY_RUN_ID`-scoped).
 
 ## APIs
