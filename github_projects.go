@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,88 @@ import (
 
 // Projects v2 (GraphQL) publish — only when roadmap_projects_v2 prefs is on
 // and the installation granted organization_projects write.
+
+// Projects v2 title/body sync statuses. Every outcome is machine-readable so a
+// caller can report the concrete reason instead of assuming success:
+//
+//	ok                            — GitHub confirmed the draft item was updated
+//	nothing_to_sync               — no title and no body were supplied
+//	missing_organization_projects — the installation lacks organization projects write
+//	title_sync_unsupported        — the card is backed by a real Issue or PR, whose title
+//	                                lives on the issue and cannot be set through Projects v2
+//	item_not_found                — the project item, or its draft content, is gone
+//	upstream_error                — anything else GitHub returned
+const (
+	projectsStatusOK                = "ok"
+	projectsStatusNothingToSync     = "nothing_to_sync"
+	projectsStatusMissingPermission = "missing_organization_projects"
+	projectsStatusTitleUnsupported  = "title_sync_unsupported"
+	projectsStatusItemNotFound      = "item_not_found"
+	projectsStatusUpstreamError     = "upstream_error"
+)
+
+// githubProjectsAPIError carries a machine-readable status alongside GitHub's own
+// detail, mirroring githubIssueAPIError on the Issues surface.
+type githubProjectsAPIError struct {
+	Op     string
+	Status string
+	Detail string
+}
+
+func (e *githubProjectsAPIError) Error() string {
+	if e.Detail == "" {
+		return fmt.Sprintf("%s: %s", e.Op, e.Status)
+	}
+	return fmt.Sprintf("%s: %s: %s", e.Op, e.Status, e.Detail)
+}
+
+// projectsSyncStatus extracts the machine-readable status from err, defaulting to
+// upstream_error for anything untyped and ok for nil.
+func projectsSyncStatus(err error) string {
+	if err == nil {
+		return projectsStatusOK
+	}
+	var pe *githubProjectsAPIError
+	if errors.As(err, &pe) {
+		return pe.Status
+	}
+	return projectsStatusUpstreamError
+}
+
+// classifyProjectsGraphQLError maps a GraphQL failure onto an honest status. GitHub
+// reports Projects v2 permission problems as a FORBIDDEN / "Resource not accessible"
+// GraphQL error rather than a distinct HTTP code, so the message is inspected.
+func classifyProjectsGraphQLError(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var already *githubProjectsAPIError
+	if errors.As(err, &already) {
+		return already
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "graphql 401"),
+		strings.Contains(msg, "graphql 403"),
+		strings.Contains(msg, "resource not accessible"),
+		strings.Contains(msg, "not have permission"),
+		strings.Contains(msg, "required scopes"),
+		strings.Contains(msg, "forbidden"):
+		return &githubProjectsAPIError{Op: op, Status: projectsStatusMissingPermission, Detail: err.Error()}
+	case strings.Contains(msg, "could not resolve to a node"),
+		strings.Contains(msg, "could not resolve"),
+		strings.Contains(msg, "graphql 404"),
+		strings.Contains(msg, "not found"):
+		return &githubProjectsAPIError{Op: op, Status: projectsStatusItemNotFound, Detail: err.Error()}
+	}
+	return &githubProjectsAPIError{Op: op, Status: projectsStatusUpstreamError, Detail: err.Error()}
+}
+
+// githubGraphQLEndpoint is the GraphQL endpoint. Overridable so tests can point at a
+// stub and so GitHub Enterprise installs can target their own host.
+func githubGraphQLEndpoint() string {
+	return envOr("OPA_GITHUB_GRAPHQL_URL", "https://api.github.com/graphql")
+}
 
 func publishRoadmapProjectsV2(conn *opaConnector, owner, repoFull string, issues []map[string]interface{}) (map[string]interface{}, error) {
 	out := map[string]interface{}{"enabled": true, "status": "skipped"}
@@ -70,7 +153,7 @@ func githubGraphQL(conn *opaConnector, query string, variables map[string]interf
 		}
 	}
 	payload, _ := json.Marshal(map[string]interface{}{"query": query, "variables": variables})
-	req, err := http.NewRequest(http.MethodPost, "https://api.github.com/graphql", bytes.NewReader(payload))
+	req, err := http.NewRequest(http.MethodPost, githubGraphQLEndpoint(), bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -291,13 +374,103 @@ mutation($projectId:ID!, $title:String!, $body:String) {
 	return "", fmt.Errorf("addProjectV2DraftIssue returned no item id")
 }
 
+// githubProjectV2DraftContentID resolves a ProjectV2Item id (PVTI_…) to the id of the
+// DraftIssue that backs it.
+//
+// Projects v2 has no mutation that renames a board item directly: updateProjectV2DraftIssue
+// takes the draft's own content id (DraftIssue.id), not the item id, so the item must be
+// resolved first. ProjectV2Item.content is a DraftIssue | Issue | PullRequest union, so this
+// also tells us whether a rename is possible at all — a card backed by a real Issue or PR
+// keeps its title on the issue, which Projects v2 cannot change.
+func githubProjectV2DraftContentID(conn *opaConnector, itemID string) (string, error) {
+	const op = "resolve draft content"
+	data, err := githubGraphQL(conn, `
+query($id:ID!) {
+  node(id:$id) {
+    ... on ProjectV2Item {
+      id
+      type
+      content {
+        ... on DraftIssue { id }
+        ... on Issue { id number }
+        ... on PullRequest { id number }
+      }
+    }
+  }
+}`, map[string]interface{}{"id": itemID})
+	if err != nil {
+		return "", classifyProjectsGraphQLError(op, err)
+	}
+	node, _ := data["node"].(map[string]interface{})
+	if node == nil {
+		return "", &githubProjectsAPIError{Op: op, Status: projectsStatusItemNotFound,
+			Detail: "no ProjectV2Item node for id " + itemID}
+	}
+	if itemType := strings.ToUpper(strings.TrimSpace(strFromAny(node["type"]))); itemType != "" && itemType != "DRAFT_ISSUE" {
+		return "", &githubProjectsAPIError{Op: op, Status: projectsStatusTitleUnsupported,
+			Detail: fmt.Sprintf("project item is %s, not DRAFT_ISSUE; its title lives on the linked issue and cannot be set through Projects v2", itemType)}
+	}
+	content, _ := node["content"].(map[string]interface{})
+	draftID := ""
+	if content != nil {
+		draftID = strFromAny(content["id"])
+	}
+	if draftID == "" {
+		return "", &githubProjectsAPIError{Op: op, Status: projectsStatusItemNotFound,
+			Detail: "project item carries no draft issue content"}
+	}
+	return draftID, nil
+}
+
+// githubUpdateProjectV2DraftIssue refreshes the title and/or body of the draft item
+// backing a board card. A blank title or body means "leave that field unchanged".
+//
+// Returns nil only once GitHub has confirmed the mutation; every failure carries a
+// machine-readable status via githubProjectsAPIError so the caller can report it.
 func githubUpdateProjectV2DraftIssue(conn *opaConnector, itemID, title, body string) error {
-	// Draft issue title updates require the draftIssue content id, which callers may not have.
-	// Item create path is the primary sync; title refresh is best-effort no-op for now.
-	_ = conn
-	_ = itemID
-	_ = title
-	_ = body
+	const op = "update draft issue"
+	itemID = strings.TrimSpace(itemID)
+	if itemID == "" {
+		return &githubProjectsAPIError{Op: op, Status: projectsStatusItemNotFound, Detail: "empty item id"}
+	}
+	title = strings.TrimSpace(title)
+	if title == "" && strings.TrimSpace(body) == "" {
+		return &githubProjectsAPIError{Op: op, Status: projectsStatusNothingToSync,
+			Detail: "neither title nor body supplied"}
+	}
+	if githubUseMockAPI(conn) {
+		return nil
+	}
+	draftID, err := githubProjectV2DraftContentID(conn, itemID)
+	if err != nil {
+		return err
+	}
+	vars := map[string]interface{}{"draftIssueId": draftID}
+	if title != "" {
+		vars["title"] = title
+	}
+	if strings.TrimSpace(body) != "" {
+		vars["body"] = body
+	}
+	data, err := githubGraphQL(conn, `
+mutation($draftIssueId:ID!, $title:String, $body:String) {
+  updateProjectV2DraftIssue(input:{draftIssueId:$draftIssueId, title:$title, body:$body}) {
+    draftIssue { id title }
+  }
+}`, vars)
+	if err != nil {
+		return classifyProjectsGraphQLError(op, err)
+	}
+	upd, _ := data["updateProjectV2DraftIssue"].(map[string]interface{})
+	if upd == nil {
+		return &githubProjectsAPIError{Op: op, Status: projectsStatusUpstreamError,
+			Detail: "updateProjectV2DraftIssue returned no payload"}
+	}
+	draft, _ := upd["draftIssue"].(map[string]interface{})
+	if draft == nil || strFromAny(draft["id"]) == "" {
+		return &githubProjectsAPIError{Op: op, Status: projectsStatusUpstreamError,
+			Detail: "updateProjectV2DraftIssue returned no draft issue"}
+	}
 	return nil
 }
 
