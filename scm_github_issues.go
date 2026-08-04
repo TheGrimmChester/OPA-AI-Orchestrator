@@ -9,14 +9,44 @@ import (
 
 // GitHub Issues / milestones REST helpers for AI Issues + roadmap publish.
 
+// githubIssueAPIError carries the upstream HTTP status so callers can tell a
+// deleted/renumbered issue (404) apart from a missing permission (403) and
+// report the concrete reason instead of a generic upstream failure.
+type githubIssueAPIError struct {
+	Code int
+	Op   string
+	Body string
+}
+
+func (e *githubIssueAPIError) Error() string {
+	return fmt.Sprintf("%s: github returned %d: %s", e.Op, e.Code, e.Body)
+}
+
+// IssueMissing is true when GitHub says the issue does not exist. GitHub also
+// answers 404 when the token cannot see the repository at all, which the peer
+// layer disambiguates with the installation permission probe.
+func (e *githubIssueAPIError) IssueMissing() bool { return e.Code == http.StatusNotFound }
+
+// Forbidden is true when the token exists but lacks Issues write.
+func (e *githubIssueAPIError) Forbidden() bool {
+	return e.Code == http.StatusForbidden || e.Code == http.StatusUnauthorized
+}
+
+func newGitHubIssueAPIError(op string, code int, raw []byte) *githubIssueAPIError {
+	return &githubIssueAPIError{Code: code, Op: op, Body: truncateStr(string(raw), 300)}
+}
+
 type githubIssueMeta struct {
-	Number    int      `json:"number"`
-	Title     string   `json:"title"`
-	Body      string   `json:"body"`
-	State     string   `json:"state"`
-	HTMLURL   string   `json:"html_url"`
-	Labels    []string `json:"labels"`
-	Milestone int      `json:"milestone"`
+	Number         int      `json:"number"`
+	Title          string   `json:"title"`
+	Body           string   `json:"body"`
+	State          string   `json:"state"`
+	HTMLURL        string   `json:"html_url"`
+	Labels         []string `json:"labels"`
+	Milestone      int      `json:"milestone"`
+	MilestoneTitle string   `json:"milestone_title,omitempty"`
+	Assignees      []string `json:"assignees,omitempty"`
+	UpdatedAt      string   `json:"updated_at,omitempty"`
 }
 
 type githubMilestoneMeta struct {
@@ -44,7 +74,7 @@ func githubGetIssue(c *opaConnector, owner, repo string, number int) (*githubIss
 		return nil, err
 	}
 	if code >= 300 {
-		return nil, fmt.Errorf("get issue %d: %s", code, truncateStr(string(raw), 200))
+		return nil, newGitHubIssueAPIError(fmt.Sprintf("get issue #%d", number), code, raw)
 	}
 	return decodeGitHubIssue(raw)
 }
@@ -60,15 +90,20 @@ func decodeGitHubIssue(raw []byte) (*githubIssueMeta, error) {
 			Name string `json:"name"`
 		} `json:"labels"`
 		Milestone *struct {
-			Number int `json:"number"`
+			Number int    `json:"number"`
+			Title  string `json:"title"`
 		} `json:"milestone"`
+		Assignees []struct {
+			Login string `json:"login"`
+		} `json:"assignees"`
+		UpdatedAt string `json:"updated_at"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, err
 	}
 	out := &githubIssueMeta{
 		Number: payload.Number, Title: payload.Title, Body: payload.Body,
-		State: payload.State, HTMLURL: payload.HTMLURL,
+		State: payload.State, HTMLURL: payload.HTMLURL, UpdatedAt: payload.UpdatedAt,
 	}
 	for _, l := range payload.Labels {
 		if l.Name != "" {
@@ -77,8 +112,75 @@ func decodeGitHubIssue(raw []byte) (*githubIssueMeta, error) {
 	}
 	if payload.Milestone != nil {
 		out.Milestone = payload.Milestone.Number
+		out.MilestoneTitle = payload.Milestone.Title
+	}
+	for _, a := range payload.Assignees {
+		if a.Login != "" {
+			out.Assignees = append(out.Assignees, a.Login)
+		}
 	}
 	return out, nil
+}
+
+// githubUpdateIssue patches title/body/state/milestone/labels on an existing
+// issue. Empty string / nil fields are left untouched so callers can push a
+// single field. milestone < 0 clears the milestone; milestone == 0 is "no change".
+func githubUpdateIssue(c *opaConnector, owner, repo string, number int, title, body, state string, milestone int, labels []string) (*githubIssueMeta, []string, error) {
+	if c == nil || number <= 0 {
+		return nil, nil, fmt.Errorf("missing connector or issue number")
+	}
+	if state != "" && state != "open" && state != "closed" {
+		return nil, nil, fmt.Errorf("state must be open or closed")
+	}
+	payload := map[string]interface{}{}
+	applied := []string{}
+	if strings.TrimSpace(title) != "" {
+		payload["title"] = title
+		applied = append(applied, "title")
+	}
+	if body != "" {
+		payload["body"] = body
+		applied = append(applied, "body")
+	}
+	if state != "" {
+		payload["state"] = state
+		applied = append(applied, "state")
+	}
+	if milestone > 0 {
+		payload["milestone"] = milestone
+		applied = append(applied, "milestone")
+	} else if milestone < 0 {
+		payload["milestone"] = nil
+		applied = append(applied, "milestone")
+	}
+	if labels != nil {
+		payload["labels"] = labels
+		applied = append(applied, "labels")
+	}
+	if len(payload) == 0 {
+		return nil, nil, fmt.Errorf("nothing to update")
+	}
+	if githubUseMockAPI(c) {
+		return &githubIssueMeta{
+			Number: number, Title: nz(title, "mock issue"), Body: body,
+			State: nz(state, "open"), Labels: labels, Milestone: milestone,
+			HTMLURL: fmt.Sprintf("https://github.com/%s/%s/issues/%d", owner, repo, number),
+		}, applied, nil
+	}
+	rawBody, _ := json.Marshal(payload)
+	raw, code, err := githubWriteAPI(c, owner, repo, githubPermsIssuesWrite(), http.MethodPatch,
+		fmt.Sprintf("/repos/%s/%s/issues/%d", owner, repo, number), strings.NewReader(string(rawBody)))
+	if err != nil {
+		return nil, nil, err
+	}
+	if code >= 300 {
+		return nil, nil, newGitHubIssueAPIError(fmt.Sprintf("update issue #%d", number), code, raw)
+	}
+	meta, err := decodeGitHubIssue(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	return meta, applied, nil
 }
 
 func githubCreateIssue(c *opaConnector, owner, repo, title, body string, labels []string, milestone int) (*githubIssueMeta, error) {
@@ -106,7 +208,7 @@ func githubCreateIssue(c *opaConnector, owner, repo, title, body string, labels 
 		return nil, err
 	}
 	if code >= 300 {
-		return nil, fmt.Errorf("create issue %d: %s", code, truncateStr(string(raw), 200))
+		return nil, newGitHubIssueAPIError("create issue", code, raw)
 	}
 	return decodeGitHubIssue(raw)
 }
