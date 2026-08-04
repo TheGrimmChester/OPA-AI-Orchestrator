@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	openlogger "github.com/TheGrimmChester/open-logger-go"
 )
 
 // jobSandboxRunner isolates untrusted phases. Host runner is the default
@@ -105,7 +106,7 @@ func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([
 	if err := requireDockerCLI(); err != nil {
 		if allowHostExecFallback() {
 			stampSandboxHonesty(spec.JobID, "UNSANDBOXED: tools ran as root (OPA_JOB_ALLOW_HOST_EXEC=1)")
-			LogWarn("sandbox docker unavailable — OPA_JOB_ALLOW_HOST_EXEC=1 falling back to host", map[string]interface{}{
+			openlogger.LogWarn("sandbox docker unavailable — OPA_JOB_ALLOW_HOST_EXEC=1 falling back to host", map[string]interface{}{
 				"error": err.Error(), "honesty": "UNSANDBOXED: tools ran as root", "job_id": spec.JobID,
 			})
 			hostSpec := spec
