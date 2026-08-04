@@ -46,14 +46,14 @@ Harness: `OPA-stack/harness/appsec-pr-check.sh`
 | `OPA_DASHBOARD_URL` | Redirect after install |
 | `OPA_SCM_STATE_DIR` | Durable SCM job + OPA Review stack JSON (default `$OPA_SECURITY_WORKSPACE/scm-state`). Survives Agent restart when the workspace (or this dir) is volume-mounted. Dual-written with ClickHouse `opa.scm_jobs` / `opa.scm_review_stacks`. |
 | `OPA_REVIEW_TMP` | OPA Review + context-gen checkout root (default `/tmp/opa-review`) |
-| `CURSOR_API_KEY` | **Unused for tenant jobs** (formerly a process-wide fallback). Set CLI keys via Account / AI settings (`opa.scm_secrets` scopes). Still injected into the child agent process after scoped resolution. |
-| `OPA_CURSOR_AGENT_BIN` | Path to AI agent binary (image default `/usr/local/bin/agent`) |
+| `CURSOR_API_KEY` | **Unused for tenant jobs** (formerly a process-wide fallback). Set review-runner / model-provider keys via Account settings (`opa.scm_secrets` scopes). Still injected into the child review-runner process after scoped resolution. |
+| `OPA_CURSOR_AGENT_BIN` | Path to review-runner binary (image default `/usr/local/bin/agent`) |
 | `OPA_CURSOR_MODEL` | default `auto` |
-| `SKIP_CURSOR_AI` | `1` to skip AI. Default `0` in compose — with a scoped user/org API key, OPA Review runs |
-| `OPA_CURSOR_AGENT_FORCE` | `1` to pass `--force` to the AI agent (default off; `--trust` alone for headless) |
+| `SKIP_CURSOR_AI` | `1` to skip automated review. Default `0` in compose — with a scoped user/org API key, OPA Review runs |
+| `OPA_CURSOR_AGENT_FORCE` | `1` to pass `--force` to the review runner (default off; `--trust` alone for headless) |
 | `OPA_AI_REVIEW_MAX_UNITS` | Cap independent review units per PR (default 10, max 12) |
 | `OPA_GITLEAKS_CONFIG` | Path to gitleaks.toml (image default `/etc/opa/gitleaks.toml` allowlists UI `key:` FPs) |
-| `JWT_SECRET` / `OPA_CONNECTOR_SECRET` | AES-256-GCM key material for persisting PAT + OPA Review API key in ClickHouse across Agent restarts (`OPA_CONNECTOR_SECRET` preferred; smoke uses compose `JWT_SECRET`). Ephemeral JWT fallbacks are refused for secret encryption. |
+| `JWT_SECRET` / `OPA_CONNECTOR_SECRET` | AES-256-GCM key material for persisting PAT + review-runner API key in ClickHouse across Agent restarts (`OPA_CONNECTOR_SECRET` preferred; smoke uses compose `JWT_SECRET`). Ephemeral JWT fallbacks are refused for secret encryption. |
 | `OPA_SCM_MOCK_GITHUB` | `1` mock checkout + Check Run ids for smoke/fake tokens (compose). **Real `ghp_` / `github_pat_` PATs still call GitHub** for repo listing and checkout. |
 | `OPA_SCAN_WORKTREE_ENFORCE` | Default `1`. SCM / repo-linked security scans must use an isolated checkout under `OPA_REVIEW_TMP/{id}` (never shared `/workspace` root). Set `0` only for legacy local path scans. |
 | `OPA_SCM_CRON` | `1` for 6h full scans |
@@ -71,15 +71,15 @@ $OPA_REVIEW_TMP/                     # default /tmp/opa-review
   ctxgen-{id}/                       # POST /api/scm/contexts/generate checkout
 ```
 
-- Repo Watch jobs (webhook / simulate / manual AI review) always prepare `$OPA_REVIEW_TMP/{job_id}` before gitleaks/SAST/AI.
-- Context generate clones into `$OPA_REVIEW_TMP/ctxgen-{id}` (default branch or optional PR), runs the agent with `cwd` = that tree, then deletes the dir.
+- Repo Watch jobs (webhook / simulate / manual review) always prepare `$OPA_REVIEW_TMP/{job_id}` before gitleaks/SAST/review.
+- Context generate clones into `$OPA_REVIEW_TMP/ctxgen-{id}` (default branch or optional PR), runs the review runner with `cwd` = that tree, then deletes the dir.
 - Real PAT/App: bare mirror + `git worktree add` via **GIT_ASKPASS** (token never in clone URL). Checkout failure → job `status=error` (no silent shared-fixture scan). Context generate fail-closed the same way with real credentials.
 - Mock / fake token: isolated mock git repo under the same `$OPA_REVIEW_TMP/{id}` path.
 - Webhooks for **unwatched** repos are skipped (no surprise auto-watch).
-- AI agent: `cmd.Dir = checkout`, prompt + `OPA_SCAN_WORKTREE` env point at the full tree; brief instructs **surrounding-code analysis** (callers, neighbors, related tests) — not hunk-only. `--trust` by default (`OPA_CURSOR_AGENT_FORCE=1` adds `--force`). Reviews run **per changed file** (or package group when over `OPA_AI_REVIEW_MAX_UNITS`), then findings are aggregated.
-- Gitleaks uses `/etc/opa/gitleaks.toml` (UI `key:` / React prop allowlists) plus an Agent post-filter; AppSec gate default `min_severity=high` ignores medium-only generic-api-key noise. Manual `force_ai` / `ai_only` jobs still run AI and report gate+ai together.
+- Review runner: `cmd.Dir = checkout`, prompt + `OPA_SCAN_WORKTREE` env point at the full tree; brief instructs **surrounding-code analysis** (callers, neighbors, related tests) — not hunk-only. `--trust` by default (`OPA_CURSOR_AGENT_FORCE=1` adds `--force`). Reviews run **per changed file** (or package group when over `OPA_AI_REVIEW_MAX_UNITS`), then findings are aggregated.
+- Gitleaks uses `/etc/opa/gitleaks.toml` (UI `key:` / React prop allowlists) plus an Agent post-filter; AppSec gate default `min_severity=high` ignores medium-only generic-api-key noise. Manual `force_ai` / `ai_only` jobs still run review and report gate+ai together.
 - Old `$OPA_REVIEW_TMP/*` (and legacy `worktrees/`/`jobs/`) cleaned after ~24h (`git worktree remove` + delete).
-- **OPA Review API key tenancy:** stored in `opa.scm_secrets` with `scope` (`admin`|`org`|`user`) + `organization_id`/`user_id`. Job resolution: **user → org → fail closed**. Admin keys are never inherited. Process env `CURSOR_API_KEY` / `OPA_OPENAI_API_KEY` / `OPA_ANTHROPIC_API_KEY` are **not** used as tenant fallbacks.
+- **Review API key tenancy:** stored in `opa.scm_secrets` with `scope` (`admin`|`org`|`user`) + `organization_id`/`user_id`. Job resolution: **user → org → fail closed**. Admin keys are never inherited. Process env `CURSOR_API_KEY` / `OPA_OPENAI_API_KEY` / `OPA_ANTHROPIC_API_KEY` are **not** used as tenant fallbacks.
 
 Dashboard: **PR Jobs** shows SHA + Worktree path from job summary.
 
@@ -102,7 +102,7 @@ curl -X POST "$AGENT/api/scm/simulate" -H 'Content-Type: application/json' \
 | Name | Meaning |
 |------|---------|
 | **OPA AppSec Gate** | Lite/stub scanners for this PR/run; fail on severity policy |
-| **OPA Review** | AI agent (`agent -p --trust [--force] --model auto`); per-file/package units then aggregate; default non-blocking unless `ai_blocking` on watched repo. **Global PR comment** = narrative résumé (confidence + human priorities); **findings** = inline line comments only. |
+| **OPA Review** | Review runner (`agent -p --trust [--force] --model auto`); per-file/package units then aggregate; default non-blocking unless `ai_blocking` on watched repo. **Global PR comment** = narrative résumé (confidence + human priorities); **findings** = inline line comments only. |
 
 **Limitation:** Creating Check Runs generally requires a **GitHub App** with Checks: write. Classic / fine-grained **PATs** often cannot create Check Runs (Agent may mock ids under `OPA_SCM_MOCK_GITHUB` / `OPA_SCM_SKIP_CHECK_RUNS`). PR comments still work when the token has pull-request write.
 
@@ -121,9 +121,9 @@ curl -X POST "$AGENT/api/scm/jobs/$JOB_ID/ai-review" -H 'Content-Type: applicati
 curl "$AGENT/api/connectors/$CONN_ID/pulls?repo=org/repo"
 ```
 
-Dashboard: **Security → Repo Watch** → **Run OPA Review** (repo + PR) → job appears under **PR Jobs**. **Re-run AI** on a job row re-queues AI-only.
+Dashboard: **Security → Repo Watch** → **Run OPA Review** (repo + PR) → job appears under **PR Jobs**. **Re-run review** on a job row re-queues review-only.
 
-With `SKIP_CURSOR_AI=1` or no OPA Review API key, the job still completes and records `ai.status=skipped` honestly.
+With `SKIP_CURSOR_AI=1` or no review-runner API key, the job still completes and records `ai.status=skipped` honestly.
 
 ## Reviewer contexts (multi-context packs)
 
@@ -138,7 +138,7 @@ APIs:
 - `POST /api/scm/contexts` — create
 - `GET|PATCH|DELETE /api/scm/contexts/{id}`
 - `PUT /api/scm/context-links` — `{ "repo_full_names":["a/b","a/c"], "link_group_id"? }` or `"clear":true`
-- `POST /api/scm/contexts/generate` — AI agent drafts a senior-engineer reviewer brief from a full checkout under `$OPA_REVIEW_TMP/ctxgen-{id}` (default branch or optional PR); explores architecture/invariants/tests (not README-only). Returns draft; set `save_draft:true` to persist. Fail-closed on checkout with real credentials. Skips honestly when `SKIP_CURSOR_AI=1` or no key.
+- `POST /api/scm/contexts/generate` — review runner drafts a senior-engineer reviewer brief from a full checkout under `$OPA_REVIEW_TMP/ctxgen-{id}` (default branch or optional PR); explores architecture/invariants/tests (not README-only). Returns draft; set `save_draft:true` to persist. Fail-closed on checkout with real credentials. Skips honestly when `SKIP_CURSOR_AI=1` or no key.
 
 Prompt pack caps: primary ~8k chars, each linked ~2k (6k budget), org ~3k.
 
@@ -146,7 +146,7 @@ Prompt pack caps: primary ~8k chars, each linked ~2k (6k budget), org ~3k.
 
 When the PR diff touches UI paths (`.jsx`/`.tsx`/`.css`/`components/`/`src/pages/`/`theme/`/…):
 
-1. AI brief sets `ui_files_changed: true` and packs **Design enforcement (from worktree)** — cites findable `src/theme/*`, `components/ui`, CSS variables; never invents a brand system.
+1. Review brief sets `ui_files_changed: true` and packs **Design enforcement (from worktree)** — cites findable `src/theme/*`, `components/ui`, CSS variables; never invents a brand system.
 2. Contexts tagged `design` / `ui` / `design-system` are **prioritized** in the multi-context pack (including linked repos’ design notes).
 3. Findings should use rule `design-enforcement` with file:line when possible.
 4. **Generate with AI** on a frontend worktree appends a Design enforcement section and suggests tags `design`,`ui`.
@@ -186,7 +186,7 @@ Legacy CI without Repo Watch can still call `harness/appsec-pr-check.sh` (tenant
 - **UI visual MCP (required for UI diffs):** ora-api / ora-orchestrator image must ship Node.js (`node`/`npx`), Playwright Chromium + system libs, and set `OPA_REVIEW_BROWSER_DEPS_OK=1`. CLI already uses `--approve-mcps`. Env:
   - `OPA_REVIEW_BROWSER_MCP` — `1` (default) enables browser MCP for UI-touched PRs; `0` disables
   - `OPA_REVIEW_BROWSER_DEPS_OK` — must be `1` when Chromium/deps are provisioned (image default); otherwise visual MCP is skipped as unmet requirement
-  - `OPA_REVIEW_PREVIEW_URL` — optional preview URL for the agent to open
+  - `OPA_REVIEW_PREVIEW_URL` — optional preview URL for the review runner to open
   - `OPA_REVIEW_MCP_CONFIG` — optional host JSON of `mcpServers` merged into a host-owned overlay under `$OPA_SCM_STATE_DIR/mcp-overlay/.../.cursor/mcp.json` via `prepareOPAReviewMCP` / `writeReviewMCPOverlay` (never the PR worktree). Only allowlisted server names are accepted (currently `browser`); others are dropped.
 - `GET|POST /api/scm/contexts`, `GET|PATCH|DELETE /api/scm/contexts/{id}`, `POST /api/scm/contexts/generate`
 - `PUT /api/scm/context-links`

@@ -1,7 +1,7 @@
 # Job isolation (ORA)
 
 
-When `OPA_JOB_SANDBOX=docker`, untrusted phases (secrets scan, AI review, autofix)
+When `OPA_JOB_SANDBOX=docker`, untrusted phases (secrets scan, automated review, autofix)
 run in short-lived containers built from the runner targets in the Dockerfile.
 Default remains `off` so existing smoke stays host-exec with curated `jobEnv`.
 
@@ -25,24 +25,25 @@ export OPA_INSTANCE_ID=laptop-dev   # reaper only kills this instance's labels
 # Optional: OPA_REVIEW_TMP=/opa-jobs  # identity path shared with container binds
 # Optional: OPA_JOB_EGRESS_NPM=1      # add registry.npmjs.org (prefer image-pinned deps)
 # Optional: OPA_JOB_EGRESS_ALLOWLIST — **full override** of defaults (not a merge).
-#   Leave unset to keep api.cursor.sh + api2–api5.cursor.sh and any checkup
+#   Leave unset to keep the default model-provider API hosts plus any checkup
 #   registry hosts the proxy ships with. Setting this replaces the entire list —
-#   do not copy a Cursor-only example into prod if checkup installs need npm/packagist.
-#   Full Cursor AI set example:
+#   do not omit checkup registries in prod if installs need npm/packagist.
+#   Model-provider hosts only (example — not a merge with checkup defaults):
 #   export OPA_JOB_EGRESS_ALLOWLIST=api.cursor.sh,api2.cursor.sh,api3.cursor.sh,api4.cursor.sh,api5.cursor.sh
 # Optional: OPA_JOB_EGRESS_STACK_NETWORKS=opa-stack_opa_internal,opa_network
 #   (default) also join compose bridges so NAS egress routing/DNS matches the stack
 ```
 
-Enable checkup via agent prefs (`checkup_enabled: true` at org/installation/repo).
+Enable checkup via job prefs (`checkup_enabled: true` at org/installation/repo).
 Without docker sandbox the checkup child is skipped with an honesty reason.
 
 Do **not** deploy `*:smoke` images to NAS prod — use `*:nas` and prod compose only.
 
-## Checkup (AI-planned)
+## Checkup (model-planned)
 
-Plan is derived from `AGENTS.md` / `CLAUDE.md` / `CURSOR.md` / `.cursor/rules`
-(an `opa-checkup-plan` fenced JSON block) or a conservative heuristic, then
+Plan is derived from project instruction files (`AGENTS.md` and common
+assistant-config filenames under the repo root) that contain an
+`opa-checkup-plan` fenced JSON block, or from a conservative heuristic, then
 clamped by `intersectSpecWithPolicy` (image/binary/secret/egress caps). Steps
 use argv slices only; post-conditions (e.g. JUnit with ≥1 testcase) are
 mandatory.
@@ -56,9 +57,9 @@ Service sidecars join `--internal` `opa-job-<id>`; teardown is
 |--------|----------|-------|
 | `opa-runner-scan` | gitleaks + `/etc/opa/gitleaks.toml` | `security.scan` |
 | `opa-runner-git` | git only | prepare-adjacent |
-| `opa-runner-ai` | `/opt/opa/agent`, Playwright, pinned `@playwright/mcp` | review / autofix |
+| `opa-runner-ai` | Review runner binary, Playwright, pinned `@playwright/mcp` | review / autofix |
 | `opa-runner-php` | PHP 8.4 CLI + common extensions + Composer | checkup / `cloud.verify` |
-| `opa-egress-proxy` | allowlist CONNECT proxy (`egress-proxy` mode) | shared AI egress |
+| `opa-egress-proxy` | allowlist CONNECT proxy (`egress-proxy` mode) | shared review egress |
 
 Heuristic checkup plans pick `OPA_JOB_IMAGE_PHP` / `opa-runner-php:<tag>` when
 `composer.json` (and optionally `phpunit.xml`) is present; Node/Go trees keep
@@ -67,7 +68,7 @@ adds `vendor/bin/phpstan analyse --no-progress --error-format=checkstyle` with
 a checkstyle post-condition (stdout). **New-errors-only** is best-effort: if
 `phpstan-baseline.neon` (or `.neon.php`) exists **and** the neon `includes` it,
 phpstan itself only fails on new errors; without a baseline, any reported error
-fails the check. AI-authored phpstan steps are normalized the same way in
+fails the check. Model-authored phpstan steps are normalized the same way in
 `intersectSpecWithPolicy`.
 
 ## Hardening (argv builder)
@@ -85,7 +86,7 @@ no-new-privileges / no publish / no docker.sock) but intentionally omit
 **Shared egress proxy** (`ensureSharedEgressProxy`) is a trusted long-lived
 container with its own argv (including `-e`); it is not a job box.
 
-**Networks:** Scan uses `--network none`. Review/autofix AI phases use a
+**Networks:** Scan uses `--network none`. Review/autofix phases use a
 per-job `--internal` network with the shared allowlist proxy attached (DNS
 alias `opa-egress-proxy`) and `HTTP(S)_PROXY` pointing at it. Checkup
 `runCheckupPlan` uses the **same** allowlist proxy path when
@@ -110,22 +111,22 @@ when present.
   process can unset proxy env (and Chromium ignores it without `--proxy-server`).
   Job boxes have no default route; only the shared `opa.role=egress-proxy`
   container also joins `opa-egress-<instance>` and can dial the allowlist.
-  Defaults are Cursor API hosts (`api.cursor.sh` … `api5.cursor.sh`). When
-  `OPA_JOB_SANDBOX=docker` (and `OPA_JOB_EGRESS_CHECKUP` is not `0`), the same
-  proxy also allowlists checkup registries: npm (`registry.npmjs.org`,
+  Defaults are model-provider API hosts (`api.cursor.sh` … `api5.cursor.sh`).
+  When `OPA_JOB_SANDBOX=docker` (and `OPA_JOB_EGRESS_CHECKUP` is not `0`), the
+  same proxy also allowlists checkup registries: npm (`registry.npmjs.org`,
   `registry.yarnpkg.com`), Go (`proxy.golang.org`, `sum.golang.org`,
   `storage.googleapis.com`, `github.com`, `objects.githubusercontent.com`,
   `codeload.github.com`, `proxy.golang.com`), and Composer/Packagist
   (`repo.packagist.org`, `packagist.org`). `OPA_JOB_EGRESS_PROXY=0` falls back
-  to unrestricted `bridge` for AI (break-glass).
-- Prompt injection survives the container. Agent stdout can reach check runs /
-  comments; masking is heuristic, not a boundary.
+  to unrestricted `bridge` for review runners (break-glass).
+- Prompt injection survives the container. Review-runner stdout can reach check
+  runs / comments; masking is heuristic, not a boundary.
 - Checkup sidecars and the shared egress proxy are **not** under the job-box
   non-root / read-only envelope; treat them as trusted helpers on the job
-  `--internal` network, not as untrusted agent sandboxes.
+  `--internal` network, not as untrusted review-runner sandboxes.
 - **Checkup registry egress** follows the shared allowlist proxy when
   `OPA_JOB_EGRESS_PROXY` is on and the plan has no sidecar services (same
-  `--internal` + proxy path as AI). With sidecars or proxy off, checkup nets
+  `--internal` + proxy path as review). With sidecars or proxy off, checkup nets
   stay sealed — `composer`/`npm`/`yarn` then only succeed when `vendor/` /
   `node_modules` (or an offline cache bind) is already in the tree. Expanding
   the allowlist for registries is an explicit product change, not break-glass
@@ -137,7 +138,7 @@ when present.
 - Escape smoke (`job-escape-smoke.sh`) is a local guardrail, not a proof of
   isolation against a compromised orchestrator.
 - Cloud autofix lands by applying a **gateCloudDiff-validated** patch onto a
-  fresh checkout (`cloud-land-*`), not by committing the agent-writable tree.
+  fresh checkout (`cloud-land-*`), not by committing the runner-writable tree.
 - **PHP checkup image choice:** `opa-runner-php` is built from official
   `php:8.4-cli-bookworm` plus `install-php-extensions` (bcmath, pcntl, redis,
   event, opentelemetry, pdo_mysql, intl, …) and Composer 2 — not from
@@ -148,6 +149,6 @@ when present.
   require-ext sets; the runner image exists to close that gap without a
   third-party base. phpunit/phpstan/php-cs-fixer are **not** baked in — they
   come from project `vendor/` after `composer install`.
-- Dashboard Agents UI ships in OPA-Dashboard (prefs APIs live here).
-- Checkup step log viewer in Dashboard remains a follow-up; phpstan checkstyle
-  annotations cover the lint path only.
+- Agents UI ships in ORA-Dashboard (prefs APIs live here).
+- Checkup step log viewer in the dashboard remains a follow-up; phpstan
+  checkstyle annotations cover the lint path only.
