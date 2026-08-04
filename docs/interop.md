@@ -49,7 +49,7 @@ From the LAN use `192.168.100.101` instead of `127.0.0.1`. Family overview: [OPA
 Caller mints with `Open-Auth-Go` / `Open-Client-Go` peer helpers:
 
 - `iss=ora-api`, `aud=osa-api` — scopes: `runs:write`, `findings:read`, `health:read`
-- `iss=opm-api`, `aud=ora-api` — scopes: `connectors:read`, `scm:clone`, `scm:pm`, `health:read`
+- `iss=opm-api`, `aud=ora-api` — scopes: `connectors:read`, `scm:clone`, `scm:pm`, `scm:pr`, `health:read`
 - `iss=osa-api`, `aud=ora-api` — scopes: `connectors:read`, `scm:clone`, `health:read`
 
 OPM and OSA discover GitHub repos via `GET /api/connectors` and `GET /api/connectors/{id}/repos` (user JWT or service JWT with `connectors:read`). Ephemeral clones use `POST /api/peer/scm/clone-credentials` (service JWT + `scm:clone` only). Milestone list/upsert and Projects v2 list/item sync use `POST /api/peer/scm/milestones/*` and `POST /api/peer/scm/projects/*` (service JWT + `scm:pm`). GitHub App/PAT secrets never leave ORA.
@@ -75,6 +75,42 @@ Failures are machine-readable rather than a generic `502`, so the caller can rep
 | `upstream_error` | 502 | Anything else; `error` carries GitHub's own status and body. |
 
 **GitHub permissions for `scm:pm`:** Issues write covers milestones and the Issues surface above. Organization projects write is needed for Projects v2 only (optional — without it milestone and Issues routes still work; projects list returns `missing_organization_projects`).
+
+### Code delivery peer surface (`scm:pr`)
+
+`scm:pr` is the **only** scope that can write code. It is separate from `scm:pm`
+on purpose: a peer that syncs issues, milestones and Projects must not be able to
+obtain a write-capable git credential or open a pull request. Both routes are
+POST-only writes — there is no read variant under this scope.
+
+| Route | Purpose |
+|-------|---------|
+| `POST /api/peer/scm/push-credentials` | Short-lived **Contents-write** installation token + `clone_url` for one delivery push. Returns `expires_at` and the granted `permissions`. Not persisted by ORA, not logged. |
+| `POST /api/peer/scm/pull-requests/create` | Opens a pull request (`title`, `body`, `head`, `base`, `draft`). Returns `pull_request { number, html_url, state, head_ref, base_ref, draft }`. |
+
+An already-open pull request for the same `head` is resolved and returned with
+`already_existed: true`, so re-delivering a branch converges instead of failing.
+
+Failures are machine-readable so the caller reports the concrete cause:
+
+| `status` | HTTP | Meaning |
+|----------|------|---------|
+| `missing_contents_permission` | 403 | Installation cannot push (or the connector is not authorized for writes) |
+| `missing_pull_requests_permission` | 403 | Installation cannot open pull requests |
+| `head_branch_not_found` | 422 | The head branch does not exist on the remote |
+| `no_commits_between` | 422 | Head carries nothing base does not already have |
+| `repo_not_found` | 404 | The connector cannot see the repository |
+| `upstream_error` | 502 | Anything else GitHub returned |
+
+403 responses include the installation's `granted` / `missing` permission sets.
+Write calls pre-flight the installation permission probe, so a missing permission
+is reported as such rather than surfacing as a GitHub 502.
+
+**GitHub permissions for `scm:pr`:** **Contents: Read and write** and
+**Metadata: Read** for the push credential; **Pull requests: Read and write**
+(plus Contents write, Metadata read) to open the pull request. **`workflows` is
+never requested**, so a delivery cannot modify `.github/workflows/`. PAT
+connectors are refused for writes unless `OPA_AGENTS_ALLOW_PAT_WRITE=1`.
 
 ## Review vs AppSec gate
 
