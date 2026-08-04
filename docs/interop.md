@@ -24,7 +24,7 @@ User JWTs and standalone `/api/auth/*` come from **Open-Auth-Go** (`Gate`); this
 
 ## Tenant headers
 
-When `OPA_AUTH_REQUIRED=1`, send **`X-Organization-ID`** and **`X-Project-ID`** on control-plane calls so ClickHouse scopes match the dashboard tenant picker. Omitting them (or sending `"all"`) scopes to **`default-org` / `default-project`** — the same write tenant used for INSERT (Open-Tenant-Go ≥ 0.2.2). Prefer always sending concrete headers so scripts match the UI.
+When `OPA_AUTH_REQUIRED=1`, send **`X-Organization-ID`** and **`X-Project-ID`** on control-plane calls so ClickHouse scopes match the dashboard tenant picker. Omitting them (or sending `"all"`) scopes to **`default-org` / `default-project`** — the same write tenant used for INSERT (Open-Tenant-Go ≥ 0.2.2). Prefer always sending concrete headers so scripts match the UI. Hub JWTs with `project_ids` are allowlisted via Open-Auth-Go `EnforceProjectACL` (non-member → **403**; `admin` unrestricted).
 
 ```bash
 TOKEN=$(curl -sf -X POST http://127.0.0.1:18080/api/auth/login \
