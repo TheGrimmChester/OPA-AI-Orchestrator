@@ -1718,13 +1718,13 @@ func processContinuousSCMJob(jobID string) {
 		return
 	}
 
-	var scanErr error
+	var scanStartErr error
 	if !job.AIOnly {
-		scanErr = runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, profile, scanList, relPath, "", job.RepoFullName, job.PRNumber, job.CommitSHA, job.ID)
+		scanStartErr = runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, profile, scanList, relPath, "", job.RepoFullName, job.PRNumber, job.CommitSHA, job.ID)
 	} else {
 		job.Summary["ai_only"] = true
 		// Seed an empty security run so AI context still has a run id.
-		runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, "auto", []string{}, relPath, "", job.RepoFullName, job.PRNumber, job.CommitSHA, job.ID)
+		scanStartErr = runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, "auto", []string{}, relPath, "", job.RepoFullName, job.PRNumber, job.CommitSHA, job.ID)
 	}
 	if finishIfCancelled() {
 		if appSecID != 0 {
@@ -1736,24 +1736,17 @@ func processContinuousSCMJob(jobID string) {
 		return
 	}
 
-	// Scoped gate
-	var gate map[string]interface{}
-	if scanErr != nil {
-		// No run reached OSA — skip the gate query rather than read an empty
-		// finding set as a pass.
-		gate = gateNotRun(runID, minSev, "scan_not_dispatched", scanErr.Error())
-	} else {
-		gate = evaluateScopedGate(job.OrganizationID, runID, minSev)
-	}
+	// Scoped gate — waits for the scanners to finish before reading findings.
+	gate := gateAfterScan(job.OrganizationID, runID, minSev, scanStartErr)
 	if job.AIOnly {
 		gate = map[string]interface{}{
-			"status": "pass", "fail": false, "reasons": []string{"ai_only"},
+			"status": gateStatusPass, "fail": false, "reasons": []string{"ai_only"},
 			"scope": "security_run", "security_run_id": runID, "min_severity": minSev,
 		}
 	}
 	job.Summary["gate"] = gate
-	conclusion, title, gateSummary := appSecCheckOutcome(gate, runID)
-	sum := checkRunSummaryWithJobLink(gateSummary, job.ID)
+	conclusion, title := gateCheckOutcome(gate)
+	sum := checkRunSummaryWithJobLink(gateCheckSummary(gate, runID), job.ID)
 	if appSecID != 0 {
 		_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", conclusion, title, sum, jobDashURL, nil)
 	}

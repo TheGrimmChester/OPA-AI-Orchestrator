@@ -142,3 +142,39 @@ func TestRelatedROBind(t *testing.T) {
 		t.Fatal("cross-layout related bind must fail assertJobBindPath")
 	}
 }
+
+func TestSiblingROBinds(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("OPA_REVIEW_TMP", tmp)
+	layout := "run-sib-1"
+	primary := filepath.Join(tmp, layout, "primary")
+	dep := filepath.Join(tmp, layout, "Open-Auth-Go")
+	for _, d := range []string{primary, dep} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	jobID := "checkup-child"
+	binds := siblingROBinds([]string{dep}, jobID, layout)
+	if len(binds) != 1 {
+		t.Fatalf("binds = %v, want 1", binds)
+	}
+	want := dep + ":/opa-jobs/" + sanitizeDockerName(jobID) + "/Open-Auth-Go:ro"
+	if binds[0] != want {
+		t.Fatalf("bind = %q, want %q", binds[0], want)
+	}
+
+	// Paths outside the job layout are dropped, never mounted.
+	outside := t.TempDir()
+	if got := siblingROBinds([]string{outside}, jobID, layout); len(got) != 0 {
+		t.Fatalf("outside-layout bind must be dropped, got %v", got)
+	}
+	// Relative paths and missing dirs are dropped.
+	if got := siblingROBinds([]string{"relative/path", filepath.Join(tmp, layout, "nope")}, jobID, layout); len(got) != 0 {
+		t.Fatalf("invalid binds must be dropped, got %v", got)
+	}
+	// Duplicates collapse.
+	if got := siblingROBinds([]string{dep, dep}, jobID, layout); len(got) != 1 {
+		t.Fatalf("duplicate binds must collapse, got %v", got)
+	}
+}
