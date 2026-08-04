@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	openlogger "github.com/TheGrimmChester/open-logger-go"
 )
 
 // security_run_id helpers — ORA links review jobs to OSA runs; it does not own AppSec.
@@ -33,7 +34,7 @@ func runSecurityScanJob(runID, org, proj, service, profile string, scanners []st
 	if runSecurityScanViaOSA(runID, org, proj, service, profile, scanners, targetPath, repo, pr, sha, scmJob) {
 		return
 	}
-	LogWarn("security scan skipped — set PEER_OSA_URL for AppSec runs", map[string]interface{}{
+	openlogger.LogWarn("security scan skipped — set PEER_OSA_URL for AppSec runs", map[string]interface{}{
 		"security_run_id": runID, "repo": repo,
 	})
 }

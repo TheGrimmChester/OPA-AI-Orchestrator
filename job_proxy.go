@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	openlogger "github.com/TheGrimmChester/open-logger-go"
 )
 
 // Shared allowlist egress proxy for sandboxed AI phases.
@@ -202,7 +203,7 @@ func attachEgressProxyToStackNetworks(ctx context.Context, proxyName string) {
 			if strings.Contains(low, "already") {
 				continue
 			}
-			LogWarn("egress proxy stack network connect failed", map[string]interface{}{
+			openlogger.LogWarn("egress proxy stack network connect failed", map[string]interface{}{
 				"network": netName, "proxy": proxyName,
 				"error": truncateStr(string(out)+" "+err.Error(), 160),
 			})
@@ -248,7 +249,7 @@ func ensureSharedEgressProxy(ctx context.Context) (string, error) {
 				return name, nil
 			}
 			// Allowlist drifted (e.g. new Cursor API hosts) — recreate.
-			LogInfo("egress proxy allowlist drift — recreating", map[string]interface{}{
+			openlogger.LogInfo("egress proxy allowlist drift — recreating", map[string]interface{}{
 				"name": name, "want": wantAllow,
 			})
 		}
@@ -410,7 +411,7 @@ func serveAllowlistEgressProxy(listen string, allow []string) error {
 	if err != nil {
 		return err
 	}
-	LogInfo("egress proxy listening", map[string]interface{}{
+	openlogger.LogInfo("egress proxy listening", map[string]interface{}{
 		"listen": listen, "allow": allow,
 		"honesty": "allowlist is the dial gate; clients on --internal have no other route",
 	})
