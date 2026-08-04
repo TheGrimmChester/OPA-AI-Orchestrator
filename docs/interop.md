@@ -76,6 +76,15 @@ Failures are machine-readable rather than a generic `502`, so the caller can rep
 
 **GitHub permissions for `scm:pm`:** Issues write covers milestones and the Issues surface above. Organization projects write is needed for Projects v2 only (optional — without it milestone and Issues routes still work; projects list returns `missing_organization_projects`).
 
+**Projects v2 `sync-item` covers create and status only.** `POST /api/peer/scm/projects/sync-item` creates a
+draft item when no `item_id` is supplied (`github_projects.go:274-292`) and can set the Status single-select
+from a column hint (`githubSetProjectV2ItemStatus`). It does **not** update the title or body of an item that
+already exists: `githubUpdateProjectV2DraftIssue` (`github_projects.go:294-302`) returns `nil` without calling
+the API — updating a draft issue needs the draft's content id, which callers do not have — and the caller
+discards its return value (`peer_scm_pm.go:268`). A rename therefore comes back `{"ok": true}` while the board
+is unchanged, with no `status_note` to hint at it. Callers should not treat a successful `sync-item` as
+confirmation that the item's title matches.
+
 ## Review vs AppSec gate
 
 | Concern | Product | Mechanism |
