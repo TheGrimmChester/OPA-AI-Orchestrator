@@ -33,6 +33,7 @@ func main() {
 	writer = NewClickHouseWriter(chURL, 100)
 	queryClient = NewClickHouseQuery(chURL)
 	ensureClickHouseDatabase(queryClient)
+	ensureOraSchema(queryClient)
 	initAuthMode()
 
 	authRequired := authRequiredEnv()
