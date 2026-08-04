@@ -488,14 +488,12 @@ func applyWebhookRepoMeta(rec *scmWebhookReceipt, repo string, pr int, sha strin
 	}
 }
 
-// canSeeSCMWebhook mirrors canSeeSCMJob tenant visibility (org filter; All+admin = all;
-// All+non-admin = only rows with matching org empty treated as default-org, no actor filter
-// since webhooks have no actor — non-admins with All see nothing unless they pick an org,
-// matching the honesty for webhook-origin jobs).
+// canSeeSCMWebhook mirrors canSeeSCMJob tenant visibility (org filter; auth-on
+// empty org fails closed — actorFromRequest pins WriteTenant on HTTP paths).
 //
 // When connectorFilter is set, deliveries for that connector are shown even if the
 // tenant picker points at another org (GitHub App installs often live on default-org
-// while the UI tenant is nas / All). Non-admins must still match the connector's org.
+// while the UI tenant is nas). Non-admins must still match the connector's org.
 func canSeeSCMWebhook(a credActor, r *scmWebhookReceipt, connectorFilter string) bool {
 	if r == nil {
 		return false
@@ -532,10 +530,7 @@ func canSeeSCMWebhook(a credActor, r *scmWebhookReceipt, connectorFilter string)
 	if !authEnforced {
 		return true
 	}
-	if a.isAdmin() {
-		return true
-	}
-	// Non-admin + All: webhook deliveries are not user-queued; hide (same honesty as jobs).
+	// Auth on + empty org should not reach here (actorFromRequest → WriteTenant).
 	return false
 }
 
