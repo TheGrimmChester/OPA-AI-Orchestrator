@@ -887,34 +887,128 @@ func getOrHydrateConnector(id string) *opaConnector {
 	return hydrateConnectorFromCH(id)
 }
 
-func hydrateConnectorFromCH(id string) *opaConnector {
-	if queryClient == nil || strings.TrimSpace(id) == "" {
-		return nil
+// needsLegacyConnectorFallback is true when ORA runs in a product DB (ora) and
+// legacy connector rows may still live in hub opa.connectors (QueryExact only).
+func needsLegacyConnectorFallback() bool {
+	db := clickHouseDatabase()
+	return db != "" && db != "opa" && db != "default"
+}
+
+func connectorSelectCols() string {
+	return `id, organization_id, project_id, scope, user_id, kind, installation_id, account_login,
+		       status, token_ref, meta_json, created_at, updated_at`
+}
+
+func connectorSelectColsLegacy() string {
+	return `id, organization_id, project_id, kind, installation_id, account_login,
+			       status, token_ref, meta_json, created_at, updated_at`
+}
+
+func queryProductConnectorRows(id string, limit int) ([]map[string]interface{}, error) {
+	if queryClient == nil {
+		return nil, fmt.Errorf("clickhouse query client not configured")
 	}
-	rows, err := queryClient.Query(fmt.Sprintf(`
-		SELECT id, organization_id, project_id, scope, user_id, kind, installation_id, account_login,
-		       status, token_ref, meta_json, created_at, updated_at
-		FROM opa.connectors
-		WHERE id = '%s' AND status != 'deleted'
-		ORDER BY updated_at DESC LIMIT 1`, escapeSQL(id)))
+	where := "status != 'deleted'"
+	if strings.TrimSpace(id) != "" {
+		where += fmt.Sprintf(" AND id = '%s'", escapeSQL(id))
+	}
+	lim := ""
+	if limit > 0 {
+		lim = fmt.Sprintf(" LIMIT %d", limit)
+	}
+	q := fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE %s ORDER BY updated_at DESC%s`,
+		connectorSelectCols(), where, lim)
+	rows, err := queryClient.Query(q)
 	if err != nil {
-		// Pre-migration schemas lack scope/user_id.
-		rows, err = queryClient.Query(fmt.Sprintf(`
-			SELECT id, organization_id, project_id, kind, installation_id, account_login,
-			       status, token_ref, meta_json, created_at, updated_at
-			FROM opa.connectors
-			WHERE id = '%s' AND status != 'deleted'
-			ORDER BY updated_at DESC LIMIT 1`, escapeSQL(id)))
+		rows, err = queryClient.Query(fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE %s ORDER BY updated_at DESC%s`,
+			connectorSelectColsLegacy(), where, lim))
 	}
-	if err != nil || len(rows) == 0 {
-		return nil
+	return rows, err
+}
+
+func queryLegacyHubConnectorRows(id string, limit int) ([]map[string]interface{}, error) {
+	if queryClient == nil || !needsLegacyConnectorFallback() {
+		return nil, nil
 	}
-	c := connectorFromCHRow(rows[0], true)
+	where := "status != 'deleted'"
+	if strings.TrimSpace(id) != "" {
+		where += fmt.Sprintf(" AND id = '%s'", escapeSQL(id))
+	}
+	lim := ""
+	if limit > 0 {
+		lim = fmt.Sprintf(" LIMIT %d", limit)
+	}
+	q := fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE %s ORDER BY updated_at DESC%s`,
+		connectorSelectCols(), where, lim)
+	rows, err := queryClient.QueryExact(q)
+	if err != nil {
+		rows, err = queryClient.QueryExact(fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE %s ORDER BY updated_at DESC%s`,
+			connectorSelectColsLegacy(), where, lim))
+	}
+	return rows, err
+}
+
+func storeHydratedConnector(c *opaConnector, backfillLegacy bool) *opaConnector {
 	if c == nil || c.Status == "deleted" {
 		return nil
 	}
 	connectorLive.Store(c.ID, c)
+	if backfillLegacy && needsLegacyConnectorFallback() {
+		persistConnector(c)
+	}
 	return c
+}
+
+func hydrateConnectorFromCH(id string) *opaConnector {
+	if queryClient == nil || strings.TrimSpace(id) == "" {
+		return nil
+	}
+	rows, err := queryProductConnectorRows(id, 1)
+	fromLegacy := false
+	if err != nil || len(rows) == 0 {
+		if legacy, lerr := queryLegacyHubConnectorRows(id, 1); lerr == nil && len(legacy) > 0 {
+			rows, fromLegacy = legacy, true
+		} else {
+			return nil
+		}
+	}
+	c := connectorFromCHRow(rows[0], true)
+	return storeHydratedConnector(c, fromLegacy)
+}
+
+// backfillLegacyConnectorsOnBoot copies hub opa.connectors rows missing from the
+// product DB into memory + ora.connectors so peer clone-credentials survives restart.
+func backfillLegacyConnectorsOnBoot() int {
+	if queryClient == nil || !needsLegacyConnectorFallback() {
+		return 0
+	}
+	rows, err := queryLegacyHubConnectorRows("", 200)
+	if err != nil || len(rows) == 0 {
+		return 0
+	}
+	n := 0
+	seen := map[string]struct{}{}
+	for _, row := range rows {
+		id, _ := row["id"].(string)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if getConnector(id) != nil {
+			continue
+		}
+		if prod, _ := queryProductConnectorRows(id, 1); len(prod) > 0 {
+			continue
+		}
+		c := connectorFromCHRow(row, true)
+		if storeHydratedConnector(c, true) != nil {
+			n++
+		}
+	}
+	return n
 }
 
 func connectorFromCHRow(row map[string]interface{}, decryptToken bool) *opaConnector {
@@ -1338,6 +1432,7 @@ func hydrateSCMOnBoot() {
 			n++
 		}
 	}
+	nLegacy := backfillLegacyConnectorsOnBoot()
 	nw := hydrateWatchedReposOnBoot()
 	_ = hydrateAgentPrefsOnBoot()
 	nWide := ensureOrgWideCLICursorKeys()
@@ -1350,8 +1445,8 @@ func hydrateSCMOnBoot() {
 	// resolution uses scm_secrets via resolveCursorAPIKey. Prefer org keys.
 	orgKeyHint := nWide > 0 || resolveCursorAPIKey("default-org", "default-project", "") != "" ||
 		resolveCursorAPIKey("nas", "infra", "") != ""
-	log.Printf("[INFO] SCM hydrate: %d connector(s), %d watched repo(s) from ClickHouse; cursor_key_mem=%v org_cli_keys=%v org_wide_seeded=%d",
-		n, nw, hasCursor, orgKeyHint, nWide)
+	log.Printf("[INFO] SCM hydrate: %d connector(s), %d legacy backfill, %d watched repo(s) from ClickHouse; cursor_key_mem=%v org_cli_keys=%v org_wide_seeded=%d",
+		n+nLegacy, nLegacy, nw, hasCursor, orgKeyHint, nWide)
 }
 
 func ensureWatchedRepoReviewColumns() {
