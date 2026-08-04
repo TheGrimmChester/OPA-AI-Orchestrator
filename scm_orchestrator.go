@@ -1718,8 +1718,9 @@ func processContinuousSCMJob(jobID string) {
 		return
 	}
 
+	var scanErr error
 	if !job.AIOnly {
-		runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, profile, scanList, relPath, "", job.RepoFullName, job.PRNumber, job.CommitSHA, job.ID)
+		scanErr = runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, profile, scanList, relPath, "", job.RepoFullName, job.PRNumber, job.CommitSHA, job.ID)
 	} else {
 		job.Summary["ai_only"] = true
 		// Seed an empty security run so AI context still has a run id.
@@ -1736,7 +1737,14 @@ func processContinuousSCMJob(jobID string) {
 	}
 
 	// Scoped gate
-	gate := evaluateScopedGate(job.OrganizationID, runID, minSev)
+	var gate map[string]interface{}
+	if scanErr != nil {
+		// No run reached OSA — skip the gate query rather than read an empty
+		// finding set as a pass.
+		gate = gateNotRun(runID, minSev, "scan_not_dispatched", scanErr.Error())
+	} else {
+		gate = evaluateScopedGate(job.OrganizationID, runID, minSev)
+	}
 	if job.AIOnly {
 		gate = map[string]interface{}{
 			"status": "pass", "fail": false, "reasons": []string{"ai_only"},
@@ -1744,13 +1752,8 @@ func processContinuousSCMJob(jobID string) {
 		}
 	}
 	job.Summary["gate"] = gate
-	conclusion := "success"
-	title := "AppSec Gate passed"
-	if gate["fail"] == true {
-		conclusion = "failure"
-		title = "AppSec Gate failed"
-	}
-	sum := checkRunSummaryWithJobLink(fmt.Sprintf("scope=%v reasons=%v security_run_id=%s", gate["scope"], gate["reasons"], runID), job.ID)
+	conclusion, title, gateSummary := appSecCheckOutcome(gate, runID)
+	sum := checkRunSummaryWithJobLink(gateSummary, job.ID)
 	if appSecID != 0 {
 		_ = githubUpdateCheckRun(conn, owner, repoName, appSecID, "completed", conclusion, title, sum, jobDashURL, nil)
 	}

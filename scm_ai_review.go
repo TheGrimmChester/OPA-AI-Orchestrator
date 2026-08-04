@@ -188,9 +188,7 @@ func runCursorAIReview(job *scmJob, conn *opaConnector, wr *opaWatchedRepo, chec
 	gateStatus := "unknown"
 	if job.Summary != nil {
 		if g, ok := job.Summary["gate"].(map[string]interface{}); ok {
-			if s, _ := g["status"].(string); s != "" {
-				gateStatus = s
-			}
+			gateStatus = gateStatusLabel(g)
 		}
 	}
 	ctxTitles := contextTitlesFromApplied(summarizeAppliedContexts(appliedAll))
@@ -1381,9 +1379,7 @@ func contextTitlesFromApplied(applied []map[string]interface{}) []string {
 func publishAIReviewComment(job *scmJob, res aiReviewResult, meta aiReviewPublishMeta) (comment, checkSummary string) {
 	gateStatus := "unknown"
 	if meta.Gate != nil {
-		if s, _ := meta.Gate["status"].(string); s != "" {
-			gateStatus = s
-		}
+		gateStatus = gateStatusLabel(meta.Gate)
 	}
 	aiSev := severityCountsFromFindings(res.Findings)
 	narrative := strings.TrimSpace(res.Narrative)
