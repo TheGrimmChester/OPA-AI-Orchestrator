@@ -44,3 +44,8 @@ No auto-merge.
 Contexts: `discovery`, `competitor`, `audience`, `features`.
 
 Publish creates GitHub **milestones** and Issues (with gate labels). Projects v2 is best-effort behind the flag.
+
+Projects v2 needs **Organization permissions › Projects: Read and write** (`organization_projects: write`) on the
+App installation, which the current installation does not have. Without it publish reports
+`missing_organization_projects` and links no board items; milestones and Issues are unaffected. See
+[Interop](interop.md#projects-v2-peer-surface-scmpm).
