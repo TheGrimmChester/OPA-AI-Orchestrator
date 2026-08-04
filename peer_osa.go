@@ -9,6 +9,7 @@ import (
 	"time"
 
 	openclient "github.com/TheGrimmChester/open-client-go"
+	openlogger "github.com/TheGrimmChester/open-logger-go"
 )
 
 func peerOSAConfig(orgID, scope string) openclient.PeerConfig {
@@ -46,7 +47,7 @@ func runSecurityScanViaOSA(runID, org, proj, service, profile string, scanners [
 	defer cancel()
 	_, err := peerOSACreateSecurityRun(ctx, org, proj, service, profile, scanners, targetPath, repo, pr, sha, scmJob, runID)
 	if err != nil {
-		LogWarn("peer OSA security run failed", map[string]interface{}{"error": err.Error(), "security_run_id": runID})
+		openlogger.LogWarn("peer OSA security run failed", map[string]interface{}{"error": err.Error(), "security_run_id": runID})
 	}
 	return true
 }
@@ -59,7 +60,7 @@ func evaluateScopedGateViaOSA(org, runID, minSev string) (map[string]interface{}
 	defer cancel()
 	out, err := peerOSAEvaluateGate(ctx, org, runID, minSev)
 	if err != nil {
-		LogWarn("peer OSA gate failed", map[string]interface{}{"error": err.Error(), "security_run_id": runID})
+		openlogger.LogWarn("peer OSA gate failed", map[string]interface{}{"error": err.Error(), "security_run_id": runID})
 		return map[string]interface{}{
 			"status": "error", "fail": true, "reasons": []string{"peer_unavailable"},
 			"scope": "security_run", "security_run_id": runID, "min_severity": minSev,

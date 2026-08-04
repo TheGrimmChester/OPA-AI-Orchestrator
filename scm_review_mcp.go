@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	openlogger "github.com/TheGrimmChester/open-logger-go"
 )
 
 // reviewMCPPlan describes MCP servers wired into an OPA Review worktree session.
@@ -52,7 +53,7 @@ func prepareOPAReviewMCP(checkoutRoot string, uiTouched bool, previewURL string)
 			if json.Unmarshal(raw, &base) == nil && len(base.MCPServers) > 0 {
 				for k, v := range base.MCPServers {
 					if !mcpServerAllowlist[k] {
-						LogWarn("prepareOPAReviewMCP: dropped non-allowlisted MCP server", map[string]interface{}{"name": k})
+						openlogger.LogWarn("prepareOPAReviewMCP: dropped non-allowlisted MCP server", map[string]interface{}{"name": k})
 						continue
 					}
 					servers[k] = v
@@ -118,7 +119,7 @@ func writeReviewMCPOverlay(checkoutRoot string, servers map[string]interface{}) 
 	if checkoutRoot != "" {
 		cursorDir := filepath.Join(checkoutRoot, ".cursor")
 		if fi, err := os.Lstat(cursorDir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-			LogWarn("prepareOPAReviewMCP: refusing checkout .cursor symlink", map[string]interface{}{
+			openlogger.LogWarn("prepareOPAReviewMCP: refusing checkout .cursor symlink", map[string]interface{}{
 				"path": cursorDir,
 			})
 		}

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	openlogger "github.com/TheGrimmChester/open-logger-go"
 )
 
 // launchAgentSandbox is the single seam for agent CLI children. Increment 1
@@ -209,7 +210,7 @@ func resolveAgentBinForRunner(runner string) string {
 		if err := validateAgentBin(b); err == nil {
 			return b
 		}
-		LogWarn("resolveAgentBin: OPA_CURSOR_AGENT_BIN rejected", map[string]interface{}{"bin": b})
+		openlogger.LogWarn("resolveAgentBin: OPA_CURSOR_AGENT_BIN rejected", map[string]interface{}{"bin": b})
 	}
 	if _, err := os.Stat("/opt/opa/agent"); err == nil {
 		return "/opt/opa/agent"

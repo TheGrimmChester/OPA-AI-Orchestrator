@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	openlogger "github.com/TheGrimmChester/open-logger-go"
 )
 
 // processPRRun drives a kind=run parent: plan children, launch ready ones,
@@ -450,7 +451,7 @@ func runPrepareAgent(job *scmJob) error {
 			}
 			stampSandboxHonesty(job.ID, "UNSANDBOXED: prepare fell back to primary .git (OPA_JOB_ALLOW_HOST_EXEC=1; materialize failed)")
 			job.Summary["sandbox_fallback"] = "host_exec"
-			LogWarn("sandbox tree materialize — host fallback", map[string]interface{}{"error": merr.Error(), "job": job.ID})
+			openlogger.LogWarn("sandbox tree materialize — host fallback", map[string]interface{}{"error": merr.Error(), "job": job.ID})
 		} else if sb != "" {
 			job.Summary["sandbox_tree"] = sb
 			job.Summary["sandbox_file_count"] = n
