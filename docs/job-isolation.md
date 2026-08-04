@@ -51,6 +51,47 @@ mandatory.
 Service sidecars join `--internal` `opa-job-<id>`; teardown is
 `docker rm -fv` by label `opa.job=<id>` (never `docker rm --filter`).
 
+### Checkup workspace
+
+Checkup runs in an isolated per-job layout, not a developer tree:
+
+```
+$OPA_REVIEW_TMP/<job-id>/
+  primary/                # the pull request checkout — the step working dir
+  related/<owner-repo>/    # sibling clones for cross-repo context (read-only)
+  <Module-Dir>/            # resolved go.mod replace targets (read-only)
+```
+
+Services that pin shared libraries to sibling directories:
+
+```
+replace github.com/example/shared-auth => ../Shared-Auth
+```
+
+resolve against a developer tree but not against `primary/` alone, so the
+toolchain aborts before any test runs:
+
+```
+auth_wire.go:7:2: …/shared-auth@v0.0.0: replacement directory ../Shared-Auth does not exist
+```
+
+Before the first step, Checkup reads `go.mod`, materializes each missing
+filesystem `replace` target as a sibling of `primary/`, and binds it read-only
+into the sandbox at the matching path. Sources come from
+`OPA_CHECKUP_MODULE_SRC` (then `FAMILY_ROOT`, then `OPA_FAMILY_SRC`); `.git`,
+`vendor/` and build output are not copied, and symlinks are skipped so a link in
+a source tree cannot pull host paths into the layout. Targets that resolve
+outside the job layout are refused rather than mounted.
+
+When a replacement cannot be resolved, the run is **blocked**: no step executes
+and the check reports `neutral` with the module names and the variable to set.
+A runner that could not build the tree has learned nothing about the commit, so
+it must not report a failure.
+
+Runner state from an earlier attempt (`primary/.opa-checkup/`, which holds
+per-step output captures) is removed before each run, so a retry on a reused
+layout cannot read a previous attempt's log as its own.
+
 ## Images
 
 | Target | Contents | Phase |

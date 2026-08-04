@@ -18,3 +18,6 @@
 | `OPA_GITHUB_WEBHOOK_SECRET` | Webhook HMAC secret |
 | `ORA_RUNNER_TAG` | Runner image tag (`smoke` or `nas`) |
 | `ORCHESTRATOR_LISTEN_ADDR` | Orchestrator health listen (default `:8096`) |
+| `OPA_GATE_WAIT_TIMEOUT_SEC` | How long the AppSec Gate waits for the OSA security run to finish before reporting `scan_incomplete` (default `600`) |
+| `OPA_GATE_RUN_APPEAR_TIMEOUT_SEC` | How long the gate waits for the security run to exist at all before reporting `scan_incomplete` (default `90`). A run that never appears is a broken hand-off, so this is shorter than the scan budget. |
+| `OPA_CHECKUP_MODULE_SRC` | Host directory holding sibling module checkouts, used to resolve `go.mod` filesystem `replace` targets in Checkup. Accepts a `:`-separated list. Falls back to `FAMILY_ROOT`, then `OPA_FAMILY_SRC`. See [Job isolation](job-isolation.md#checkup-workspace). |

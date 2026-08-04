@@ -49,6 +49,9 @@ type sandboxExecSpec struct {
 	// LivePhase overrides string(Phase) when set (e.g. "synth").
 	LivePhase string
 	LiveUnit  string
+	// SiblingDirs are absolute host directories inside the job layout that must
+	// appear next to the work dir (checkup module replacements). Mounted read-only.
+	SiblingDirs []string
 }
 
 func getSandboxRunner() jobSandboxRunner {
@@ -180,6 +183,7 @@ func (dockerSandboxRunner) RunOnce(ctx context.Context, spec sandboxExecSpec) ([
 	if relBind, ok := relatedROBind(hostDir, jobID, layoutID); ok {
 		extraBinds = append(extraBinds, relBind)
 	}
+	extraBinds = append(extraBinds, siblingROBinds(spec.SiblingDirs, jobID, layoutID)...)
 
 	runLabel := ""
 	if layoutID != jobID {
@@ -444,6 +448,32 @@ func relatedROBind(hostWork, jobID, layoutID string) (string, bool) {
 	}
 	cont := opaJobsContainerRoot + "/" + sanitizeDockerName(jobID) + "/related"
 	return relatedHost + ":" + cont + ":ro", true
+}
+
+// siblingROBinds mounts extra layout directories read-only beside the work dir.
+// Checkup uses this for go.mod filesystem replacements (../Open-Auth-Go), which
+// the leaf bind alone leaves invisible. Paths outside the job layout are dropped
+// rather than mounted.
+func siblingROBinds(dirs []string, jobID, layoutID string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, dir := range dirs {
+		dir = filepath.Clean(strings.TrimSpace(dir))
+		if dir == "" || !filepath.IsAbs(dir) || seen[dir] {
+			continue
+		}
+		st, err := os.Stat(dir)
+		if err != nil || !st.IsDir() {
+			continue
+		}
+		if err := assertJobBindPath(dir, layoutID); err != nil {
+			continue
+		}
+		seen[dir] = true
+		cont := opaJobsContainerRoot + "/" + sanitizeDockerName(jobID) + "/" + filepath.Base(dir)
+		out = append(out, dir+":"+cont+":ro")
+	}
+	return out
 }
 
 // relatedContainerPath is the path agents should read for a related checkout
