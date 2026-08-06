@@ -6,8 +6,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	openauth "github.com/TheGrimmChester/open-auth-go"
 )
 
 // registerPeerSCMMux exposes service-JWT-only SCM helpers for peer products (OPM, OSA).
@@ -39,13 +37,9 @@ func handlePeerCloneCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
-	claims, err := openauth.ValidateServiceJWT(token, secret, "ora-api")
+	claims, err := validatePeerAuthToken(token, "ora-api", "scm:clone")
 	if err != nil {
 		http.Error(w, "invalid service token", 401)
-		return
-	}
-	if err := openauth.RequireScope(claims, "scm:clone"); err != nil {
-		http.Error(w, "missing scope", 403)
 		return
 	}
 
@@ -64,13 +58,8 @@ func handlePeerCloneCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c := getOrHydrateConnector(body.ConnectorID)
-	if c == nil || c.Status == "deleted" {
-		http.Error(w, "connector not found", 404)
-		return
-	}
-	if org := strings.TrimSpace(claims.OrgID); org != "" && c.OrganizationID != "" && c.OrganizationID != org {
-		http.Error(w, "connector org mismatch", 403)
+	c := peerResolveConnector(w, claims, body.ConnectorID)
+	if c == nil {
 		return
 	}
 

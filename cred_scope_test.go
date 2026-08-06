@@ -5,6 +5,46 @@ import (
 	"testing"
 )
 
+func TestCanSeeConnectorHidesPending(t *testing.T) {
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+
+	admin := credActor{Username: "root", Role: "admin", OrganizationID: "org-a"}
+	svc := credActor{Username: "service:opm-api", Role: "admin", OrganizationID: "org-a"}
+	pending := &opaConnector{ID: "p", Status: "pending_claim", OrganizationID: "", Scope: credScopeOrg}
+	orphan := &opaConnector{ID: "o", Status: "active", OrganizationID: "", Scope: credScopeOrg}
+	active := &opaConnector{ID: "a", Status: "active", OrganizationID: "org-a", Scope: credScopeOrg}
+	foreign := &opaConnector{ID: "f", Status: "active", OrganizationID: "org-b", Scope: credScopeOrg}
+	adminConn := &opaConnector{ID: "adm", Status: "active", OrganizationID: "", Scope: credScopeAdmin}
+
+	if canSeeConnector(admin, pending) || canSeeConnector(svc, pending) {
+		t.Fatal("pending_claim must be invisible to admin and service")
+	}
+	if canSeeConnector(admin, orphan) {
+		t.Fatal("empty-org org-scoped must be invisible")
+	}
+	if !canSeeConnector(admin, active) {
+		t.Fatal("active same-org should be visible to admin")
+	}
+	if canSeeConnector(admin, foreign) {
+		t.Fatal("foreign org must be hidden")
+	}
+	if !canSeeConnector(svc, active) {
+		t.Fatal("service should see active connectors for its org")
+	}
+	if canSeeConnector(svc, foreign) {
+		t.Fatal("service must not see foreign org")
+	}
+	svcNoOrg := credActor{Username: "service:opm-api", Role: "admin", OrganizationID: ""}
+	if canSeeConnector(svcNoOrg, active) {
+		t.Fatal("service with empty org must see nothing")
+	}
+	if !canSeeConnector(admin, adminConn) {
+		t.Fatal("admin-scoped empty-org connector stays visible to platform admin")
+	}
+}
+
 func TestCanSeeCredScope(t *testing.T) {
 	prev := authEnforced
 	authEnforced = true

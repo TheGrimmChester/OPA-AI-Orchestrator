@@ -578,7 +578,7 @@ func handleAISettingsPut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
-	if refuseOAMLocalWrite(w) {
+	if refuseOAMLocalWrite(w, r) {
 		return
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))

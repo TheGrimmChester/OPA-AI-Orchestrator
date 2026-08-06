@@ -298,8 +298,8 @@ func TestFixedReplyHasCheckEmoji(t *testing.T) {
 }
 
 func TestPreferWatchedForChecksPrefersGitHubApp(t *testing.T) {
-	pat := &opaConnector{ID: "conn-pat", Kind: "github_pat", Status: "active"}
-	app := &opaConnector{ID: "conn-app", Kind: "github_app", InstallationID: "99", Status: "active"}
+	pat := &opaConnector{ID: "conn-pat", OrganizationID: "org-a", Kind: "github_pat", Status: "active"}
+	app := &opaConnector{ID: "conn-app", OrganizationID: "org-a", Kind: "github_app", InstallationID: "99", Status: "active"}
 	connectorLive.Store(pat.ID, pat)
 	connectorLive.Store(app.ID, app)
 	t.Cleanup(func() {

@@ -54,6 +54,8 @@ Caller mints with `Open-Auth-Go` / `Open-Client-Go` peer helpers:
 
 OPM and OSA discover GitHub repos via `GET /api/connectors` and `GET /api/connectors/{id}/repos` (user JWT or service JWT with `connectors:read`). Ephemeral clones use `POST /api/peer/scm/clone-credentials` (service JWT + `scm:clone` only). Milestone list/upsert and Projects v2 list/item sync use `POST /api/peer/scm/milestones/*` and `POST /api/peer/scm/projects/*` (service JWT + `scm:pm`). GitHub App/PAT secrets never leave ORA.
 
+**Install bind:** `GET /api/connectors/github/install-url` signs Open tenant into GitHub `state` (organization accounts only); callback creates an `active` connector under that org. Orphans (`pending_claim`) are invisible to list/get/peers until claimed; redirect once with `#claim_token=` (fragment); remint via `POST /api/connectors/github/issue-claim-token`; claim with `POST /api/connectors/{id}/claim` `{ "claim_token": "..." }` — not by matching GitHub `account_login` to an Open org name. Peer SCM resolve fail-closed: `status=active` + non-empty matching `org_id`.
+
 ### Issues peer surface (`scm:pm`)
 
 Used by OPM to keep a task and a GitHub Issue in step. All three take `connector_id` and `repo_full_name`.

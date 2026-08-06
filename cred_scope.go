@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	openauth "github.com/TheGrimmChester/open-auth-go"
 )
 
 // Credential scopes for connectors and AI secrets (OPA Review / OpenAI / Anthropic / Cursor).
@@ -100,8 +102,17 @@ func claimsFromRequestToken(r *http.Request) *Claims {
 	if token == "" {
 		return nil
 	}
-	ah := &AuthHandler{queryClient: queryClient}
-	claims, err := ah.VerifyToken(token)
+	if authGate != nil {
+		claims, err := authGate.ParseUser(token)
+		if err != nil {
+			return nil
+		}
+		return claims
+	}
+	if len(jwtSecret) == 0 {
+		return nil
+	}
+	claims, err := openauth.ParseUserJWT(token, jwtSecret)
 	if err != nil {
 		return nil
 	}
@@ -159,6 +170,54 @@ func canWriteCredScope(a credActor, scope string) error {
 	default:
 		return fmt.Errorf("invalid scope %q", scope)
 	}
+}
+
+// connectorIsUnclaimed reports pending_claim or empty-org non-admin rows. These
+// are invisible and immutable for everyone (including platform admin / service-as-admin);
+// claim with a one-time nonce is the only mutation path. Admin-scoped connectors
+// intentionally have empty organization_id and remain listable to admins.
+func connectorIsUnclaimed(c *opaConnector) bool {
+	if c == nil {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(c.Status), "pending_claim") {
+		return true
+	}
+	if strings.TrimSpace(c.OrganizationID) != "" {
+		return false
+	}
+	scope := inferLegacyScope(c.OrganizationID, c.Scope)
+	return scope != credScopeAdmin
+}
+
+// isServiceCredActor detects peer service JWT callers (role mapped to admin).
+func isServiceCredActor(a credActor) bool {
+	return strings.HasPrefix(strings.TrimSpace(a.Username), "service:")
+}
+
+// canSeeConnector controls connector list/get visibility.
+// Unclaimed/pending rows are hidden from everyone. Service JWT (connectors:read)
+// sees only active connectors for the caller's non-empty org — never empty-org
+// pendings via admin mapping.
+func canSeeConnector(a credActor, c *opaConnector) bool {
+	if c == nil || c.Status == "deleted" {
+		return false
+	}
+	if connectorIsUnclaimed(c) {
+		return false
+	}
+	if isServiceCredActor(a) {
+		if !strings.EqualFold(strings.TrimSpace(c.Status), "active") {
+			return false
+		}
+		sel := strings.TrimSpace(a.OrganizationID)
+		if sel == "" || sel != strings.TrimSpace(c.OrganizationID) {
+			return false
+		}
+		return true
+	}
+	scope := inferLegacyScope(c.OrganizationID, c.Scope)
+	return canSeeCredScope(a, scope, c.UserID, c.OrganizationID)
 }
 
 // canSeeCredScope controls list/get visibility (secret values never returned either way).

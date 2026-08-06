@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,11 +11,14 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	openauth "github.com/TheGrimmChester/open-auth-go"
 )
 
 // Repo watch — GitHub Repo Watch connectors + settings.
@@ -22,12 +27,14 @@ func registerRepoWatchMux(mux *http.ServeMux, authView, authAdmin func(string, h
 	// Connector list/read accept user JWT or peer service JWT (connectors:read).
 	registerConnectorReadAuth(mux, "/api/connectors", handleConnectorsList)
 	authAdmin("/api/connectors/github/install-url", handleGitHubInstallURL)
+	authAdmin("/api/connectors/github/issue-claim-token", handleIssueClaimToken)
 	mux.HandleFunc("/api/connectors/github/callback", handleGitHubCallback)
 	// PAT connect: viewer+ (scope gates in-handler — users can add personal PATs).
 	registerAISettingsAuth(mux, "/api/connectors/github/pat", handleGitHubPATConnect)
 	// Connector sub-routes: viewer+ or peer service; mutate gates live in-handler.
 	registerConnectorReadAuth(mux, "/api/connectors/", handleConnectorSub)
 	registerPeerSCMMux(mux)
+	registerInternalConnectorsMux(mux)
 	authView("/api/scm/jobs", handleSCMJobsList)
 	authAdmin("/api/scm/jobs/resume", handleSCMJobsResume)
 	registerSCMAuthFlexible(mux, "/api/scm/jobs/", handleSCMJobSub)
@@ -155,8 +162,7 @@ func handleConnectorsList(w http.ResponseWriter, r *http.Request) {
 		if c == nil || c.Status == "deleted" {
 			return
 		}
-		scope := inferLegacyScope(c.OrganizationID, c.Scope)
-		if !canSeeCredScope(a, scope, c.UserID, c.OrganizationID) {
+		if !canSeeConnector(a, c) {
 			return
 		}
 		list = append(list, connectorPublic(c))
@@ -196,7 +202,7 @@ func handleConnectorsList(w http.ResponseWriter, r *http.Request) {
 					appendIfVisible(live)
 					continue
 				}
-				c := connectorFromCHRow(row, false)
+				c := connectorFromCHRow(context.Background(), row, false)
 				appendIfVisible(c)
 			}
 		}
@@ -265,6 +271,9 @@ func handleGitHubInstallURL(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
+	if !requireOrganizationAccountHTTP(w, r, "GitHub App install") {
+		return
+	}
 	appSlug := envOr("OPA_GITHUB_APP_SLUG", "")
 	appID := strings.TrimSpace(os.Getenv("OPA_GITHUB_APP_ID"))
 	public := strings.TrimRight(envOr("OPA_PUBLIC_URL", "http://127.0.0.1:8080"), "/")
@@ -282,27 +291,35 @@ func handleGitHubInstallURL(w http.ResponseWriter, r *http.Request) {
 	if a.OrganizationID != "" {
 		org, proj = a.OrganizationID, nz(a.ProjectID, proj)
 	}
-	state := ""
-	stateNote := ""
-	if org != "" {
-		if s, err := mintGitHubInstallState(org, proj, a.Username); err == nil {
-			state = s
-		} else {
-			stateNote = err.Error()
+	if claims := claimsFromRequestToken(r); claims != nil {
+		if jo := strings.TrimSpace(claims.OrgID); jo != "" {
+			org = jo
 		}
 	}
-	url := fmt.Sprintf("https://github.com/apps/%s/installations/new", nz(appSlug, "opa-repo-watch"))
+	org = strings.TrimSpace(org)
+	if org == "" {
+		http.Error(w, "organization_id required — GitHub App install binds to an Open organization account", 400)
+		return
+	}
+	state := ""
+	stateNote := ""
+	if s, err := mintGitHubInstallState(org, proj, a.Username); err == nil {
+		state = s
+	} else {
+		stateNote = err.Error()
+	}
+	installURL := fmt.Sprintf("https://github.com/apps/%s/installations/new", nz(appSlug, "opa-repo-watch"))
 	if state != "" {
-		url += "?state=" + state
+		installURL += "?state=" + state
 	}
 	if cid := strings.TrimSpace(os.Getenv("OPA_GITHUB_APP_CLIENT_ID")); cid != "" {
-		url = fmt.Sprintf("https://github.com/login/oauth/authorize?client_id=%s", cid)
+		installURL = fmt.Sprintf("https://github.com/login/oauth/authorize?client_id=%s", cid)
 		if state != "" {
-			url += "&state=" + state
+			installURL += "&state=" + state
 		}
 	}
 	writeJSON(w, map[string]interface{}{
-		"ok": true, "configured": true, "install_url": url,
+		"ok": true, "configured": true, "install_url": installURL,
 		"webhook_url":  public + "/v1/scm/github/webhook",
 		"callback_url": public + "/api/connectors/github/callback",
 		"organization_id": org, "project_id": proj,
@@ -318,35 +335,327 @@ func handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "installation_id required", 400)
 		return
 	}
-	org, proj, userID, status := "", "", "", "active"
+	org, proj, userID := "", "", ""
 	if stateRaw != "" {
 		if st, err := parseGitHubInstallState(stateRaw); err == nil && st != nil {
 			org, proj, userID = st.OrganizationID, st.ProjectID, st.UserID
 		}
 	}
-	if org == "" {
-		status = "pending_claim"
+	org = strings.TrimSpace(org)
+	proj = strings.TrimSpace(proj)
+	userID = strings.TrimSpace(userID)
+	if proj == "" || proj == tenantAll {
+		proj = defaultProjectID
 	}
-	id := loadID("conn", nz(org, "pending"), nz(proj, "pending"), "github_app", inst)
+
+	redirectConnectors := func(connectorID, claimRaw string) {
+		http.Redirect(w, r, connectorsDashboardURL(connectorID, claimRaw), http.StatusFound)
+	}
+
+	connectorClaimMu.Lock()
+	defer connectorClaimMu.Unlock()
+
+	existing := findConnectorByInstallation(inst)
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
-	meta := map[string]interface{}{"setup_action": setup}
-	if status == "pending_claim" {
-		meta["pending_claim"] = true
+
+	// Already bound: never reset via unauthenticated callback (takeover vector).
+	if existing != nil && strings.EqualFold(strings.TrimSpace(existing.Status), "active") {
+		softDeleteOtherInstallConnectors(existing.ID, inst)
+		id := ""
+		if org != "" && existing.OrganizationID == org {
+			id = existing.ID
+		}
+		redirectConnectors(id, "")
+		return
 	}
-	metaJSON, _ := json.Marshal(meta)
-	c := &opaConnector{
-		ID: id, OrganizationID: org, ProjectID: proj, Scope: credScopeOrg, UserID: userID,
-		Kind: "github_app", InstallationID: inst, AccountLogin: "", Status: status,
-		MetaJSON: string(metaJSON), CreatedAt: now, UpdatedAt: now,
+
+	// Signed install state → bind (or activate an existing pending) into that org.
+	if org != "" {
+		var c *opaConnector
+		if existing != nil && strings.EqualFold(strings.TrimSpace(existing.Status), "pending_claim") {
+			c = existing
+		} else {
+			id := loadID("conn", org, proj, "github_app", inst)
+			c = &opaConnector{
+				ID: id, Kind: "github_app", InstallationID: inst,
+				Scope: credScopeOrg, CreatedAt: now,
+			}
+		}
+		meta := parseConnectorMeta(c.MetaJSON)
+		delete(meta, "pending_claim")
+		delete(meta, "claim_nonce_hash")
+		meta["setup_action"] = setup
+		meta["bound_via"] = "install_state"
+		meta["bound_at"] = now
+		if userID != "" {
+			meta["bound_by"] = userID
+		}
+		b, _ := json.Marshal(meta)
+		prevOrg, prevProj := c.OrganizationID, c.ProjectID
+		c.OrganizationID = org
+		c.ProjectID = proj
+		c.Scope = credScopeOrg
+		c.UserID = userID
+		c.Kind = "github_app"
+		c.InstallationID = inst
+		c.Status = "active"
+		c.MetaJSON = string(b)
+		c.UpdatedAt = now
+		if c.CreatedAt == "" {
+			c.CreatedAt = now
+		}
+		connectorLive.Store(c.ID, c)
+		persistConnectorOrgMove(c, prevOrg, prevProj)
+		softDeleteOtherInstallConnectors(c.ID, inst)
+		stampWatchedTenantForConnectorForce(c)
+		redirectConnectors(c.ID, "")
+		return
 	}
-	connectorLive.Store(id, c)
+
+	// Orphan / marketplace install — pending_claim + one-time claim_token.
+	claimRaw, claimHash, err := mintConnectorClaimNonce()
+	if err != nil {
+		http.Error(w, "claim nonce unavailable", 500)
+		return
+	}
+	var c *opaConnector
+	if existing != nil && strings.EqualFold(strings.TrimSpace(existing.Status), "pending_claim") {
+		c = existing
+	} else {
+		id := loadID("conn", "pending", "pending", "github_app", inst)
+		c = &opaConnector{
+			ID: id, OrganizationID: "", ProjectID: "", Scope: credScopeOrg, UserID: "",
+			Kind: "github_app", InstallationID: inst, CreatedAt: now,
+		}
+	}
+	meta := parseConnectorMeta(c.MetaJSON)
+	meta["setup_action"] = setup
+	meta["pending_claim"] = true
+	meta["claim_nonce_hash"] = claimHash
+	b, _ := json.Marshal(meta)
+	c.Status = "pending_claim"
+	c.OrganizationID = ""
+	c.ProjectID = ""
+	c.MetaJSON = string(b)
+	c.UpdatedAt = now
+	if c.CreatedAt == "" {
+		c.CreatedAt = now
+	}
+	connectorLive.Store(c.ID, c)
 	persistConnector(c)
-	dash := envOr("OPA_DASHBOARD_URL", "http://127.0.0.1:8088")
-	http.Redirect(w, r, dash+"/security?tab=watch&connector="+id, http.StatusFound)
+	softDeleteOtherInstallConnectors(c.ID, inst)
+	redirectConnectors(c.ID, claimRaw)
+}
+
+// softDeleteOtherInstallConnectors marks every non-deleted connector for the same
+// GitHub installation_id as deleted except keepID — enforces one live binder.
+func softDeleteOtherInstallConnectors(keepID, installationID string) {
+	inst := strings.TrimSpace(installationID)
+	keepID = strings.TrimSpace(keepID)
+	if inst == "" || keepID == "" {
+		return
+	}
+	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	connectorLive.Range(func(_, v interface{}) bool {
+		c, ok := v.(*opaConnector)
+		if !ok || c == nil || c.ID == keepID || c.Status == "deleted" {
+			return true
+		}
+		if strings.TrimSpace(c.InstallationID) != inst {
+			return true
+		}
+		c.Status = "deleted"
+		c.UpdatedAt = now
+		connectorLive.Store(c.ID, c)
+		persistConnector(c)
+		cascadeDeleteWatched(c.ID)
+		log.Printf("[INFO] soft-deleted duplicate github_app connector %s installation=%s keep=%s", c.ID, inst, keepID)
+		return true
+	})
+}
+
+// mintConnectorClaimNonce returns a high-entropy one-time claim token and its
+// sha256 hex hash. The raw token is returned to the browser once via redirect;
+// only the hash is stored. Never log the raw token.
+func mintConnectorClaimNonce() (raw, hash string, err error) {
+	b := make([]byte, 32)
+	if _, err = rand.Read(b); err != nil {
+		return "", "", err
+	}
+	raw = hex.EncodeToString(b)
+	sum := sha256.Sum256([]byte(raw))
+	hash = hex.EncodeToString(sum[:])
+	return raw, hash, nil
+}
+
+// requireOrganizationAccountHTTP rejects personal Open accounts. GitHub App
+// install/claim is organization-only (role admin does not bypass account_type).
+func requireOrganizationAccountHTTP(w http.ResponseWriter, r *http.Request, action string) bool {
+	// OAM peer writes carry delegated account_type (no user JWT on the wire).
+	if isPeerOAMConnectorWrite(r) {
+		at := strings.ToLower(strings.TrimSpace(r.Header.Get(headerDelegatedAccountType)))
+		if at == openauth.AccountTypePersonal {
+			http.Error(w, action+" requires an organization Open account (not personal)", 400)
+			return false
+		}
+		if at == openauth.AccountTypeOrganization {
+			return true
+		}
+		if strings.TrimSpace(r.Header.Get("X-Organization-ID")) != "" {
+			return true
+		}
+		http.Error(w, action+" requires an organization Open account (not personal)", 400)
+		return false
+	}
+	claims := claimsFromRequestToken(r)
+	if claims == nil {
+		return true
+	}
+	at := strings.ToLower(strings.TrimSpace(claims.AccountType))
+	if at == openauth.AccountTypePersonal {
+		http.Error(w, action+" requires an organization Open account (not personal)", 400)
+		return false
+	}
+	if at == "" && strings.TrimSpace(claims.OrgID) == "" {
+		// Legacy unbound token without account_type — treat as personal for App bind.
+		http.Error(w, action+" requires an organization Open account (not personal)", 400)
+		return false
+	}
+	return true
+}
+
+// connectorsDashboardBaseURL prefers OAM_DASHBOARD_URL for post-install / claim
+// browser redirects. OPA_DASHBOARD_URL remains a one-release fallback (often still
+// pointing at the ORA dashboard). Management UI path is always /connectors.
+func connectorsDashboardBaseURL() string {
+	if v := strings.TrimSpace(os.Getenv("OAM_DASHBOARD_URL")); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return strings.TrimRight(envOr("OPA_DASHBOARD_URL", "http://127.0.0.1:8088"), "/")
+}
+
+// connectorsDashboardURL builds the OAM (or fallback) connectors page URL.
+// Query ?connector= and fragment #claim_token= are unchanged from the prior
+// /settings/connectors contract so dashboards keep working during cutover.
+func connectorsDashboardURL(connectorID, claimRaw string) string {
+	loc := connectorsDashboardBaseURL() + "/connectors"
+	if connectorID != "" {
+		loc += "?connector=" + url.QueryEscape(connectorID)
+	}
+	if claimRaw != "" {
+		// Fragment so claim_token is not sent as a Referer query param.
+		loc += "#claim_token=" + url.QueryEscape(claimRaw)
+	}
+	return loc
+}
+
+var connectorClaimMu sync.Mutex
+
+// POST /api/connectors/{id}/claim — organization account attaches a pending_claim
+// GitHub App install using the one-time claim_token from the orphan callback.
+// CAS pending→active; wipe nonce; stamp watches; OAM sync via persist.
+func handleConnectorClaim(w http.ResponseWriter, r *http.Request, id string) {
+	if refuseOAMLocalWrite(w, r) {
+		return
+	}
+	if !requireOrganizationAccountHTTP(w, r, "GitHub App claim") {
+		return
+	}
+	rawBody, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	var body struct {
+		ClaimToken string `json:"claim_token"`
+	}
+	_ = json.Unmarshal(rawBody, &body)
+	claimToken := strings.TrimSpace(body.ClaimToken)
+	if claimToken == "" {
+		http.Error(w, "claim_token required", 400)
+		return
+	}
+
+	connectorClaimMu.Lock()
+	defer connectorClaimMu.Unlock()
+
+	c := getOrHydrateConnector(id)
+	if c == nil || c.Status == "deleted" {
+		http.Error(w, "not found", 404)
+		return
+	}
+	a := actorFromRequest(r)
+	if !a.isAdmin() {
+		http.Error(w, "admin role required to claim a connector", 403)
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(c.Status), "pending_claim") {
+		writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
+			"ok": false, "error": "not_pending_claim",
+			"message": "connector is not pending_claim",
+			"status":  c.Status,
+		})
+		return
+	}
+	meta := parseConnectorMeta(c.MetaJSON)
+	wantHash, _ := meta["claim_nonce_hash"].(string)
+	wantHash = strings.TrimSpace(wantHash)
+	gotSum := sha256.Sum256([]byte(claimToken))
+	gotHash := hex.EncodeToString(gotSum[:])
+	if wantHash == "" || !hmac.Equal([]byte(wantHash), []byte(gotHash)) {
+		http.Error(w, "invalid claim_token", 403)
+		return
+	}
+
+	org := strings.TrimSpace(a.OrganizationID)
+	proj := strings.TrimSpace(a.ProjectID)
+	if claims := claimsFromRequestToken(r); claims != nil {
+		if jo := strings.TrimSpace(claims.OrgID); jo != "" {
+			org = jo
+		}
+	}
+	if org == "" {
+		ctx, _ := ExtractTenantContext(r, queryClient)
+		if ctx != nil {
+			org, proj = ctx.WriteTenant()
+		}
+	}
+	org = strings.TrimSpace(org)
+	if org == "" {
+		http.Error(w, "organization_id required — select an Open organization before claiming", 400)
+		return
+	}
+	if proj == "" || proj == tenantAll {
+		proj = defaultProjectID
+	}
+	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	prevOrg, prevProj := c.OrganizationID, c.ProjectID
+	c.OrganizationID = org
+	c.ProjectID = proj
+	c.Scope = credScopeOrg
+	if uid := strings.TrimSpace(a.Username); uid != "" {
+		c.UserID = uid
+	}
+	c.Status = "active"
+	c.UpdatedAt = now
+	delete(meta, "pending_claim")
+	delete(meta, "claim_nonce_hash")
+	meta["claimed_at"] = now
+	if a.Username != "" {
+		meta["claimed_by"] = a.Username
+	}
+	meta["claimed_organization_id"] = org
+	meta["claimed_project_id"] = proj
+	b, _ := json.Marshal(meta)
+	c.MetaJSON = string(b)
+	connectorLive.Store(id, c)
+	persistConnectorOrgMove(c, prevOrg, prevProj)
+	softDeleteOtherInstallConnectors(c.ID, c.InstallationID)
+	stampWatchedTenantForConnectorForce(c)
+	writeJSON(w, map[string]interface{}{
+		"ok": true, "connector": connectorPublic(c),
+		"honesty": "Claimed into the Open organization from your session — not from GitHub account_login.",
+	})
 }
 
 func handleGitHubPATConnect(w http.ResponseWriter, r *http.Request) {
-	if refuseOAMLocalWrite(w) {
+	if refuseOAMLocalWrite(w, r) {
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -454,7 +763,50 @@ func handleConnectorSub(w http.ResponseWriter, r *http.Request) {
 		handleConnectorPermissions(w, r, id)
 		return
 	}
+	if len(parts) >= 2 && parts[1] == "claim" && r.Method == http.MethodPost {
+		handleConnectorClaim(w, r, id)
+		return
+	}
 	http.Error(w, "not found", 404)
+}
+
+// stampWatchedTenantForConnector copies connector org/project onto watches that
+// still lack organization_id (auto-watch during pending_claim).
+// stampWatchedTenantForConnector copies the connector's org/project onto every
+// watch for that connector. Force=true overwrites a prior org (claim / state bind).
+func stampWatchedTenantForConnector(c *opaConnector) {
+	stampWatchedTenantForConnectorOpts(c, false)
+}
+
+func stampWatchedTenantForConnectorForce(c *opaConnector) {
+	stampWatchedTenantForConnectorOpts(c, true)
+}
+
+func stampWatchedTenantForConnectorOpts(c *opaConnector, force bool) {
+	if c == nil || strings.TrimSpace(c.OrganizationID) == "" {
+		return
+	}
+	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	wantOrg := strings.TrimSpace(c.OrganizationID)
+	wantProj := nz(strings.TrimSpace(c.ProjectID), defaultProjectID)
+	watchedLive.Range(func(_, v interface{}) bool {
+		wr, ok := v.(*opaWatchedRepo)
+		if !ok || wr.ConnectorID != c.ID {
+			return true
+		}
+		curOrg := strings.TrimSpace(wr.OrganizationID)
+		if !force && curOrg != "" {
+			return true
+		}
+		if curOrg == wantOrg && strings.TrimSpace(wr.ProjectID) == wantProj {
+			return true
+		}
+		wr.OrganizationID = wantOrg
+		wr.ProjectID = wantProj
+		wr.UpdatedAt = now
+		persistWatched(wr)
+		return true
+	})
 }
 
 // GET /api/connectors/{id}/permissions — installation permission health for
@@ -477,14 +829,14 @@ func handleConnectorPermissions(w http.ResponseWriter, r *http.Request, id strin
 
 // denyConnectorIfInvisible writes 404 when the connector is missing or the
 // caller must not learn it exists (no cross-tenant / cross-scope leakage).
+// pending_claim / empty-org rows are invisible to everyone including admins.
 func denyConnectorIfInvisible(w http.ResponseWriter, r *http.Request, c *opaConnector) bool {
 	if c == nil || c.Status == "deleted" {
 		http.Error(w, "not found", 404)
 		return true
 	}
 	a := actorFromRequest(r)
-	scope := inferLegacyScope(c.OrganizationID, c.Scope)
-	if !canSeeCredScope(a, scope, c.UserID, c.OrganizationID) {
+	if !canSeeConnector(a, c) {
 		http.Error(w, "not found", 404)
 		return true
 	}
@@ -492,9 +844,13 @@ func denyConnectorIfInvisible(w http.ResponseWriter, r *http.Request, c *opaConn
 }
 
 // denyConnectorIfImmutable writes 404 if invisible, else 403 if the caller
-// cannot mutate this connector's scope/ownership.
+// cannot mutate this connector's scope/ownership. Unclaimed rows are never mutable here.
 func denyConnectorIfImmutable(w http.ResponseWriter, r *http.Request, c *opaConnector) bool {
 	if denyConnectorIfInvisible(w, r, c) {
+		return true
+	}
+	if connectorIsUnclaimed(c) {
+		http.Error(w, "connector is pending claim — use POST /claim with claim_token", 403)
 		return true
 	}
 	a := actorFromRequest(r)
@@ -515,7 +871,7 @@ func handleConnectorGet(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func handleConnectorPatch(w http.ResponseWriter, r *http.Request, id string) {
-	if refuseOAMLocalWrite(w) {
+	if refuseOAMLocalWrite(w, r) {
 		return
 	}
 	c := getOrHydrateConnector(id)
@@ -554,7 +910,7 @@ func handleConnectorPatch(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func handleConnectorDelete(w http.ResponseWriter, r *http.Request, id string) {
-	if refuseOAMLocalWrite(w) {
+	if refuseOAMLocalWrite(w, r) {
 		return
 	}
 	c := getOrHydrateConnector(id)
@@ -571,7 +927,7 @@ func handleConnectorDelete(w http.ResponseWriter, r *http.Request, id string) {
 				FROM opa.connectors WHERE id = '%s' ORDER BY updated_at DESC LIMIT 1`, escapeSQL(id)))
 		}
 		if err == nil && len(rows) > 0 {
-			c = connectorFromCHRow(rows[0], false)
+			c = connectorFromCHRow(context.Background(), rows[0], false)
 		}
 	}
 	if denyConnectorIfImmutable(w, r, c) {
@@ -630,37 +986,7 @@ func cascadeDeleteWatched(connectorID string) {
 
 func handleConnectorRepos(w http.ResponseWriter, r *http.Request, id string) {
 	c := getOrHydrateConnector(id)
-	if c == nil {
-		writeJSON(w, map[string]interface{}{
-			"repos": []interface{}{},
-			"error": "connector_not_in_memory",
-			"note":  "Connector missing or token could not be decrypted — use Edit → Replace token, or Connect PAT. Needs stable OPA_CONNECTOR_SECRET or JWT_SECRET.",
-		})
-		return
-	}
-	if c.Status == "deleted" {
-		writeJSON(w, map[string]interface{}{
-			"repos": []interface{}{},
-			"error": "connector_not_found",
-			"note":  "Connector was deleted. Pick another connector or reconnect under Settings · Connectors.",
-		})
-		return
-	}
-	a := actorFromRequest(r)
-	scope := inferLegacyScope(c.OrganizationID, c.Scope)
-	if !canSeeCredScope(a, scope, c.UserID, c.OrganizationID) {
-		note := "Select the connector's organization in the tenant picker (top bar), then reload."
-		if c.OrganizationID != "" {
-			note = fmt.Sprintf("This connector belongs to organization %q. Select that org (or All, as admin) in the tenant picker, then reload.", c.OrganizationID)
-		}
-		if scope == credScopeUser && c.UserID != "" && a.Username != "" && c.UserID != a.Username {
-			note = fmt.Sprintf("This is a personal connector owned by %q (signed in as %q).", c.UserID, a.Username)
-		}
-		writeJSON(w, map[string]interface{}{
-			"repos": []interface{}{},
-			"error": "connector_org_mismatch",
-			"note":  note,
-		})
+	if denyConnectorIfInvisible(w, r, c) {
 		return
 	}
 	if c.Kind == "github_pat" && c.TokenRef == "" {
@@ -1076,14 +1402,24 @@ func queryProductConnectorRows(id string, limit int) ([]map[string]interface{}, 
 	if queryClient == nil {
 		return nil, fmt.Errorf("clickhouse query client not configured")
 	}
-	where := "status != 'deleted'"
-	if strings.TrimSpace(id) != "" {
-		where += fmt.Sprintf(" AND id = '%s'", escapeSQL(id))
-	}
+	id = strings.TrimSpace(id)
 	lim := ""
 	if limit > 0 {
 		lim = fmt.Sprintf(" LIMIT %d", limit)
 	}
+	// By id: take latest row across all (org,proj) series — do not filter status
+	// first (soft-delete / org-move must win over older active rows).
+	if id != "" {
+		q := fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE id = '%s' ORDER BY updated_at DESC%s`,
+			connectorSelectCols(), escapeSQL(id), lim)
+		rows, err := queryClient.Query(q)
+		if err != nil {
+			rows, err = queryClient.Query(fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE id = '%s' ORDER BY updated_at DESC%s`,
+				connectorSelectColsLegacy(), escapeSQL(id), lim))
+		}
+		return rows, err
+	}
+	where := "status != 'deleted'"
 	q := fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE %s ORDER BY updated_at DESC%s`,
 		connectorSelectCols(), where, lim)
 	rows, err := queryClient.Query(q)
@@ -1098,14 +1434,22 @@ func queryLegacyHubConnectorRows(id string, limit int) ([]map[string]interface{}
 	if queryClient == nil || !needsLegacyConnectorFallback() {
 		return nil, nil
 	}
-	where := "status != 'deleted'"
-	if strings.TrimSpace(id) != "" {
-		where += fmt.Sprintf(" AND id = '%s'", escapeSQL(id))
-	}
+	id = strings.TrimSpace(id)
 	lim := ""
 	if limit > 0 {
 		lim = fmt.Sprintf(" LIMIT %d", limit)
 	}
+	if id != "" {
+		q := fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE id = '%s' ORDER BY updated_at DESC%s`,
+			connectorSelectCols(), escapeSQL(id), lim)
+		rows, err := queryClient.QueryExact(q)
+		if err != nil {
+			rows, err = queryClient.QueryExact(fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE id = '%s' ORDER BY updated_at DESC%s`,
+				connectorSelectColsLegacy(), escapeSQL(id), lim))
+		}
+		return rows, err
+	}
+	where := "status != 'deleted'"
 	q := fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE %s ORDER BY updated_at DESC%s`,
 		connectorSelectCols(), where, lim)
 	rows, err := queryClient.QueryExact(q)
@@ -1140,8 +1484,35 @@ func hydrateConnectorFromCH(id string) *opaConnector {
 			return nil
 		}
 	}
-	c := connectorFromCHRow(rows[0], true)
+	c := connectorFromCHRow(context.Background(), rows[0], true)
+	if c == nil || strings.EqualFold(strings.TrimSpace(c.Status), "deleted") {
+		return nil
+	}
 	return storeHydratedConnector(c, fromLegacy)
+}
+
+// persistConnectorOrgMove writes a deleted tombstone under the previous
+// (organization_id, project_id, id) ReplacingMergeTree key when tenancy moves,
+// then persists the live row. Without this, the old-key active row survives merges.
+func persistConnectorOrgMove(c *opaConnector, prevOrg, prevProj string) {
+	if c == nil {
+		return
+	}
+	prevOrg = strings.TrimSpace(prevOrg)
+	prevProj = strings.TrimSpace(prevProj)
+	newOrg := strings.TrimSpace(c.OrganizationID)
+	newProj := strings.TrimSpace(c.ProjectID)
+	if prevOrg != newOrg || prevProj != newProj {
+		tomb := *c
+		tomb.OrganizationID = prevOrg
+		tomb.ProjectID = prevProj
+		tomb.Status = "deleted"
+		tomb.TokenRef = ""
+		// Slightly older than the live row so same-series replaces still prefer live.
+		tomb.UpdatedAt = c.UpdatedAt
+		persistConnector(&tomb)
+	}
+	persistConnector(c)
 }
 
 // backfillLegacyConnectorsOnBoot copies hub opa.connectors rows missing from the
@@ -1171,7 +1542,7 @@ func backfillLegacyConnectorsOnBoot() int {
 		if prod, _ := queryProductConnectorRows(id, 1); len(prod) > 0 {
 			continue
 		}
-		c := connectorFromCHRow(row, true)
+		c := connectorFromCHRow(context.Background(), row, true)
 		if storeHydratedConnector(c, true) != nil {
 			n++
 		}
@@ -1179,10 +1550,11 @@ func backfillLegacyConnectorsOnBoot() int {
 	return n
 }
 
-func connectorFromCHRow(row map[string]interface{}, decryptToken bool) *opaConnector {
+func connectorFromCHRow(ctx context.Context, row map[string]interface{}, decryptToken bool) *opaConnector {
 	if row == nil {
 		return nil
 	}
+	_ = ctx
 	id, _ := row["id"].(string)
 	if id == "" {
 		return nil
@@ -1216,9 +1588,14 @@ func findWatched(repo string) (*opaWatchedRepo, *opaConnector) {
 		if !ok || !wr.Enabled {
 			return true
 		}
-		if strings.EqualFold(wr.RepoFullName, repo) {
-			candidates = append(candidates, wr)
+		if !strings.EqualFold(wr.RepoFullName, repo) {
+			return true
 		}
+		c := getOrHydrateConnector(wr.ConnectorID)
+		if !connectorUsableForWatch(c) {
+			return true
+		}
+		candidates = append(candidates, wr)
 		return true
 	})
 	if len(candidates) == 0 {
@@ -1228,15 +1605,38 @@ func findWatched(repo string) (*opaWatchedRepo, *opaConnector) {
 	return found, getOrHydrateConnector(found.ConnectorID)
 }
 
+// connectorUsableForWatch is true only for active binders with a non-empty org.
+func connectorUsableForWatch(c *opaConnector) bool {
+	if c == nil || c.Status == "deleted" {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(c.Status), "active") {
+		return false
+	}
+	return strings.TrimSpace(c.OrganizationID) != ""
+}
+
 // preferWatchedForChecks picks the github_app watch when both App and PAT watch
 // the same repo so Check Runs post as the GitHub App bot.
 func preferWatchedForChecks(cands []*opaWatchedRepo) *opaWatchedRepo {
-	if len(cands) == 1 {
-		return cands[0]
+	usable := make([]*opaWatchedRepo, 0, len(cands))
+	for _, wr := range cands {
+		if wr == nil {
+			continue
+		}
+		if connectorUsableForWatch(getOrHydrateConnector(wr.ConnectorID)) {
+			usable = append(usable, wr)
+		}
+	}
+	if len(usable) == 0 {
+		return nil
+	}
+	if len(usable) == 1 {
+		return usable[0]
 	}
 	var best *opaWatchedRepo
 	bestScore := -1
-	for _, wr := range cands {
+	for _, wr := range usable {
 		score := 0
 		c := getOrHydrateConnector(wr.ConnectorID)
 		if c != nil && c.Kind == "github_app" && c.InstallationID != "" {
@@ -1254,37 +1654,164 @@ func preferWatchedForChecks(cands []*opaWatchedRepo) *opaWatchedRepo {
 		}
 	}
 	if best == nil {
-		return cands[0]
+		return usable[0]
 	}
 	return best
 }
 
 // ensureGitHubAppConnector creates or returns the connector for an installation.
 // When org is unknown, status=pending_claim — no silent default-org fallback.
+// New (and hash-less) pendings always get a claim_nonce_hash so they can be
+// claimed via callback remint or POST /api/connectors/github/issue-claim-token.
 func ensureGitHubAppConnector(installationID, accountLogin string) *opaConnector {
 	inst := strings.TrimSpace(installationID)
 	if inst == "" || !githubAppConfigured() {
 		return nil
 	}
+	connectorClaimMu.Lock()
+	defer connectorClaimMu.Unlock()
+
 	if c := findConnectorByInstallation(inst); c != nil {
+		changed := false
 		if accountLogin != "" && strings.TrimSpace(c.AccountLogin) == "" {
 			c.AccountLogin = accountLogin
+			changed = true
+		}
+		if strings.EqualFold(strings.TrimSpace(c.Status), "pending_claim") {
+			meta := parseConnectorMeta(c.MetaJSON)
+			if strings.TrimSpace(fmt.Sprint(meta["claim_nonce_hash"])) == "" {
+				if _, hash, err := mintConnectorClaimNonce(); err == nil {
+					meta["pending_claim"] = true
+					meta["claim_nonce_hash"] = hash
+					meta["auto_provisioned"] = true
+					b, _ := json.Marshal(meta)
+					c.MetaJSON = string(b)
+					changed = true
+				}
+			}
+		}
+		if changed {
 			c.UpdatedAt = time.Now().UTC().Format("2006-01-02 15:04:05.000")
 			persistConnector(c)
 		}
+		softDeleteOtherInstallConnectors(c.ID, inst)
 		return c
+	}
+	_, hash, err := mintConnectorClaimNonce()
+	if err != nil {
+		log.Printf("[WARN] claim nonce mint failed for installation=%s: %v", inst, err)
+		hash = ""
 	}
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
 	id := loadID("conn", "pending", "pending", "github_app", inst)
+	meta := map[string]interface{}{"auto_provisioned": true, "pending_claim": true}
+	if hash != "" {
+		meta["claim_nonce_hash"] = hash
+	}
+	metaJSON, _ := json.Marshal(meta)
 	c := &opaConnector{
 		ID: id, OrganizationID: "", ProjectID: "", Scope: credScopeOrg, UserID: "",
 		Kind: "github_app", InstallationID: inst, AccountLogin: accountLogin, Status: "pending_claim",
-		MetaJSON: `{"auto_provisioned":true,"pending_claim":true}`, CreatedAt: now, UpdatedAt: now,
+		MetaJSON: string(metaJSON), CreatedAt: now, UpdatedAt: now,
 	}
 	connectorLive.Store(id, c)
 	persistConnector(c)
+	softDeleteOtherInstallConnectors(id, inst)
 	log.Printf("[INFO] provisioned github_app connector %s installation=%s account=%s status=pending_claim", id, inst, accountLogin)
 	return c
+}
+
+// POST /api/connectors/github/issue-claim-token — remint a one-time claim_token
+// for a pending_claim install identified by GitHub installation_id. Knowing the
+// installation id (from GitHub) is the gate; pendings stay invisible on list/get.
+func handleIssueClaimToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	if !requireOrganizationAccountHTTP(w, r, "issue claim token") {
+		return
+	}
+	a := actorFromRequest(r)
+	if !a.isAdmin() {
+		http.Error(w, "admin role required", 403)
+		return
+	}
+	rawBody, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	var body struct {
+		InstallationID  string `json:"installation_id"`
+		Force           bool   `json:"force"`
+		PriorClaimToken string `json:"prior_claim_token"`
+	}
+	if json.Unmarshal(rawBody, &body) != nil || strings.TrimSpace(body.InstallationID) == "" {
+		http.Error(w, "installation_id required", 400)
+		return
+	}
+	connectorClaimMu.Lock()
+	defer connectorClaimMu.Unlock()
+
+	c := findConnectorByInstallation(strings.TrimSpace(body.InstallationID))
+	if c == nil || c.Status == "deleted" {
+		http.Error(w, "not found", 404)
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(c.Status), "pending_claim") {
+		// Prefer-active lookup means an active binder already owns this install.
+		writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
+			"ok": false, "error": "not_pending_claim", "status": c.Status,
+			"message": "installation is already bound or not claimable — callback will not remint over active",
+		})
+		return
+	}
+	meta := parseConnectorMeta(c.MetaJSON)
+	existingHash := strings.TrimSpace(fmt.Sprint(meta["claim_nonce_hash"]))
+	// Default: only backfill hash-less rows. Force remint requires possession of
+	// the prior claim_token so foreign admins cannot invalidate callback links.
+	if existingHash != "" {
+		if !body.Force {
+			writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
+				"ok": false, "error": "claim_token_already_issued",
+				"message": "claim_token already minted — use the original callback link, or pass force=true with prior_claim_token",
+				"connector_id": c.ID,
+			})
+			return
+		}
+		prior := strings.TrimSpace(body.PriorClaimToken)
+		if prior == "" {
+			http.Error(w, "prior_claim_token required when force=true", 400)
+			return
+		}
+		sum := sha256.Sum256([]byte(prior))
+		if !hmac.Equal([]byte(existingHash), []byte(hex.EncodeToString(sum[:]))) {
+			http.Error(w, "invalid prior_claim_token", 403)
+			return
+		}
+	}
+	raw, hash, err := mintConnectorClaimNonce()
+	if err != nil {
+		http.Error(w, "claim nonce unavailable", 500)
+		return
+	}
+	meta["pending_claim"] = true
+	meta["claim_nonce_hash"] = hash
+	meta["claim_reminted_at"] = time.Now().UTC().Format(time.RFC3339)
+	if a.Username != "" {
+		meta["claim_reminted_by"] = a.Username
+	}
+	if body.Force {
+		meta["claim_remint_forced"] = true
+	}
+	b, _ := json.Marshal(meta)
+	c.MetaJSON = string(b)
+	c.UpdatedAt = time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	connectorLive.Store(c.ID, c)
+	persistConnector(c)
+	log.Printf("[INFO] issued claim_token connector=%s installation=%s by=%s force=%v", c.ID, c.InstallationID, a.Username, body.Force)
+	claimURL := connectorsDashboardURL(c.ID, raw)
+	writeJSON(w, map[string]interface{}{
+		"ok": true, "connector_id": c.ID, "claim_token": raw, "claim_url": claimURL,
+		"honesty": "One-time claim_token — open claim_url while signed into the target Open org. Confirm the org before claiming. Token is not logged.",
+	})
 }
 
 // autoWatchInstalledRepo enables Repo Watch + OPA Review for a repo on an
@@ -1552,20 +2079,20 @@ func hydrateSCMOnBoot() {
 	ensureAgentsTables()
 	nBackfill := backfillLegacyTablesOnBoot()
 	n := 0
+	// Pull a wide window then keep the latest row per id (ReplacingMergeTree key
+	// includes org/project, so status!='deleted' alone can resurrect soft-deletes).
 	rows, err := queryClient.Query(`
 		SELECT id, organization_id, project_id, scope, user_id, kind, installation_id, account_login,
 		       status, token_ref, meta_json, created_at, updated_at
 		FROM opa.connectors
-		WHERE status != 'deleted'
-		ORDER BY updated_at DESC LIMIT 200`)
+		ORDER BY updated_at DESC LIMIT 1000`)
 	if err != nil {
 		// Pre-migration schemas lack scope/user_id.
 		rows, err = queryClient.Query(`
 			SELECT id, organization_id, project_id, kind, installation_id, account_login,
 			       status, token_ref, meta_json, created_at, updated_at
 			FROM opa.connectors
-			WHERE status != 'deleted'
-			ORDER BY updated_at DESC LIMIT 200`)
+			ORDER BY updated_at DESC LIMIT 1000`)
 	}
 	if err != nil {
 		log.Printf("[WARN] hydrateSCMOnBoot connectors: %v", err)
@@ -1583,8 +2110,12 @@ func hydrateSCMOnBoot() {
 			if getConnector(id) != nil {
 				continue
 			}
-			c := connectorFromCHRow(row, true)
-			if c == nil || c.Status == "deleted" {
+			c := connectorFromCHRow(context.Background(), row, true)
+			if c == nil || strings.EqualFold(strings.TrimSpace(c.Status), "deleted") {
+				continue
+			}
+			if !strings.EqualFold(strings.TrimSpace(c.Status), "active") &&
+				!strings.EqualFold(strings.TrimSpace(c.Status), "pending_claim") {
 				continue
 			}
 			connectorLive.Store(c.ID, c)

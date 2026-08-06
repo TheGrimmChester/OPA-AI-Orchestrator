@@ -38,13 +38,13 @@ func peerSCMAuth(w http.ResponseWriter, r *http.Request, scope string) (*peerSCM
 		return nil, false
 	}
 	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
-	claims, err := openauth.ValidateServiceJWT(token, secret, "ora-api")
+	claims, err := validatePeerAuthToken(token, "ora-api", scope)
 	if err != nil {
+		if err == openauth.ErrMissingScope {
+			http.Error(w, "missing scope", 403)
+			return nil, false
+		}
 		http.Error(w, "invalid service token", 401)
-		return nil, false
-	}
-	if err := openauth.RequireScope(claims, scope); err != nil {
-		http.Error(w, "missing scope", 403)
 		return nil, false
 	}
 	return claims, true
@@ -61,7 +61,18 @@ func peerResolveConnector(w http.ResponseWriter, claims *peerSCMClaims, connecto
 		http.Error(w, "connector not found", 404)
 		return nil
 	}
-	if org := strings.TrimSpace(claims.OrgID); org != "" && c.OrganizationID != "" && c.OrganizationID != org {
+	if !strings.EqualFold(strings.TrimSpace(c.Status), "active") {
+		http.Error(w, "connector not active", 403)
+		return nil
+	}
+	// Fail closed: both sides must carry a non-empty org and they must match.
+	// Empty service org_id or empty-org / pending connectors must never mint tokens.
+	claimsOrg := ""
+	if claims != nil {
+		claimsOrg = strings.TrimSpace(claims.OrgID)
+	}
+	connOrg := strings.TrimSpace(c.OrganizationID)
+	if claimsOrg == "" || connOrg == "" || claimsOrg != connOrg {
 		http.Error(w, "connector org mismatch", 403)
 		return nil
 	}
