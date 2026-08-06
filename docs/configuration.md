@@ -19,7 +19,7 @@
 | `OPA_GITHUB_APP_SLUG` | GitHub App slug for install URLs and reviewer login. Fallback `ora`; set to the **installed** App slug in production (do not force-rename a live App). |
 | `OPA_GITHUB_APP_PRIVATE_KEY` | GitHub App PEM |
 | `OPA_GITHUB_WEBHOOK_SECRET` | Webhook HMAC secret |
-| `OPA_GITHUB_INSTALL_STATE_SECRET` | Dedicated HMAC for signed install `state` (≥16). Prefer over `JWT_SECRET`. Do **not** reuse `OPEN_SERVICE_JWT_SECRET` for minting (legacy tokens still verify). |
+| `OPA_GITHUB_INSTALL_STATE_SECRET` | Dedicated HMAC for signed install `state` (≥16). Prefer over `JWT_SECRET`. When set, only this key verifies callback state (set `OPA_GITHUB_INSTALL_STATE_ACCEPT_LEGACY=1` temporarily to also accept older `OPEN_SERVICE`/`JWT` tokens). |
 | `OPA_GITHUB_GRAPHQL_URL` | GitHub GraphQL endpoint used by the Projects v2 surface (default `https://api.github.com/graphql`). Override for a GitHub Enterprise host or a test stub. |
 | `ORA_RUNNER_TAG` | Runner image tag (`smoke` or `nas`) |
 | `ORCHESTRATOR_LISTEN_ADDR` | Orchestrator health listen (default `:8096`) |

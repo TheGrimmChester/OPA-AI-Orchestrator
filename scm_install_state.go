@@ -32,8 +32,10 @@ func installStatePreferredKey() ([]byte, error) {
 	return nil, fmt.Errorf("install state signing key unavailable — set OPA_GITHUB_INSTALL_STATE_SECRET (≥16) or stable JWT_SECRET (≥32)")
 }
 
-// installStateVerifyKeys tries preferred key first, then legacy OPEN_SERVICE_JWT_SECRET
-// so existing callbacks keep working until NAS rotates to the dedicated secret.
+// installStateVerifyKeys returns keys accepted for callback state.
+// When OPA_GITHUB_INSTALL_STATE_SECRET is set, only that key is used (peers
+// holding OPEN_SERVICE_JWT_SECRET cannot forge binds). Legacy OPEN_SERVICE /
+// JWT verification is opt-in via OPA_GITHUB_INSTALL_STATE_ACCEPT_LEGACY=1.
 func installStateVerifyKeys() [][]byte {
 	seen := map[string]bool{}
 	var keys [][]byte
@@ -48,13 +50,32 @@ func installStateVerifyKeys() [][]byte {
 		seen[k] = true
 		keys = append(keys, b)
 	}
+
+	dedicated := strings.TrimSpace(os.Getenv("OPA_GITHUB_INSTALL_STATE_SECRET"))
+	if len(dedicated) >= 16 {
+		add([]byte(dedicated))
+		if !envTruthy("OPA_GITHUB_INSTALL_STATE_ACCEPT_LEGACY") {
+			return keys
+		}
+	}
 	if k, err := installStatePreferredKey(); err == nil {
 		add(k)
 	}
-	if s := strings.TrimSpace(os.Getenv("OPEN_SERVICE_JWT_SECRET")); len(s) >= 16 {
-		add([]byte(s))
+	if envTruthy("OPA_GITHUB_INSTALL_STATE_ACCEPT_LEGACY") || dedicated == "" {
+		if s := strings.TrimSpace(os.Getenv("OPEN_SERVICE_JWT_SECRET")); len(s) >= 16 {
+			add([]byte(s))
+		}
 	}
 	return keys
+}
+
+func envTruthy(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func mintGitHubInstallState(org, proj, userID string) (string, error) {

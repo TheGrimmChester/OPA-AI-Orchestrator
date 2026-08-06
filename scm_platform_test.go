@@ -660,7 +660,7 @@ func TestIssueClaimTokenRemints(t *testing.T) {
 
 	inst := "inst-remint-" + fmt.Sprint(time.Now().UnixNano())
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
-	_, oldHash, err := mintConnectorClaimNonce()
+	rawPrior, oldHash, err := mintConnectorClaimNonce()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -673,7 +673,9 @@ func TestIssueClaimTokenRemints(t *testing.T) {
 	connectorLive.Store(c.ID, c)
 	defer connectorLive.Delete(c.ID)
 
-	body, _ := json.Marshal(map[string]interface{}{"installation_id": inst, "force": true})
+	body, _ := json.Marshal(map[string]interface{}{
+		"installation_id": inst, "force": true, "prior_claim_token": rawPrior,
+	})
 	req := httptest.NewRequest(http.MethodPost, "/api/connectors/github/issue-claim-token", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-User-Role", "admin")

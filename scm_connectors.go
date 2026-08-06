@@ -399,6 +399,7 @@ func handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 			meta["bound_by"] = userID
 		}
 		b, _ := json.Marshal(meta)
+		prevOrg, prevProj := c.OrganizationID, c.ProjectID
 		c.OrganizationID = org
 		c.ProjectID = proj
 		c.Scope = credScopeOrg
@@ -412,7 +413,7 @@ func handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 			c.CreatedAt = now
 		}
 		connectorLive.Store(c.ID, c)
-		persistConnector(c)
+		persistConnectorOrgMove(c, prevOrg, prevProj)
 		softDeleteOtherInstallConnectors(c.ID, inst)
 		stampWatchedTenantForConnectorForce(c)
 		redirectConnectors(c.ID, "")
@@ -588,6 +589,7 @@ func handleConnectorClaim(w http.ResponseWriter, r *http.Request, id string) {
 		proj = defaultProjectID
 	}
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	prevOrg, prevProj := c.OrganizationID, c.ProjectID
 	c.OrganizationID = org
 	c.ProjectID = proj
 	c.Scope = credScopeOrg
@@ -607,7 +609,7 @@ func handleConnectorClaim(w http.ResponseWriter, r *http.Request, id string) {
 	b, _ := json.Marshal(meta)
 	c.MetaJSON = string(b)
 	connectorLive.Store(id, c)
-	persistConnector(c)
+	persistConnectorOrgMove(c, prevOrg, prevProj)
 	softDeleteOtherInstallConnectors(c.ID, c.InstallationID)
 	stampWatchedTenantForConnectorForce(c)
 	writeJSON(w, map[string]interface{}{
@@ -1364,14 +1366,24 @@ func queryProductConnectorRows(id string, limit int) ([]map[string]interface{}, 
 	if queryClient == nil {
 		return nil, fmt.Errorf("clickhouse query client not configured")
 	}
-	where := "status != 'deleted'"
-	if strings.TrimSpace(id) != "" {
-		where += fmt.Sprintf(" AND id = '%s'", escapeSQL(id))
-	}
+	id = strings.TrimSpace(id)
 	lim := ""
 	if limit > 0 {
 		lim = fmt.Sprintf(" LIMIT %d", limit)
 	}
+	// By id: take latest row across all (org,proj) series — do not filter status
+	// first (soft-delete / org-move must win over older active rows).
+	if id != "" {
+		q := fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE id = '%s' ORDER BY updated_at DESC%s`,
+			connectorSelectCols(), escapeSQL(id), lim)
+		rows, err := queryClient.Query(q)
+		if err != nil {
+			rows, err = queryClient.Query(fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE id = '%s' ORDER BY updated_at DESC%s`,
+				connectorSelectColsLegacy(), escapeSQL(id), lim))
+		}
+		return rows, err
+	}
+	where := "status != 'deleted'"
 	q := fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE %s ORDER BY updated_at DESC%s`,
 		connectorSelectCols(), where, lim)
 	rows, err := queryClient.Query(q)
@@ -1386,14 +1398,22 @@ func queryLegacyHubConnectorRows(id string, limit int) ([]map[string]interface{}
 	if queryClient == nil || !needsLegacyConnectorFallback() {
 		return nil, nil
 	}
-	where := "status != 'deleted'"
-	if strings.TrimSpace(id) != "" {
-		where += fmt.Sprintf(" AND id = '%s'", escapeSQL(id))
-	}
+	id = strings.TrimSpace(id)
 	lim := ""
 	if limit > 0 {
 		lim = fmt.Sprintf(" LIMIT %d", limit)
 	}
+	if id != "" {
+		q := fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE id = '%s' ORDER BY updated_at DESC%s`,
+			connectorSelectCols(), escapeSQL(id), lim)
+		rows, err := queryClient.QueryExact(q)
+		if err != nil {
+			rows, err = queryClient.QueryExact(fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE id = '%s' ORDER BY updated_at DESC%s`,
+				connectorSelectColsLegacy(), escapeSQL(id), lim))
+		}
+		return rows, err
+	}
+	where := "status != 'deleted'"
 	q := fmt.Sprintf(`SELECT %s FROM opa.connectors WHERE %s ORDER BY updated_at DESC%s`,
 		connectorSelectCols(), where, lim)
 	rows, err := queryClient.QueryExact(q)
@@ -1429,7 +1449,34 @@ func hydrateConnectorFromCH(id string) *opaConnector {
 		}
 	}
 	c := connectorFromCHRow(context.Background(), rows[0], true)
+	if c == nil || strings.EqualFold(strings.TrimSpace(c.Status), "deleted") {
+		return nil
+	}
 	return storeHydratedConnector(c, fromLegacy)
+}
+
+// persistConnectorOrgMove writes a deleted tombstone under the previous
+// (organization_id, project_id, id) ReplacingMergeTree key when tenancy moves,
+// then persists the live row. Without this, the old-key active row survives merges.
+func persistConnectorOrgMove(c *opaConnector, prevOrg, prevProj string) {
+	if c == nil {
+		return
+	}
+	prevOrg = strings.TrimSpace(prevOrg)
+	prevProj = strings.TrimSpace(prevProj)
+	newOrg := strings.TrimSpace(c.OrganizationID)
+	newProj := strings.TrimSpace(c.ProjectID)
+	if prevOrg != newOrg || prevProj != newProj {
+		tomb := *c
+		tomb.OrganizationID = prevOrg
+		tomb.ProjectID = prevProj
+		tomb.Status = "deleted"
+		tomb.TokenRef = ""
+		// Slightly older than the live row so same-series replaces still prefer live.
+		tomb.UpdatedAt = c.UpdatedAt
+		persistConnector(&tomb)
+	}
+	persistConnector(c)
 }
 
 // backfillLegacyConnectorsOnBoot copies hub opa.connectors rows missing from the
@@ -1675,8 +1722,9 @@ func handleIssueClaimToken(w http.ResponseWriter, r *http.Request) {
 	}
 	rawBody, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	var body struct {
-		InstallationID string `json:"installation_id"`
-		Force          bool   `json:"force"`
+		InstallationID  string `json:"installation_id"`
+		Force           bool   `json:"force"`
+		PriorClaimToken string `json:"prior_claim_token"`
 	}
 	if json.Unmarshal(rawBody, &body) != nil || strings.TrimSpace(body.InstallationID) == "" {
 		http.Error(w, "installation_id required", 400)
@@ -1700,15 +1748,27 @@ func handleIssueClaimToken(w http.ResponseWriter, r *http.Request) {
 	}
 	meta := parseConnectorMeta(c.MetaJSON)
 	existingHash := strings.TrimSpace(fmt.Sprint(meta["claim_nonce_hash"]))
-	// Default: only backfill hash-less rows. Reminting invalidates the original
-	// callback token (cross-org steal). Ops may pass force=true deliberately.
-	if existingHash != "" && !body.Force {
-		writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
-			"ok": false, "error": "claim_token_already_issued",
-			"message": "claim_token already minted — use the original callback link, or pass force=true to invalidate it",
-			"connector_id": c.ID,
-		})
-		return
+	// Default: only backfill hash-less rows. Force remint requires possession of
+	// the prior claim_token so foreign admins cannot invalidate callback links.
+	if existingHash != "" {
+		if !body.Force {
+			writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
+				"ok": false, "error": "claim_token_already_issued",
+				"message": "claim_token already minted — use the original callback link, or pass force=true with prior_claim_token",
+				"connector_id": c.ID,
+			})
+			return
+		}
+		prior := strings.TrimSpace(body.PriorClaimToken)
+		if prior == "" {
+			http.Error(w, "prior_claim_token required when force=true", 400)
+			return
+		}
+		sum := sha256.Sum256([]byte(prior))
+		if !hmac.Equal([]byte(existingHash), []byte(hex.EncodeToString(sum[:]))) {
+			http.Error(w, "invalid prior_claim_token", 403)
+			return
+		}
 	}
 	raw, hash, err := mintConnectorClaimNonce()
 	if err != nil {
@@ -2003,20 +2063,20 @@ func hydrateSCMOnBoot() {
 	ensureAgentsTables()
 	nBackfill := backfillLegacyTablesOnBoot()
 	n := 0
+	// Pull a wide window then keep the latest row per id (ReplacingMergeTree key
+	// includes org/project, so status!='deleted' alone can resurrect soft-deletes).
 	rows, err := queryClient.Query(`
 		SELECT id, organization_id, project_id, scope, user_id, kind, installation_id, account_login,
 		       status, token_ref, meta_json, created_at, updated_at
 		FROM opa.connectors
-		WHERE status != 'deleted'
-		ORDER BY updated_at DESC LIMIT 200`)
+		ORDER BY updated_at DESC LIMIT 1000`)
 	if err != nil {
 		// Pre-migration schemas lack scope/user_id.
 		rows, err = queryClient.Query(`
 			SELECT id, organization_id, project_id, kind, installation_id, account_login,
 			       status, token_ref, meta_json, created_at, updated_at
 			FROM opa.connectors
-			WHERE status != 'deleted'
-			ORDER BY updated_at DESC LIMIT 200`)
+			ORDER BY updated_at DESC LIMIT 1000`)
 	}
 	if err != nil {
 		log.Printf("[WARN] hydrateSCMOnBoot connectors: %v", err)
@@ -2035,7 +2095,11 @@ func hydrateSCMOnBoot() {
 				continue
 			}
 			c := connectorFromCHRow(context.Background(), row, true)
-			if c == nil || c.Status == "deleted" {
+			if c == nil || strings.EqualFold(strings.TrimSpace(c.Status), "deleted") {
+				continue
+			}
+			if !strings.EqualFold(strings.TrimSpace(c.Status), "active") &&
+				!strings.EqualFold(strings.TrimSpace(c.Status), "pending_claim") {
 				continue
 			}
 			connectorLive.Store(c.ID, c)
