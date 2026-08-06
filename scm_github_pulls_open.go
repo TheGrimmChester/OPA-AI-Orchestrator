@@ -192,3 +192,69 @@ func githubFindOpenPullForHead(c *opaConnector, owner, repo, head string) (*gith
 	}
 	return decodeGitHubDeliveryPull(list[0])
 }
+
+// githubMergePullRequest merges an open pull request. mergeMethod defaults to
+// "squash" when empty. When the PR is already merged, current meta is returned
+// so a re-driven autopilot merge converges instead of erroring.
+func githubMergePullRequest(c *opaConnector, owner, repo string, number int, mergeMethod string) (*githubDeliveryPull, error) {
+	if c == nil {
+		return nil, fmt.Errorf("no connector")
+	}
+	if number <= 0 {
+		return nil, fmt.Errorf("pull request number required")
+	}
+	mergeMethod = strings.ToLower(strings.TrimSpace(mergeMethod))
+	switch mergeMethod {
+	case "", "squash":
+		mergeMethod = "squash"
+	case "merge", "rebase":
+		// allowed
+	default:
+		return nil, fmt.Errorf("unsupported merge_method %q (use squash, merge, or rebase)", mergeMethod)
+	}
+	if githubUseMockAPI(c) {
+		return &githubDeliveryPull{
+			Number: number,
+			HTMLURL: fmt.Sprintf("https://github.com/%s/%s/pull/%d", owner, repo, number),
+			State: "merged", Title: "merged",
+		}, nil
+	}
+
+	if existing, err := githubGetPull(c, owner, repo, number); err == nil && existing != nil {
+		if existing.Merged || strings.EqualFold(existing.State, "merged") {
+			return &githubDeliveryPull{
+				Number: existing.Number,
+				HTMLURL: fmt.Sprintf("https://github.com/%s/%s/pull/%d", owner, repo, existing.Number),
+				State: "merged", Title: existing.Title,
+				HeadRef: existing.HeadRef, BaseRef: existing.BaseRef, Draft: existing.Draft,
+			}, nil
+		}
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"merge_method": mergeMethod,
+	})
+	raw, code, err := githubWriteAPI(c, owner, repo, githubPermsCreatePR(), http.MethodPut,
+		fmt.Sprintf("/repos/%s/%s/pulls/%d/merge", owner, repo, number), strings.NewReader(string(payload)))
+	if err != nil {
+		return nil, err
+	}
+	if code >= 300 {
+		return nil, newGitHubPullAPIError("merge pull request", code, raw)
+	}
+	meta, err := githubGetPull(c, owner, repo, number)
+	if err != nil {
+		return &githubDeliveryPull{
+			Number: number,
+			HTMLURL: fmt.Sprintf("https://github.com/%s/%s/pull/%d", owner, repo, number),
+			State: "merged",
+		}, nil
+	}
+	return &githubDeliveryPull{
+		Number: meta.Number,
+		HTMLURL: fmt.Sprintf("https://github.com/%s/%s/pull/%d", owner, repo, meta.Number),
+		State: "merged", Title: meta.Title,
+		HeadRef: meta.HeadRef, BaseRef: meta.BaseRef, Draft: meta.Draft,
+	}, nil
+}
+

@@ -1554,9 +1554,7 @@ func connectorFromCHRow(ctx context.Context, row map[string]interface{}, decrypt
 	if row == nil {
 		return nil
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	_ = ctx
 	id, _ := row["id"].(string)
 	if id == "" {
 		return nil
@@ -1576,25 +1574,8 @@ func connectorFromCHRow(ctx context.Context, row map[string]interface{}, decrypt
 	}
 	ref := str("token_ref")
 	if decryptToken && isEncryptedSecret(ref) {
-		key := "connector:" + id + ":token_ref"
-		cryptoCtx := cryptoContextForConnector(c.OrganizationID, c.Scope, c.UserID, key)
-		plain, scopedErr := decryptSecretScoped(ctx, cryptoCtx, ref)
-		scopedOK := scopedErr == nil && plain != ""
-		if !scopedOK {
-			// Pre-scoped enc:v2 (admin/_legacy) or enc:v1 under OPA_CONNECTOR_SECRET.
-			if p, e := decryptSecret(ref); e == nil && p != "" {
-				plain = p
-			} else if p, e := legacyDecryptSecret(ref); e == nil && p != "" {
-				plain = p
-			}
-		}
-		if plain != "" {
+		if plain, err := decryptSecret(ref); err == nil {
 			c.TokenRef = plain
-			if !scopedOK {
-				persistConnector(c)
-			} else if enc, ok, reErr := maybeReencryptSecret(ctx, cryptoCtx, ref); reErr == nil && ok && enc != ref {
-				persistConnector(c)
-			}
 		}
 	}
 	return c
@@ -1896,7 +1877,7 @@ func persistConnector(c *opaConnector) {
 	}
 	tokenRef := ""
 	if strings.TrimSpace(c.TokenRef) != "" {
-		enc, err := persistTokenRefScoped(context.Background(), c.OrganizationID, c.Scope, c.UserID, c.ID, c.TokenRef)
+		enc, err := persistTokenRef(c.TokenRef)
 		if err != nil {
 			log.Printf("[WARN] persistConnector %s: encrypt failed — skipping CH write to avoid wiping token_ref: %v", c.ID, err)
 			return
