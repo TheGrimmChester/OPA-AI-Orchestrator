@@ -375,16 +375,31 @@ func handleInstallationWebhook(w http.ResponseWriter, event string, raw []byte, 
 }
 
 func findConnectorByInstallation(inst string) *opaConnector {
-	var found *opaConnector
+	inst = strings.TrimSpace(inst)
+	if inst == "" {
+		return nil
+	}
+	var active, pending *opaConnector
 	connectorLive.Range(func(_, v interface{}) bool {
 		c, ok := v.(*opaConnector)
-		if ok && c.InstallationID == inst && c.Status == "active" {
-			found = c
+		if !ok || strings.TrimSpace(c.InstallationID) != inst || c.Status == "deleted" {
+			return true
+		}
+		switch strings.ToLower(strings.TrimSpace(c.Status)) {
+		case "active":
+			active = c
 			return false
+		case "pending_claim":
+			if pending == nil {
+				pending = c
+			}
 		}
 		return true
 	})
-	return found
+	if active != nil {
+		return active
+	}
+	return pending
 }
 
 func enqueueSCMJob(wr *opaWatchedRepo, conn *opaConnector, repo string, pr int, sha, event string, draft bool, title, body string) *scmJob {

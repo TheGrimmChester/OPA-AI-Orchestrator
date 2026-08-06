@@ -568,6 +568,154 @@ func TestConnectorsForeignViewerIsolation(t *testing.T) {
 	}
 }
 
+func TestEnsureGitHubAppConnectorMintsClaimNonce(t *testing.T) {
+	t.Setenv("OPA_GITHUB_APP_ID", "12345")
+	t.Setenv("OPA_GITHUB_APP_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF6PZGFw=\n-----END RSA PRIVATE KEY-----")
+
+	inst := "inst-ensure-" + fmt.Sprint(time.Now().UnixNano())
+	c := ensureGitHubAppConnector(inst, "acme-bot")
+	if c == nil {
+		t.Fatal("expected connector")
+	}
+	defer connectorLive.Delete(c.ID)
+	if c.Status != "pending_claim" {
+		t.Fatalf("status=%s", c.Status)
+	}
+	meta := parseConnectorMeta(c.MetaJSON)
+	if strings.TrimSpace(fmt.Sprint(meta["claim_nonce_hash"])) == "" {
+		t.Fatalf("claim_nonce_hash missing: %v", meta)
+	}
+	// Idempotent: same installation returns same row and keeps hash.
+	again := ensureGitHubAppConnector(inst, "acme-bot")
+	if again == nil || again.ID != c.ID {
+		t.Fatalf("again=%+v want id=%s", again, c.ID)
+	}
+}
+
+func TestEnsureGitHubAppConnectorBackfillsHash(t *testing.T) {
+	t.Setenv("OPA_GITHUB_APP_ID", "12345")
+	t.Setenv("OPA_GITHUB_APP_PRIVATE_KEY", "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF6PZGFw=\n-----END RSA PRIVATE KEY-----")
+
+	inst := "inst-backfill-" + fmt.Sprint(time.Now().UnixNano())
+	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	c := &opaConnector{
+		ID: "conn-hashless", Kind: "github_app", InstallationID: inst,
+		Status: "pending_claim", Scope: credScopeOrg,
+		MetaJSON: `{"auto_provisioned":true,"pending_claim":true}`, CreatedAt: now, UpdatedAt: now,
+	}
+	connectorLive.Store(c.ID, c)
+	defer connectorLive.Delete(c.ID)
+
+	got := ensureGitHubAppConnector(inst, "acme")
+	if got == nil || got.ID != c.ID {
+		t.Fatalf("got=%+v", got)
+	}
+	meta := parseConnectorMeta(got.MetaJSON)
+	if strings.TrimSpace(fmt.Sprint(meta["claim_nonce_hash"])) == "" {
+		t.Fatalf("expected backfilled claim_nonce_hash: %v", meta)
+	}
+}
+
+func TestConnectorReposForeignReturns404(t *testing.T) {
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+
+	foreign := &opaConnector{
+		ID: "repos-foreign", Kind: "github_app", Status: "active",
+		OrganizationID: "org-b", ProjectID: "p1", Scope: credScopeOrg,
+	}
+	pending := &opaConnector{
+		ID: "repos-pending", Kind: "github_app", Status: "pending_claim",
+		OrganizationID: "", Scope: credScopeOrg,
+	}
+	connectorLive.Store(foreign.ID, foreign)
+	connectorLive.Store(pending.ID, pending)
+	defer connectorLive.Delete(foreign.ID)
+	defer connectorLive.Delete(pending.ID)
+
+	for _, id := range []string{foreign.ID, pending.ID} {
+		req := httptest.NewRequest(http.MethodGet, "/api/connectors/"+id+"/repos", nil)
+		req.Header.Set("X-User-Role", "viewer")
+		req.Header.Set("X-User-Username", "alice")
+		req.Header.Set("X-Organization-ID", "org-a")
+		req.Header.Set("X-Project-ID", "p1")
+		rr := httptest.NewRecorder()
+		handleConnectorRepos(rr, req, id)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("repos %s status %d want 404 body %s", id, rr.Code, rr.Body.String())
+		}
+		if strings.Contains(rr.Body.String(), "org-b") || strings.Contains(rr.Body.String(), "organization_id") {
+			t.Fatalf("repos body leaked org: %s", rr.Body.String())
+		}
+	}
+}
+
+func TestIssueClaimTokenRemints(t *testing.T) {
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+
+	inst := "inst-remint-" + fmt.Sprint(time.Now().UnixNano())
+	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	_, oldHash, err := mintConnectorClaimNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &opaConnector{
+		ID: "conn-remint", Kind: "github_app", InstallationID: inst,
+		Status: "pending_claim", Scope: credScopeOrg,
+		MetaJSON: fmt.Sprintf(`{"pending_claim":true,"claim_nonce_hash":%q}`, oldHash),
+		CreatedAt: now, UpdatedAt: now,
+	}
+	connectorLive.Store(c.ID, c)
+	defer connectorLive.Delete(c.ID)
+
+	body, _ := json.Marshal(map[string]string{"installation_id": inst})
+	req := httptest.NewRequest(http.MethodPost, "/api/connectors/github/issue-claim-token", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-Role", "admin")
+	req.Header.Set("X-User-Username", "alice")
+	req.Header.Set("X-Organization-ID", "nas")
+	req.Header.Set("X-Project-ID", "infra")
+	rr := httptest.NewRecorder()
+	handleIssueClaimToken(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]interface{}
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	raw, _ := out["claim_token"].(string)
+	if raw == "" || !strings.Contains(fmt.Sprint(out["claim_url"]), "#claim_token=") {
+		t.Fatalf("out=%v", out)
+	}
+	live := getConnector(c.ID)
+	meta := parseConnectorMeta(live.MetaJSON)
+	newHash := strings.TrimSpace(fmt.Sprint(meta["claim_nonce_hash"]))
+	if newHash == "" || newHash == oldHash {
+		t.Fatalf("hash not reminted: old=%s new=%s", oldHash, newHash)
+	}
+	sum := sha256.Sum256([]byte(raw))
+	if hex.EncodeToString(sum[:]) != newHash {
+		t.Fatalf("returned token does not match stored hash")
+	}
+}
+
+func TestFindConnectorByInstallationPrefersActive(t *testing.T) {
+	inst := "inst-pref-" + fmt.Sprint(time.Now().UnixNano())
+	pending := &opaConnector{ID: "f-pending", InstallationID: inst, Status: "pending_claim"}
+	active := &opaConnector{ID: "f-active", InstallationID: inst, Status: "active", OrganizationID: "nas"}
+	connectorLive.Store(pending.ID, pending)
+	connectorLive.Store(active.ID, active)
+	defer connectorLive.Delete(pending.ID)
+	defer connectorLive.Delete(active.ID)
+
+	got := findConnectorByInstallation(inst)
+	if got == nil || got.ID != active.ID {
+		t.Fatalf("got=%+v want active", got)
+	}
+}
+
 func TestPublishCheckerResultCommitStatusFallback(t *testing.T) {
 	t.Setenv("OPA_SCM_MOCK_GITHUB", "1")
 	t.Setenv("OPA_SCM_SKIP_CHECK_RUNS", "1")

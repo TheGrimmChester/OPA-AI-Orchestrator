@@ -248,10 +248,11 @@ Legacy CI without Repo Watch can still call `harness/appsec-pr-check.sh` (tenant
 - `GET /api/connectors`
 - `POST /api/connectors/github/pat`
 - `GET /api/connectors/github/install-url` — mints signed install `state` from the current Open **organization** account (personal accounts → 400)
-- `GET /api/connectors/github/callback` — completes install; orphans redirect to `/settings/connectors?connector=&claim_token=` (raw token once; hash stored)
+- `GET /api/connectors/github/callback` — completes install; orphans redirect to `/settings/connectors?connector=…#claim_token=…` (raw token once in fragment; hash stored). Older `?claim_token=` links still work in dashboards.
+- `POST /api/connectors/github/issue-claim-token` — admin remint `{ "installation_id": "…" }` → one-time `claim_token` + `claim_url` for webhook-provisioned pendings
 - `GET|PATCH|DELETE /api/connectors/{id}` — get / edit (login, display_name, replace PAT) / soft-delete + cascade watched (`pending_claim` invisible/immutable)
 - `POST /api/connectors/{id}/claim` — `{ "claim_token": "..." }` claims a `pending_claim` connector into the caller's Open org (CAS; wipe nonce; sync OAM)
-- `GET /api/connectors/{id}/repos` — installable repos (hydrates encrypted PAT from CH after restart)
+- `GET /api/connectors/{id}/repos` — installable repos; foreign / pending → **404** (no org leak)
 - `GET /api/connectors/{id}/pulls?repo=owner/name` — open PRs
 - `GET|PUT /api/connectors/{id}/watched`
 - `GET /api/scm/jobs` — live SCM jobs (`running` → `queued` → `waiting` first; `counts`/`total`; `limit` max 500). **running** = actively processing; **queued** = next to run (slot reserved / ready); **waiting** = backlog until a free slot or prior stack item. Stack drain keeps at most `OPA_REVIEW_STACK_CONCURRENCY` items in `queued`+`running`; extras stay `waiting`. Non-stack manual jobs stay `queued` until a process slot frees. Jobs + stacks persist under `$OPA_SCM_STATE_DIR` (default `$OPA_SECURITY_WORKSPACE/scm-state`) and ClickHouse; on Agent boot, stuck `running` jobs are recovered (`recovered_from_restart`), incomplete stacks resume drain, and **all non-stack `queued` jobs are re-dispatched** up to concurrency (enqueue-time goroutines do not survive recreate). Also `POST /api/scm/jobs/resume` (admin one-shot), `POST /api/scm/jobs/{id}/retry`, `POST /api/scm/jobs/{id}/cancel`, `POST /api/scm/jobs/{id}/ai-review`, `POST /api/scm/opa-review/stacks/{id}/cancel`
