@@ -19,9 +19,23 @@
 | `OPA_GITHUB_APP_SLUG` | GitHub App slug for install URLs and reviewer login. Fallback `ora`; set to the **installed** App slug in production (do not force-rename a live App). |
 | `OPA_GITHUB_APP_PRIVATE_KEY` | GitHub App PEM |
 | `OPA_GITHUB_WEBHOOK_SECRET` | Webhook HMAC secret |
+| `OPA_GITHUB_INSTALL_STATE_SECRET` | Dedicated HMAC for signed install `state` (≥16). Prefer over `JWT_SECRET`. Do **not** reuse `OPEN_SERVICE_JWT_SECRET` for minting (legacy tokens still verify). |
 | `OPA_GITHUB_GRAPHQL_URL` | GitHub GraphQL endpoint used by the Projects v2 surface (default `https://api.github.com/graphql`). Override for a GitHub Enterprise host or a test stub. |
 | `ORA_RUNNER_TAG` | Runner image tag (`smoke` or `nas`) |
 | `ORCHESTRATOR_LISTEN_ADDR` | Orchestrator health listen (default `:8096`) |
 | `OPA_GATE_WAIT_TIMEOUT_SEC` | How long the AppSec Gate waits for the OSA security run to finish before reporting `scan_incomplete` (default `600`) |
 | `OPA_GATE_RUN_APPEAR_TIMEOUT_SEC` | How long the gate waits for the security run to exist at all before reporting `scan_incomplete` (default `90`). A run that never appears is a broken hand-off, so this is shorter than the scan budget. |
 | `OPA_CHECKUP_MODULE_SRC` | Host directory holding sibling module checkouts, used to resolve `go.mod` filesystem `replace` targets in Checkup. Accepts a `:`-separated list. Falls back to `FAMILY_ROOT`, then `OPA_FAMILY_SRC`. See [Job isolation](job-isolation.md#checkup-workspace). |
+
+## Security cache and job sandbox
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REDIS_URL` | empty | Dedicated `redis-ora` instance for security caches (install-permission probe, webhook dedup, job-token allowlist mirror). Memory-only when unset. |
+| `ORA_SEC_L1_CACHE` | `20000` | L1 max entries for security cache |
+| `ORA_SEC_KEY_PREFIX` | `ora:sec:` | Redis key prefix |
+| `OPA_JOB_SANDBOX` | `off` | Set `docker` on NAS for container-isolated agent/scan jobs |
+| `OPA_JOB_EGRESS_PROXY` | on when sandbox=docker | Set `0` for break-glass unrestricted egress |
+| `OPA_JOB_ALLOW_HOST_EXEC` | off | Break-glass host exec when docker unavailable |
+
+Job boxes never receive `REDIS_URL` or platform secrets — see [Job isolation](job-isolation.md).

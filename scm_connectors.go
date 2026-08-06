@@ -414,7 +414,7 @@ func handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		connectorLive.Store(c.ID, c)
 		persistConnector(c)
 		softDeleteOtherInstallConnectors(c.ID, inst)
-		stampWatchedTenantForConnector(c)
+		stampWatchedTenantForConnectorForce(c)
 		redirectConnectors(c.ID, "")
 		return
 	}
@@ -475,6 +475,7 @@ func softDeleteOtherInstallConnectors(keepID, installationID string) {
 		c.UpdatedAt = now
 		connectorLive.Store(c.ID, c)
 		persistConnector(c)
+		cascadeDeleteWatched(c.ID)
 		log.Printf("[INFO] soft-deleted duplicate github_app connector %s installation=%s keep=%s", c.ID, inst, keepID)
 		return true
 	})
@@ -608,7 +609,7 @@ func handleConnectorClaim(w http.ResponseWriter, r *http.Request, id string) {
 	connectorLive.Store(id, c)
 	persistConnector(c)
 	softDeleteOtherInstallConnectors(c.ID, c.InstallationID)
-	stampWatchedTenantForConnector(c)
+	stampWatchedTenantForConnectorForce(c)
 	writeJSON(w, map[string]interface{}{
 		"ok": true, "connector": connectorPublic(c),
 		"honesty": "Claimed into the Open organization from your session — not from GitHub account_login.",
@@ -733,21 +734,37 @@ func handleConnectorSub(w http.ResponseWriter, r *http.Request) {
 
 // stampWatchedTenantForConnector copies connector org/project onto watches that
 // still lack organization_id (auto-watch during pending_claim).
+// stampWatchedTenantForConnector copies the connector's org/project onto every
+// watch for that connector. Force=true overwrites a prior org (claim / state bind).
 func stampWatchedTenantForConnector(c *opaConnector) {
+	stampWatchedTenantForConnectorOpts(c, false)
+}
+
+func stampWatchedTenantForConnectorForce(c *opaConnector) {
+	stampWatchedTenantForConnectorOpts(c, true)
+}
+
+func stampWatchedTenantForConnectorOpts(c *opaConnector, force bool) {
 	if c == nil || strings.TrimSpace(c.OrganizationID) == "" {
 		return
 	}
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	wantOrg := strings.TrimSpace(c.OrganizationID)
+	wantProj := nz(strings.TrimSpace(c.ProjectID), defaultProjectID)
 	watchedLive.Range(func(_, v interface{}) bool {
 		wr, ok := v.(*opaWatchedRepo)
 		if !ok || wr.ConnectorID != c.ID {
 			return true
 		}
-		if strings.TrimSpace(wr.OrganizationID) != "" {
+		curOrg := strings.TrimSpace(wr.OrganizationID)
+		if !force && curOrg != "" {
 			return true
 		}
-		wr.OrganizationID = c.OrganizationID
-		wr.ProjectID = nz(strings.TrimSpace(c.ProjectID), defaultProjectID)
+		if curOrg == wantOrg && strings.TrimSpace(wr.ProjectID) == wantProj {
+			return true
+		}
+		wr.OrganizationID = wantOrg
+		wr.ProjectID = wantProj
 		wr.UpdatedAt = now
 		persistWatched(wr)
 		return true
@@ -1507,9 +1524,14 @@ func findWatched(repo string) (*opaWatchedRepo, *opaConnector) {
 		if !ok || !wr.Enabled {
 			return true
 		}
-		if strings.EqualFold(wr.RepoFullName, repo) {
-			candidates = append(candidates, wr)
+		if !strings.EqualFold(wr.RepoFullName, repo) {
+			return true
 		}
+		c := getOrHydrateConnector(wr.ConnectorID)
+		if !connectorUsableForWatch(c) {
+			return true
+		}
+		candidates = append(candidates, wr)
 		return true
 	})
 	if len(candidates) == 0 {
@@ -1519,15 +1541,38 @@ func findWatched(repo string) (*opaWatchedRepo, *opaConnector) {
 	return found, getOrHydrateConnector(found.ConnectorID)
 }
 
+// connectorUsableForWatch is true only for active binders with a non-empty org.
+func connectorUsableForWatch(c *opaConnector) bool {
+	if c == nil || c.Status == "deleted" {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(c.Status), "active") {
+		return false
+	}
+	return strings.TrimSpace(c.OrganizationID) != ""
+}
+
 // preferWatchedForChecks picks the github_app watch when both App and PAT watch
 // the same repo so Check Runs post as the GitHub App bot.
 func preferWatchedForChecks(cands []*opaWatchedRepo) *opaWatchedRepo {
-	if len(cands) == 1 {
-		return cands[0]
+	usable := make([]*opaWatchedRepo, 0, len(cands))
+	for _, wr := range cands {
+		if wr == nil {
+			continue
+		}
+		if connectorUsableForWatch(getOrHydrateConnector(wr.ConnectorID)) {
+			usable = append(usable, wr)
+		}
+	}
+	if len(usable) == 0 {
+		return nil
+	}
+	if len(usable) == 1 {
+		return usable[0]
 	}
 	var best *opaWatchedRepo
 	bestScore := -1
-	for _, wr := range cands {
+	for _, wr := range usable {
 		score := 0
 		c := getOrHydrateConnector(wr.ConnectorID)
 		if c != nil && c.Kind == "github_app" && c.InstallationID != "" {
@@ -1545,7 +1590,7 @@ func preferWatchedForChecks(cands []*opaWatchedRepo) *opaWatchedRepo {
 		}
 	}
 	if best == nil {
-		return cands[0]
+		return usable[0]
 	}
 	return best
 }
@@ -1559,6 +1604,9 @@ func ensureGitHubAppConnector(installationID, accountLogin string) *opaConnector
 	if inst == "" || !githubAppConfigured() {
 		return nil
 	}
+	connectorClaimMu.Lock()
+	defer connectorClaimMu.Unlock()
+
 	if c := findConnectorByInstallation(inst); c != nil {
 		changed := false
 		if accountLogin != "" && strings.TrimSpace(c.AccountLogin) == "" {
@@ -1582,6 +1630,7 @@ func ensureGitHubAppConnector(installationID, accountLogin string) *opaConnector
 			c.UpdatedAt = time.Now().UTC().Format("2006-01-02 15:04:05.000")
 			persistConnector(c)
 		}
+		softDeleteOtherInstallConnectors(c.ID, inst)
 		return c
 	}
 	_, hash, err := mintConnectorClaimNonce()
@@ -1603,6 +1652,7 @@ func ensureGitHubAppConnector(installationID, accountLogin string) *opaConnector
 	}
 	connectorLive.Store(id, c)
 	persistConnector(c)
+	softDeleteOtherInstallConnectors(id, inst)
 	log.Printf("[INFO] provisioned github_app connector %s installation=%s account=%s status=pending_claim", id, inst, accountLogin)
 	return c
 }
@@ -1626,6 +1676,7 @@ func handleIssueClaimToken(w http.ResponseWriter, r *http.Request) {
 	rawBody, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	var body struct {
 		InstallationID string `json:"installation_id"`
+		Force          bool   `json:"force"`
 	}
 	if json.Unmarshal(rawBody, &body) != nil || strings.TrimSpace(body.InstallationID) == "" {
 		http.Error(w, "installation_id required", 400)
@@ -1647,24 +1698,38 @@ func handleIssueClaimToken(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	meta := parseConnectorMeta(c.MetaJSON)
+	existingHash := strings.TrimSpace(fmt.Sprint(meta["claim_nonce_hash"]))
+	// Default: only backfill hash-less rows. Reminting invalidates the original
+	// callback token (cross-org steal). Ops may pass force=true deliberately.
+	if existingHash != "" && !body.Force {
+		writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
+			"ok": false, "error": "claim_token_already_issued",
+			"message": "claim_token already minted — use the original callback link, or pass force=true to invalidate it",
+			"connector_id": c.ID,
+		})
+		return
+	}
 	raw, hash, err := mintConnectorClaimNonce()
 	if err != nil {
 		http.Error(w, "claim nonce unavailable", 500)
 		return
 	}
-	meta := parseConnectorMeta(c.MetaJSON)
 	meta["pending_claim"] = true
 	meta["claim_nonce_hash"] = hash
 	meta["claim_reminted_at"] = time.Now().UTC().Format(time.RFC3339)
 	if a.Username != "" {
 		meta["claim_reminted_by"] = a.Username
 	}
+	if body.Force {
+		meta["claim_remint_forced"] = true
+	}
 	b, _ := json.Marshal(meta)
 	c.MetaJSON = string(b)
 	c.UpdatedAt = time.Now().UTC().Format("2006-01-02 15:04:05.000")
 	connectorLive.Store(c.ID, c)
 	persistConnector(c)
-	log.Printf("[INFO] reminted claim_token connector=%s installation=%s by=%s", c.ID, c.InstallationID, a.Username)
+	log.Printf("[INFO] issued claim_token connector=%s installation=%s by=%s force=%v", c.ID, c.InstallationID, a.Username, body.Force)
 	dash := strings.TrimRight(envOr("OPA_DASHBOARD_URL", "http://127.0.0.1:8088"), "/")
 	claimURL := dash + "/settings/connectors?connector=" + url.QueryEscape(c.ID) + "#claim_token=" + url.QueryEscape(raw)
 	writeJSON(w, map[string]interface{}{

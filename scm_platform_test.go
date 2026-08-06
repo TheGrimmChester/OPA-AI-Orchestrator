@@ -228,7 +228,8 @@ func TestPendingClaimBlocksPRWebhook(t *testing.T) {
 }
 
 func TestMintAndParseInstallState(t *testing.T) {
-	t.Setenv("OPEN_SERVICE_JWT_SECRET", "install-state-secret-32bytes!!")
+	t.Setenv("OPA_GITHUB_INSTALL_STATE_SECRET", "install-state-secret-32bytes!!")
+	t.Setenv("OPEN_SERVICE_JWT_SECRET", "")
 	state, err := mintGitHubInstallState("nas", "infra", "alice")
 	if err != nil {
 		t.Fatal(err)
@@ -672,7 +673,7 @@ func TestIssueClaimTokenRemints(t *testing.T) {
 	connectorLive.Store(c.ID, c)
 	defer connectorLive.Delete(c.ID)
 
-	body, _ := json.Marshal(map[string]string{"installation_id": inst})
+	body, _ := json.Marshal(map[string]interface{}{"installation_id": inst, "force": true})
 	req := httptest.NewRequest(http.MethodPost, "/api/connectors/github/issue-claim-token", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-User-Role", "admin")
@@ -719,7 +720,8 @@ func TestFindConnectorByInstallationPrefersActive(t *testing.T) {
 
 func TestGitHubCallbackDoesNotResetActive(t *testing.T) {
 	t.Setenv("OPA_DASHBOARD_URL", "http://dash.test")
-	t.Setenv("OPEN_SERVICE_JWT_SECRET", "callback-protect-secret-32bytes!!")
+	t.Setenv("OPA_GITHUB_INSTALL_STATE_SECRET", "callback-protect-secret-32bytes!!")
+	t.Setenv("OPEN_SERVICE_JWT_SECRET", "")
 
 	inst := "inst-protect-" + fmt.Sprint(time.Now().UnixNano())
 	active := &opaConnector{
@@ -775,9 +777,68 @@ func TestGitHubCallbackDoesNotResetActive(t *testing.T) {
 	}
 }
 
+func TestIssueClaimTokenRequiresForceWhenHashPresent(t *testing.T) {
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+
+	inst := "inst-noforce-" + fmt.Sprint(time.Now().UnixNano())
+	_, hash, err := mintConnectorClaimNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &opaConnector{
+		ID: "conn-noforce", Kind: "github_app", InstallationID: inst,
+		Status: "pending_claim", Scope: credScopeOrg,
+		MetaJSON: fmt.Sprintf(`{"pending_claim":true,"claim_nonce_hash":%q}`, hash),
+	}
+	connectorLive.Store(c.ID, c)
+	defer connectorLive.Delete(c.ID)
+
+	body, _ := json.Marshal(map[string]string{"installation_id": inst})
+	req := httptest.NewRequest(http.MethodPost, "/api/connectors/github/issue-claim-token", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-Role", "admin")
+	req.Header.Set("X-Organization-ID", "nas")
+	rr := httptest.NewRecorder()
+	handleIssueClaimToken(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status %d want 409 body %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestFindWatchedSkipsDeletedConnector(t *testing.T) {
+	repo := "acme/skip-deleted"
+	del := &opaConnector{
+		ID: "conn-del-watch", Kind: "github_app", InstallationID: "1",
+		Status: "deleted", OrganizationID: "nas", Scope: credScopeOrg,
+	}
+	active := &opaConnector{
+		ID: "conn-ok-watch", Kind: "github_pat", Status: "active",
+		OrganizationID: "nas", ProjectID: "infra", Scope: credScopeOrg, TokenRef: "x",
+	}
+	connectorLive.Store(del.ID, del)
+	connectorLive.Store(active.ID, active)
+	defer connectorLive.Delete(del.ID)
+	defer connectorLive.Delete(active.ID)
+
+	wrDel := &opaWatchedRepo{ID: "w-del", ConnectorID: del.ID, RepoFullName: repo, Enabled: true, OrganizationID: "nas"}
+	wrOK := &opaWatchedRepo{ID: "w-ok", ConnectorID: active.ID, RepoFullName: repo, Enabled: true, OrganizationID: "nas"}
+	watchedLive.Store(del.ID+"|"+repo, wrDel)
+	watchedLive.Store(active.ID+"|"+repo, wrOK)
+	defer watchedLive.Delete(del.ID + "|" + repo)
+	defer watchedLive.Delete(active.ID + "|" + repo)
+
+	got, conn := findWatched(repo)
+	if got == nil || got.ID != wrOK.ID || conn == nil || conn.ID != active.ID {
+		t.Fatalf("got wr=%+v conn=%+v", got, conn)
+	}
+}
+
 func TestGitHubCallbackActivatesPendingWithState(t *testing.T) {
 	t.Setenv("OPA_DASHBOARD_URL", "http://dash.test")
-	t.Setenv("OPEN_SERVICE_JWT_SECRET", "callback-activate-secret-32bytes!")
+	t.Setenv("OPA_GITHUB_INSTALL_STATE_SECRET", "callback-activate-secret-32bytes!")
+	t.Setenv("OPEN_SERVICE_JWT_SECRET", "")
 
 	inst := "inst-activate-" + fmt.Sprint(time.Now().UnixNano())
 	_, hash, err := mintConnectorClaimNonce()
