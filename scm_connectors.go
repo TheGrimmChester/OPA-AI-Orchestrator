@@ -346,6 +346,9 @@ func handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleGitHubPATConnect(w http.ResponseWriter, r *http.Request) {
+	if refuseOAMLocalWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
 		return
@@ -512,6 +515,9 @@ func handleConnectorGet(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func handleConnectorPatch(w http.ResponseWriter, r *http.Request, id string) {
+	if refuseOAMLocalWrite(w) {
+		return
+	}
 	c := getOrHydrateConnector(id)
 	if denyConnectorIfImmutable(w, r, c) {
 		return
@@ -548,6 +554,9 @@ func handleConnectorPatch(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func handleConnectorDelete(w http.ResponseWriter, r *http.Request, id string) {
+	if refuseOAMLocalWrite(w) {
+		return
+	}
 	c := getOrHydrateConnector(id)
 	if c == nil && queryClient != nil {
 		// Soft-load metadata for auth before delete (token not required).

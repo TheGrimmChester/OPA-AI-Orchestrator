@@ -94,6 +94,12 @@ func TenantMiddleware(handler http.HandlerFunc, queryClient *ClickHouseQuery) ht
 			return
 		}
 
+		if peerProductConfigured("PEER_OAM_URL") {
+			AddTenantContext(r, ctx)
+			handler(w, r)
+			return
+		}
+
 		query := fmt.Sprintf("SELECT org_id FROM opa.organizations WHERE org_id = '%s' LIMIT 1",
 			opentenant.EscapeSQL(ctx.OrganizationID))
 		rows, err := queryClient.QueryExact(query)

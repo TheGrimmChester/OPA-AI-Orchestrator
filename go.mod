@@ -28,4 +28,4 @@ require (
 // that was never tagged, so resolution cannot proceed on the require line
 // alone. This replace maps that dead version onto a real commit. Drop it once
 // open-client-go is republished requiring a resolvable version.
-replace github.com/TheGrimmChester/open-auth-go => github.com/TheGrimmChester/open-auth-go v0.0.0-20260805140119-f8f106b388fb
+replace github.com/TheGrimmChester/open-auth-go => ../Open-Auth-Go

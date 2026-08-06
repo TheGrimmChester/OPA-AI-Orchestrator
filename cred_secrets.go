@@ -35,6 +35,9 @@ func ensureCredentialScopeColumns() {
 }
 
 func persistSCMSecretScoped(org, proj, scope, userID, logicalKey, plaintext string, deleted bool) error {
+	if err := errOAMCredentialHome(); err != nil {
+		return err
+	}
 	if writer == nil {
 		return nil
 	}
