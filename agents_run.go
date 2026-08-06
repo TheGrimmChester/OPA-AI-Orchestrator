@@ -248,14 +248,24 @@ func enqueuePRRun(wr *opaWatchedRepo, conn *opaConnector, repo string, pr int, s
 }
 
 func planRunChildren(parent *scmJob, prefs agentPrefs, skipBugbot bool, skipBugbotReason string) []*scmJob {
-	kinds := []agentKind{kindPrepare, kindSecurity, kindBugbot, kindApproval}
+	checks := defaultWatchedChecks()
+	if wr, _ := findWatched(parent.RepoFullName); wr != nil {
+		checks = parseWatchedChecks(wr.ChecksJSON)
+	}
+	kinds := []agentKind{kindPrepare}
+	if wantsLegacySecurityScan(checks) || wantsORAReview(checks) {
+		kinds = append(kinds, kindSecurity)
+	}
+	if wantsORAReview(checks) {
+		kinds = append(kinds, kindBugbot)
+	}
 	if prefs.CheckupEnabled {
-		// Insert checkup after bugbot slot (sibling of security/bugbot; before approval).
-		kinds = []agentKind{kindPrepare, kindSecurity, kindBugbot, kindCheckup, kindApproval}
+		kinds = append(kinds, kindCheckup)
+	}
+	if wantsORAReview(checks) {
+		kinds = append(kinds, kindApproval)
 	}
 	cloudOn := prefs.CloudEnabled && prefs.AutofixMode != "" && prefs.AutofixMode != "off"
-	// Always enqueue cloud so approval's cloud dependency is satisfiable. When
-	// cloud is off, the child is skipped immediately (avoids approval stuck forever).
 	kinds = append(kinds, kindCloud)
 	out := make([]*scmJob, 0, len(kinds))
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
@@ -269,6 +279,10 @@ func planRunChildren(parent *scmJob, prefs agentPrefs, skipBugbot bool, skipBugb
 			StartedAt: now, FinishedAt: now, Draft: parent.Draft, Title: parent.Title, Body: parent.Body,
 			ForceAI: parent.ForceAI, AIOnly: parent.AIOnly, ActorUserID: parent.ActorUserID,
 			Kind: string(k), RunID: parent.ID, ParentID: parent.ID, Attempt: parent.Attempt,
+		}
+		if k == kindSecurity && !wantsLegacySecurityScan(checks) {
+			child.Status = "skipped"
+			child.Summary["skip_reason"] = "no legacy AppSec checks on watch policy"
 		}
 		if k == kindBugbot && skipBugbot {
 			child.Status = "skipped"

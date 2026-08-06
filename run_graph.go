@@ -555,7 +555,7 @@ func runSecurityAgent(job *scmJob) error {
 
 	// scmJob label = security child id so cancelSCMJob(teardown opa.job) hits scan boxes;
 	// checkout layout stays under the parent run (relPath already absolute).
-	scanStartErr := runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, profile, scanList, relPath, "", job.RepoFullName, job.PRNumber, job.CommitSHA, job.ID)
+	scanStartErr := runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, profile, scanList, relPath, "", job.RepoFullName, job.ConnectorID, job.PRNumber, job.CommitSHA, job.ID)
 
 	gate := gateAfterScan(job.OrganizationID, runID, minSev, scanStartErr)
 	if job.AIOnly {

@@ -19,13 +19,17 @@ func peerOSAConfig(orgID, scope string) openclient.PeerConfig {
 	return cfg
 }
 
-func peerOSACreateSecurityRun(ctx context.Context, org, proj, service, profile string, scanners []string, targetPath, repo string, pr int, sha, scmJob, runID string) (map[string]interface{}, error) {
+func peerOSACreateSecurityRun(ctx context.Context, org, proj, service, profile string, scanners []string, targetPath, repo, connectorID string, pr int, sha, scmJob, runID string) (map[string]interface{}, error) {
 	cfg := peerOSAConfig(org, "runs:write findings:read")
 	body := map[string]interface{}{
 		"service": service, "profile": profile, "scanners": scanners,
 		"target_path": targetPath, "repo_full_name": repo, "pr_number": pr,
 		"commit_sha": sha, "scm_job_id": scmJob, "security_run_id": runID,
 		"organization_id": org, "project_id": proj,
+	}
+	// OSA refuses repo_full_name without connector_id (clone credentials live there).
+	if id := strings.TrimSpace(connectorID); id != "" {
+		body["connector_id"] = id
 	}
 	var out map[string]interface{}
 	err := openclient.PeerJSON(ctx, cfg, http.MethodPost, "/api/security/runs", body, &out)
@@ -40,13 +44,13 @@ func peerOSAEvaluateGate(ctx context.Context, org, runID, minSev string) (map[st
 	return out, err
 }
 
-func runSecurityScanViaOSA(runID, org, proj, service, profile string, scanners []string, targetPath, repo string, pr int, sha, scmJob string) (bool, error) {
+func runSecurityScanViaOSA(runID, org, proj, service, profile string, scanners []string, targetPath, repo, connectorID string, pr int, sha, scmJob string) (bool, error) {
 	if strings.TrimSpace(os.Getenv("PEER_OSA_URL")) == "" {
 		return false, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	_, err := peerOSACreateSecurityRun(ctx, org, proj, service, profile, scanners, targetPath, repo, pr, sha, scmJob, runID)
+	_, err := peerOSACreateSecurityRun(ctx, org, proj, service, profile, scanners, targetPath, repo, connectorID, pr, sha, scmJob, runID)
 	if err != nil {
 		openlogger.LogWarn("peer OSA security run failed", map[string]interface{}{"error": err.Error(), "security_run_id": runID})
 		return true, err

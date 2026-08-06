@@ -20,6 +20,17 @@ Harness: `OPA-stack/harness/appsec-pr-check.sh`
 
 ## Connect GitHub
 
+Family platform overview (checker fan-out, OAM tenancy, peer contract): [OPA-Stack interop — SCM checker platform](https://github.com/TheGrimmChester/OPA-Stack/blob/main/docs/interop.md#scm-checker-platform).
+
+ORA supports **two webhook ingress modes**. Both feed the same unified pipeline (tenant resolve → SCM envelope → parallel peer fan-out → GitHub status publish). Register connectors and watched repos from **OAM Dashboard**; every connector and watch requires `organization_id` + `project_id`.
+
+| Mode | When to use | Webhook URL | Credential |
+|------|-------------|-------------|------------|
+| **GitHub App** | Production; Check Runs + installation APIs | `{ORA_PUBLIC_URL}/v1/scm/github/webhook` | App installation (OAM-scoped) |
+| **Repository hooks** | No App; PAT-only orgs | `{ORA_PUBLIC_URL}/v1/scm/github/webhook/{connector_id}` | PAT with `admin:repo_hook` (or fine-grained hook scope) |
+
+Repository-hook mode: `PUT /api/connectors/{id}/watched` creates GitHub `POST /repos/{owner}/{repo}/hooks` per enabled watch; disable → delete hook. Per-repo encrypted secret on `watched_repos` (`webhook_mode`: `app` | `repo`).
+
 ### Production — GitHub App
 
 1. Create a GitHub App with:
@@ -30,7 +41,7 @@ Harness: `OPA-stack/harness/appsec-pr-check.sh`
    - **Issues:** read/write (**required** for AI Issues, milestones, roadmap publish, and PR conversation comments)
    - **Organization projects:** read/write — **optional**, only when `roadmap_projects_v2` is enabled
 2. Events: `pull_request`, `push`, `installation`, `installation_repositories`, **`issues`**, **`issue_comment`**, **`label`**. Optionally `projects_v2_item` when Projects v2 is on.
-3. Webhook URL: `$OPA_PUBLIC_URL/v1/scm/github/webhook`
+3. Webhook URL: `$ORA_PUBLIC_URL/v1/scm/github/webhook` (legacy alias: `$OPA_PUBLIC_URL/v1/scm/github/webhook`)
 4. Dashboard: `GET /api/connectors/{id}/permissions` probes installation grants and lists missing keys (Issues write, etc.).
 5. AI Issues / roadmap: see [ai-issues-roadmap.md](ai-issues-roadmap.md). Only Issues labelled `AI` (configurable) are auto-processed.
 4. Agent env:
@@ -84,6 +95,13 @@ $OPA_REVIEW_TMP/                     # default /tmp/opa-review
 Dashboard: **PR Jobs** shows SHA + Worktree path from job summary.
 
 Dashboard: **Security → Repo Watch** → Connect GitHub / PAT bootstrap → select watched repos.
+
+### Repository hooks (no App)
+
+1. Connect a PAT under an OAM org/project (OAM Dashboard → Connectors, or `POST /api/connectors/github/pat`).
+2. Set `webhook_mode` to `repo` on the connector (stored in OAM directory via `POST /api/internal/connectors/sync`).
+3. Enable watches: `PUT /api/connectors/{id}/watched` — ORA registers repo hooks pointing at `{ORA_PUBLIC_URL}/v1/scm/github/webhook/{connector_id}`.
+4. Same peer fan-out as App mode; commit-status fallback when Check Runs are unavailable.
 
 ### Local / smoke — PAT or simulate
 

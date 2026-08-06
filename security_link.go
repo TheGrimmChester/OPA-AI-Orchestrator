@@ -31,9 +31,9 @@ func securityRunIDFromBody(raw []byte) string {
 // Empty peer URL skips local AppSec execution (OSA owns scanners).
 // The returned error reports a failed hand-off so the caller can mark the gate
 // unavailable rather than reading findings from a run that never started.
-func runSecurityScanJob(runID, org, proj, service, profile string, scanners []string, targetPath, image, repo string, pr int, sha, scmJob string) error {
+func runSecurityScanJob(runID, org, proj, service, profile string, scanners []string, targetPath, image, repo, connectorID string, pr int, sha, scmJob string) error {
 	_ = image
-	peered, err := runSecurityScanViaOSA(runID, org, proj, service, profile, scanners, targetPath, repo, pr, sha, scmJob)
+	peered, err := runSecurityScanViaOSA(runID, org, proj, service, profile, scanners, targetPath, repo, connectorID, pr, sha, scmJob)
 	if peered {
 		return err
 	}

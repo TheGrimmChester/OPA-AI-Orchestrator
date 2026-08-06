@@ -57,59 +57,226 @@ func handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
-	if err != nil {
-		http.Error(w, "read error", 400)
-		return
-	}
-	deliveryID := strings.TrimSpace(r.Header.Get("X-GitHub-Delivery"))
-	event := r.Header.Get("X-GitHub-Event")
-	secret := strings.TrimSpace(os.Getenv("OPA_GITHUB_WEBHOOK_SECRET"))
-	sigOK := verifyGitHubSignature(secret, raw, r.Header.Get("X-Hub-Signature-256"))
-	rec := newSCMWebhookReceipt(deliveryID, event, sigOK)
+	ingressGitHubWebhook(w, r, "")
+}
 
-	if !sigOK {
-		finishWebhookReceipt(rec, "error", "Invalid X-Hub-Signature-256 (or webhook secret unset without OPA_SCM_ALLOW_UNSIGNED).", 401, "invalid signature")
-		http.Error(w, "invalid signature", 401)
+func handlePRWebhook(w http.ResponseWriter, raw []byte, rec *scmWebhookReceipt) {
+	handlePRWebhookIngress(w, raw, rec, "", nil)
+}
+
+func handlePRWebhookIngress(w http.ResponseWriter, raw []byte, rec *scmWebhookReceipt, connectorID string, forcedConn *opaConnector) {
+	var payload struct {
+		Action string `json:"action"`
+		Number int    `json:"number"`
+		PR     struct {
+			Number   int    `json:"number"`
+			Title    string `json:"title"`
+			Body     string `json:"body"`
+			Draft    bool   `json:"draft"`
+			State    string `json:"state"`
+			Merged   bool   `json:"merged"`
+			MergedAt string `json:"merged_at"`
+			Head     struct {
+				SHA string `json:"sha"`
+				Ref string `json:"ref"`
+			} `json:"head"`
+		} `json:"pull_request"`
+		Repository struct {
+			FullName string `json:"full_name"`
+		} `json:"repository"`
+		Installation struct {
+			ID int64 `json:"id"`
+		} `json:"installation"`
+	}
+	if json.Unmarshal(raw, &payload) != nil {
+		finishWebhookReceipt(rec, "error", "Failed to parse pull_request JSON body.", 400, "bad json")
+		http.Error(w, "bad json", 400)
 		return
 	}
-	if deliveryID != "" {
-		if prev := findSCMWebhookByDelivery(deliveryID); prev != nil && prev.ID != rec.ID {
-			rec.RepoFullName = prev.RepoFullName
-			rec.Action = prev.Action
-			rec.PRNumber = prev.PRNumber
-			rec.CommitSHA = prev.CommitSHA
-			rec.InstallationID = prev.InstallationID
-			rec.OrganizationID = prev.OrganizationID
-			rec.ProjectID = prev.ProjectID
-			rec.ConnectorID = prev.ConnectorID
-			rec.JobID = prev.JobID
-			finishWebhookReceipt(rec, "duplicate", "Duplicate X-GitHub-Delivery — already processed as "+prev.ID+".", 200, "")
-			writeJSON(w, map[string]interface{}{"ok": true, "duplicate": true, "prior_id": prev.ID})
-			return
+	action := payload.Action
+	pr := payload.PR.Number
+	if pr == 0 {
+		pr = payload.Number
+	}
+	applyWebhookRepoMeta(rec, payload.Repository.FullName, pr, payload.PR.Head.SHA, payload.Installation.ID, action)
+	if scmPRIsMerged(payload.PR.Merged, payload.PR.MergedAt, payload.PR.State) {
+		cancelled := cancelInFlightJobsForMergedPR(payload.Repository.FullName, pr, "pull request merged")
+		msg := "Pull request is already merged — SCM job not queued."
+		if len(cancelled) > 0 {
+			msg = fmt.Sprintf("Pull request merged — cancelled %d in-flight job(s): %s", len(cancelled), strings.Join(cancelled, ", "))
+		}
+		finishWebhookReceipt(rec, "skipped", msg, 200, "")
+		writeJSON(w, map[string]interface{}{
+			"ok": true, "skipped": "merged", "reason": "pull request is already merged",
+			"cancelled_job_ids": cancelled, "webhook_id": rec.ID,
+		})
+		return
+	}
+	if priorID, already := lookupSuccessfulAIReviewForSHA(payload.Repository.FullName, payload.PR.Head.SHA, ""); already {
+		_ = supersedeInFlightPRJobs(payload.Repository.FullName, pr, payload.PR.Head.SHA)
+		finishWebhookReceipt(rec, "skipped", "Commit already had a successful OPA Review — SCM job not queued.", 200, "")
+		writeJSON(w, map[string]interface{}{
+			"ok": true, "skipped": "already_reviewed",
+			"reason": "commit already reviewed successfully", "prior_job_id": priorID,
+			"commit_sha": payload.PR.Head.SHA, "webhook_id": rec.ID,
+		})
+		return
+	}
+	if action != "opened" && action != "synchronize" && action != "reopened" && action != "ready_for_review" {
+		finishWebhookReceipt(rec, "skipped", "PR action '"+action+"' is not actionable (only opened/synchronize/reopened/ready_for_review).", 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "skipped": action, "webhook_id": rec.ID})
+		return
+	}
+	repo := payload.Repository.FullName
+	var wr *opaWatchedRepo
+	var conn *opaConnector
+	if forcedConn != nil {
+		conn = forcedConn
+		wr = findWatchedForConnectorRepo(connectorID, repo)
+	}
+	if wr == nil {
+		wr, conn = findWatched(repo)
+	}
+	inst := ""
+	if payload.Installation.ID != 0 {
+		inst = strconv.FormatInt(payload.Installation.ID, 10)
+	}
+	if inst != "" && githubAppConfigured() && forcedConn == nil {
+		if appConn := ensureGitHubAppConnector(inst, ""); appConn != nil {
+			if wrApp := autoWatchInstalledRepo(appConn, repo); wrApp != nil {
+				wr, conn = wrApp, appConn
+			}
 		}
 	}
-	switch event {
-	case "ping":
-		finishWebhookReceipt(rec, "ping", "GitHub ping acknowledged.", 200, "")
-		writeJSON(w, map[string]interface{}{"ok": true, "pong": true, "webhook_id": rec.ID})
-		return
-	case "pull_request":
-		handlePRWebhook(w, raw, rec)
-	case "push":
-		handlePushWebhook(w, raw, rec)
-	case "installation", "installation_repositories":
-		handleInstallationWebhook(w, event, raw, rec)
-	case "issues":
-		handleIssuesWebhook(w, raw, rec)
-	case "issue_comment":
-		handleIssueCommentWebhook(w, raw, rec)
-	case "label":
-		handleLabelWebhook(w, raw, rec)
-	default:
-		finishWebhookReceipt(rec, "ignored", "Unhandled GitHub event type — no action taken.", 200, "")
-		writeJSON(w, map[string]interface{}{"ok": true, "ignored": event, "webhook_id": rec.ID})
+	if wr == nil {
+		conn = findConnectorByInstallation(inst)
+		if conn != nil {
+			wr = autoWatchInstalledRepo(conn, repo)
+		}
 	}
+	if wr == nil {
+		finishWebhookReceipt(rec, "ignored", "Repo not watched and no GitHub App connector — no job queued.", 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "repo not watched", "repo": repo, "webhook_id": rec.ID})
+		return
+	}
+	if forcedConn != nil {
+		conn = forcedConn
+	}
+	tenant := resolveSCMTenant(wr, conn)
+	rec.OrganizationID = tenant.OrganizationID
+	rec.ProjectID = tenant.ProjectID
+	rec.ConnectorID = nz(rec.ConnectorID, wr.ConnectorID)
+	if scmTenantBlocksJob(tenant) {
+		outcome := "pending_tenant"
+		msg := tenant.Reason
+		if tenant.PendingClaim {
+			outcome = "pending_claim"
+		}
+		finishWebhookReceipt(rec, outcome, msg, 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "skipped": outcome, "reason": msg, "webhook_id": rec.ID})
+		return
+	}
+	checks := parseWatchedChecks(wr.ChecksJSON)
+	if !wantsORAReview(checks) && !wantsLegacySecurityScan(checks) && len(checks) > 0 {
+		env := buildSCMEventEnvelope(rec, nil, wr, raw, "pull_request")
+		dispatchSCMCheckers(conn, env, checks, raw)
+		finishWebhookReceipt(rec, "ok", "Peer checker fan-out only (no ora:review).", 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "peer_only": true, "webhook_id": rec.ID})
+		return
+	}
+	job := enqueuePRRun(wr, conn, repo, pr, payload.PR.Head.SHA, "pull_request."+action, payload.PR.Draft, payload.PR.Title, payload.PR.Body)
+	stampSCMJobTenant(job, tenant)
+	rec.JobID = job.ID
+	rec.OrganizationID = job.OrganizationID
+	rec.ProjectID = job.ProjectID
+	rec.ConnectorID = job.ConnectorID
+	if job.Summary != nil {
+		if sid, _ := job.Summary["stack_id"].(string); sid != "" {
+			rec.StackID = sid
+		}
+	}
+	finishWebhookReceipt(rec, "queued", "PR job queued.", 200, "")
+	finishSCMIngressPipeline(w, rec, job, wr, conn, raw, "pull_request", true)
+}
+
+func handlePushWebhook(w http.ResponseWriter, raw []byte, rec *scmWebhookReceipt) {
+	handlePushWebhookIngress(w, raw, rec, "", nil)
+}
+
+func handlePushWebhookIngress(w http.ResponseWriter, raw []byte, rec *scmWebhookReceipt, connectorID string, forcedConn *opaConnector) {
+	var payload struct {
+		Ref        string `json:"ref"`
+		After      string `json:"after"`
+		Repository struct {
+			FullName      string `json:"full_name"`
+			DefaultBranch string `json:"default_branch"`
+		} `json:"repository"`
+		Installation struct {
+			ID int64 `json:"id"`
+		} `json:"installation"`
+	}
+	if json.Unmarshal(raw, &payload) != nil {
+		finishWebhookReceipt(rec, "error", "Failed to parse push JSON body.", 400, "bad json")
+		http.Error(w, "bad json", 400)
+		return
+	}
+	applyWebhookRepoMeta(rec, payload.Repository.FullName, 0, payload.After, payload.Installation.ID, "push")
+	def := nz(payload.Repository.DefaultBranch, "main")
+	if payload.Ref != "refs/heads/"+def {
+		rec.Action = "non_default"
+		finishWebhookReceipt(rec, "skipped", "Push to non-default branch ("+payload.Ref+") — ignored.", 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "not default branch", "webhook_id": rec.ID})
+		return
+	}
+	rec.Action = "default"
+	repo := payload.Repository.FullName
+	var wr *opaWatchedRepo
+	var conn *opaConnector
+	if forcedConn != nil {
+		conn = forcedConn
+		wr = findWatchedForConnectorRepo(connectorID, repo)
+	}
+	if wr == nil {
+		wr, conn = findWatched(repo)
+	}
+	if wr == nil {
+		finishWebhookReceipt(rec, "ignored", "Repo not watched — no job queued.", 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "repo not watched", "webhook_id": rec.ID})
+		return
+	}
+	if forcedConn != nil {
+		conn = forcedConn
+	}
+	tenant := resolveSCMTenant(wr, conn)
+	rec.OrganizationID = tenant.OrganizationID
+	rec.ProjectID = tenant.ProjectID
+	rec.ConnectorID = nz(rec.ConnectorID, wr.ConnectorID)
+	if scmTenantBlocksJob(tenant) {
+		outcome := "pending_tenant"
+		msg := tenant.Reason
+		if tenant.PendingClaim {
+			outcome = "pending_claim"
+		}
+		finishWebhookReceipt(rec, outcome, msg, 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "skipped": outcome, "reason": msg, "webhook_id": rec.ID})
+		return
+	}
+	checks := parseWatchedChecks(wr.ChecksJSON)
+	if !wantsLegacySecurityScan(checks) && !wantsORAReview(checks) {
+		env := buildSCMEventEnvelope(rec, nil, wr, raw, "push")
+		dispatchSCMCheckers(conn, env, checks, raw)
+		finishWebhookReceipt(rec, "ok", "Peer checker fan-out only (no native push scan).", 200, "")
+		writeJSON(w, map[string]interface{}{"ok": true, "peer_only": true, "webhook_id": rec.ID})
+		return
+	}
+	job := enqueueSCMJob(wr, conn, repo, 0, payload.After, "push.default", false, "default-branch scan", "")
+	stampSCMJobTenant(job, tenant)
+	rec.JobID = job.ID
+	rec.OrganizationID = job.OrganizationID
+	rec.ProjectID = job.ProjectID
+	rec.ConnectorID = job.ConnectorID
+	finishWebhookReceipt(rec, "queued", "Default-branch push job queued.", 200, "")
+	finishSCMIngressPipeline(w, rec, job, wr, conn, raw, "push", true)
 }
 
 func handleInstallationWebhook(w http.ResponseWriter, event string, raw []byte, rec *scmWebhookReceipt) {
@@ -161,7 +328,6 @@ func handleInstallationWebhook(w http.ResponseWriter, event string, raw []byte, 
 		writeJSON(w, map[string]interface{}{"ok": true, "ignored": event, "action": action, "webhook_id": rec.ID})
 		return
 	case "removed":
-		// repositories_removed — disable matching watches on this installation connector.
 		conn := findConnectorByInstallation(inst)
 		disabled := 0
 		if conn != nil {
@@ -182,7 +348,6 @@ func handleInstallationWebhook(w http.ResponseWriter, event string, raw []byte, 
 		return
 	}
 
-	// created / added / unsuspend / new_permissions_accepted — provision + auto-watch.
 	conn := ensureGitHubAppConnector(inst, payload.Installation.Account.Login)
 	watched := []string{}
 	if conn != nil {
@@ -207,153 +372,6 @@ func handleInstallationWebhook(w http.ResponseWriter, event string, raw []byte, 
 		}(),
 		"webhook_id": rec.ID,
 	})
-}
-
-func handlePRWebhook(w http.ResponseWriter, raw []byte, rec *scmWebhookReceipt) {
-	var payload struct {
-		Action string `json:"action"`
-		Number int    `json:"number"`
-		PR     struct {
-			Number   int    `json:"number"`
-			Title    string `json:"title"`
-			Body     string `json:"body"`
-			Draft    bool   `json:"draft"`
-			State    string `json:"state"`
-			Merged   bool   `json:"merged"`
-			MergedAt string `json:"merged_at"`
-			Head     struct {
-				SHA string `json:"sha"`
-				Ref string `json:"ref"`
-			} `json:"head"`
-		} `json:"pull_request"`
-		Repository struct {
-			FullName string `json:"full_name"`
-		} `json:"repository"`
-		Installation struct {
-			ID int64 `json:"id"`
-		} `json:"installation"`
-	}
-	if json.Unmarshal(raw, &payload) != nil {
-		finishWebhookReceipt(rec, "error", "Failed to parse pull_request JSON body.", 400, "bad json")
-		http.Error(w, "bad json", 400)
-		return
-	}
-	action := payload.Action
-	pr := payload.PR.Number
-	if pr == 0 {
-		pr = payload.Number
-	}
-	applyWebhookRepoMeta(rec, payload.Repository.FullName, pr, payload.PR.Head.SHA, payload.Installation.ID, action)
-	if scmPRIsMerged(payload.PR.Merged, payload.PR.MergedAt, payload.PR.State) {
-		cancelled := cancelInFlightJobsForMergedPR(payload.Repository.FullName, pr, "pull request merged")
-		msg := "Pull request is already merged — SCM job not queued."
-		if len(cancelled) > 0 {
-			msg = fmt.Sprintf("Pull request merged — cancelled %d in-flight job(s): %s", len(cancelled), strings.Join(cancelled, ", "))
-		}
-		finishWebhookReceipt(rec, "skipped", msg, 200, "")
-		writeJSON(w, map[string]interface{}{
-			"ok": true, "skipped": "merged", "reason": "pull request is already merged",
-			"cancelled_job_ids": cancelled, "webhook_id": rec.ID,
-		})
-		return
-	}
-	if priorID, already := lookupSuccessfulAIReviewForSHA(payload.Repository.FullName, payload.PR.Head.SHA, ""); already {
-		// Head is already reviewed — drop any stale in-flight work for older commits.
-		_ = supersedeInFlightPRJobs(payload.Repository.FullName, pr, payload.PR.Head.SHA)
-		finishWebhookReceipt(rec, "skipped", "Commit already had a successful OPA Review — SCM job not queued.", 200, "")
-		writeJSON(w, map[string]interface{}{
-			"ok": true, "skipped": "already_reviewed",
-			"reason": "commit already reviewed successfully", "prior_job_id": priorID,
-			"commit_sha": payload.PR.Head.SHA, "webhook_id": rec.ID,
-		})
-		return
-	}
-	if action != "opened" && action != "synchronize" && action != "reopened" && action != "ready_for_review" {
-		finishWebhookReceipt(rec, "skipped", "PR action '"+action+"' is not actionable (only opened/synchronize/reopened/ready_for_review).", 200, "")
-		writeJSON(w, map[string]interface{}{"ok": true, "skipped": action, "webhook_id": rec.ID})
-		return
-	}
-	repo := payload.Repository.FullName
-	wr, conn := findWatched(repo)
-	inst := ""
-	if payload.Installation.ID != 0 {
-		inst = strconv.FormatInt(payload.Installation.ID, 10)
-	}
-	// Prefer / provision GitHub App connector so Check Runs post as the bot.
-	if inst != "" && githubAppConfigured() {
-		if appConn := ensureGitHubAppConnector(inst, ""); appConn != nil {
-			if wrApp := autoWatchInstalledRepo(appConn, repo); wrApp != nil {
-				wr, conn = wrApp, appConn
-			}
-		}
-	}
-	if wr == nil {
-		conn = findConnectorByInstallation(inst)
-		if conn != nil {
-			wr = autoWatchInstalledRepo(conn, repo)
-		}
-	}
-	if wr == nil {
-		finishWebhookReceipt(rec, "ignored", "Repo not watched and no GitHub App connector — no job queued.", 200, "")
-		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "repo not watched", "repo": repo, "webhook_id": rec.ID})
-		return
-	}
-	job := enqueuePRRun(wr, conn, repo, pr, payload.PR.Head.SHA, "pull_request."+action, payload.PR.Draft, payload.PR.Title, payload.PR.Body)
-	rec.JobID = job.ID
-	rec.OrganizationID = job.OrganizationID
-	rec.ProjectID = job.ProjectID
-	rec.ConnectorID = job.ConnectorID
-	if job.Summary != nil {
-		if sid, _ := job.Summary["stack_id"].(string); sid != "" {
-			rec.StackID = sid
-		}
-	}
-	finishWebhookReceipt(rec, "queued", "PR job queued.", 200, "")
-	go processSCMJob(job.ID)
-	writeJSON(w, map[string]interface{}{"ok": true, "job_id": job.ID, "status": "queued", "webhook_id": rec.ID})
-}
-
-func handlePushWebhook(w http.ResponseWriter, raw []byte, rec *scmWebhookReceipt) {
-	var payload struct {
-		Ref        string `json:"ref"`
-		After      string `json:"after"`
-		Repository struct {
-			FullName      string `json:"full_name"`
-			DefaultBranch string `json:"default_branch"`
-		} `json:"repository"`
-		Installation struct {
-			ID int64 `json:"id"`
-		} `json:"installation"`
-	}
-	if json.Unmarshal(raw, &payload) != nil {
-		finishWebhookReceipt(rec, "error", "Failed to parse push JSON body.", 400, "bad json")
-		http.Error(w, "bad json", 400)
-		return
-	}
-	applyWebhookRepoMeta(rec, payload.Repository.FullName, 0, payload.After, payload.Installation.ID, "push")
-	def := nz(payload.Repository.DefaultBranch, "main")
-	if payload.Ref != "refs/heads/"+def {
-		rec.Action = "non_default"
-		finishWebhookReceipt(rec, "skipped", "Push to non-default branch ("+payload.Ref+") — ignored.", 200, "")
-		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "not default branch", "webhook_id": rec.ID})
-		return
-	}
-	rec.Action = "default"
-	repo := payload.Repository.FullName
-	wr, conn := findWatched(repo)
-	if wr == nil {
-		finishWebhookReceipt(rec, "ignored", "Repo not watched — no job queued.", 200, "")
-		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "repo not watched", "webhook_id": rec.ID})
-		return
-	}
-	job := enqueueSCMJob(wr, conn, repo, 0, payload.After, "push.default", false, "default-branch scan", "")
-	rec.JobID = job.ID
-	rec.OrganizationID = job.OrganizationID
-	rec.ProjectID = job.ProjectID
-	rec.ConnectorID = job.ConnectorID
-	finishWebhookReceipt(rec, "queued", "Default-branch push job queued.", 200, "")
-	go processSCMJob(job.ID)
-	writeJSON(w, map[string]interface{}{"ok": true, "job_id": job.ID, "webhook_id": rec.ID})
 }
 
 func findConnectorByInstallation(inst string) *opaConnector {
@@ -1720,11 +1738,11 @@ func processContinuousSCMJob(jobID string) {
 
 	var scanStartErr error
 	if !job.AIOnly {
-		scanStartErr = runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, profile, scanList, relPath, "", job.RepoFullName, job.PRNumber, job.CommitSHA, job.ID)
+		scanStartErr = runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, profile, scanList, relPath, "", job.RepoFullName, job.ConnectorID, job.PRNumber, job.CommitSHA, job.ID)
 	} else {
 		job.Summary["ai_only"] = true
 		// Seed an empty security run so AI context still has a run id.
-		scanStartErr = runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, "auto", []string{}, relPath, "", job.RepoFullName, job.PRNumber, job.CommitSHA, job.ID)
+		scanStartErr = runSecurityScanJob(runID, job.OrganizationID, job.ProjectID, service, "auto", []string{}, relPath, "", job.RepoFullName, job.ConnectorID, job.PRNumber, job.CommitSHA, job.ID)
 	}
 	if finishIfCancelled() {
 		if appSecID != 0 {

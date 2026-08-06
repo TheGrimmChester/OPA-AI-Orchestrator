@@ -9,7 +9,10 @@
 | `OPEN_SERVICE_JWT_SECRET` | Service JWT mint/validate secret |
 | `CLICKHOUSE_URL` | ClickHouse HTTP endpoint |
 | `CLICKHOUSE_DB` | Product database (default `ora`). Alias: `CLICKHOUSE_DATABASE` |
-| `PEER_OSA_URL` | OSA base URL (AppSec runs + gate) |
+| `PEER_OSA_URL` | OSA base URL (AppSec runs + gate + SCM checker fan-out target) |
+| `PEER_OAM_URL` | OAM base URL (connector directory sync via `POST /api/internal/connectors/sync`) |
+| `PEER_OPL_URL` | OPL base URL (SCM checker fan-out) |
+| `PEER_OPM_URL` | OPM base URL (SCM checker fan-out) |
 | `PEER_OPA_URL` | Optional OPA hub base URL (also selects co-deployed auth when set) |
 | `ORA_PUBLIC_URL` | Public URL for this product |
 | `OPA_GITHUB_APP_ID` | GitHub App id |

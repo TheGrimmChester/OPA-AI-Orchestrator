@@ -36,6 +36,7 @@ func registerRepoWatchMux(mux *http.ServeMux, authView, authAdmin func(string, h
 	authView("/api/scm/settings", handleSCMSettings)
 	authAdmin("/api/scm/settings/cursor-key", handleCursorKeySet)
 	mux.HandleFunc("/v1/scm/github/webhook", handleGitHubWebhook)
+	mux.HandleFunc("/v1/scm/github/webhook/", handleGitHubWebhookByConnector)
 	authAdmin("/api/scm/simulate", handleSCMSimulate)
 	authAdmin("/api/scm/ai-review", handleSCMAIReview)
 	authAdmin("/api/scm/opa-review", handleSCMAIReview) // alias
@@ -136,6 +137,9 @@ type opaWatchedRepo struct {
 	// agent prefs AutoApprove plus the evidence conjunction.
 	AutoApproveMinScore int    `json:"auto_approve_min_score"`
 	LinkGroupID         string `json:"link_group_id"`
+	GithubHookID        int64  `json:"github_hook_id"`
+	WebhookSecretRef    string `json:"-"`
+	WebhookMode         string `json:"webhook_mode"` // app | repo
 	UpdatedAt           string `json:"updated_at"`
 }
 
@@ -221,6 +225,7 @@ func connectorPublic(c *opaConnector) map[string]interface{} {
 		"account_login": c.AccountLogin, "status": c.Status,
 		"organization_id": c.OrganizationID, "project_id": c.ProjectID,
 		"scope": scope, "user_id": c.UserID,
+		"webhook_mode": connectorWebhookMode(c),
 		"meta_json": c.MetaJSON, "display_name": display,
 		"created_at": c.CreatedAt, "updated_at": c.UpdatedAt,
 		"has_token": c.TokenRef != "",
@@ -271,32 +276,68 @@ func handleGitHubInstallURL(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	a := actorFromRequest(r)
+	ctx, _ := ExtractTenantContext(r, queryClient)
+	org, proj := ctx.WriteTenant()
+	if a.OrganizationID != "" {
+		org, proj = a.OrganizationID, nz(a.ProjectID, proj)
+	}
+	state := ""
+	stateNote := ""
+	if org != "" {
+		if s, err := mintGitHubInstallState(org, proj, a.Username); err == nil {
+			state = s
+		} else {
+			stateNote = err.Error()
+		}
+	}
 	url := fmt.Sprintf("https://github.com/apps/%s/installations/new", nz(appSlug, "opa-repo-watch"))
+	if state != "" {
+		url += "?state=" + state
+	}
 	if cid := strings.TrimSpace(os.Getenv("OPA_GITHUB_APP_CLIENT_ID")); cid != "" {
-		url = fmt.Sprintf("https://github.com/login/oauth/authorize?client_id=%s&state=opa-scm", cid)
+		url = fmt.Sprintf("https://github.com/login/oauth/authorize?client_id=%s", cid)
+		if state != "" {
+			url += "&state=" + state
+		}
 	}
 	writeJSON(w, map[string]interface{}{
 		"ok": true, "configured": true, "install_url": url,
 		"webhook_url":  public + "/v1/scm/github/webhook",
 		"callback_url": public + "/api/connectors/github/callback",
+		"organization_id": org, "project_id": proj,
+		"state_signed": state != "", "state_note": stateNote,
 	})
 }
 
 func handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 	inst := strings.TrimSpace(r.URL.Query().Get("installation_id"))
 	setup := strings.TrimSpace(r.URL.Query().Get("setup_action"))
+	stateRaw := strings.TrimSpace(r.URL.Query().Get("state"))
 	if inst == "" {
 		http.Error(w, "installation_id required", 400)
 		return
 	}
-	ctx, _ := ExtractTenantContext(r, queryClient)
-	org, proj := ctx.WriteTenant()
-	id := loadID("conn", org, proj, "github_app", inst)
+	org, proj, userID, status := "", "", "", "active"
+	if stateRaw != "" {
+		if st, err := parseGitHubInstallState(stateRaw); err == nil && st != nil {
+			org, proj, userID = st.OrganizationID, st.ProjectID, st.UserID
+		}
+	}
+	if org == "" {
+		status = "pending_claim"
+	}
+	id := loadID("conn", nz(org, "pending"), nz(proj, "pending"), "github_app", inst)
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	meta := map[string]interface{}{"setup_action": setup}
+	if status == "pending_claim" {
+		meta["pending_claim"] = true
+	}
+	metaJSON, _ := json.Marshal(meta)
 	c := &opaConnector{
-		ID: id, OrganizationID: org, ProjectID: proj, Scope: credScopeOrg, UserID: "",
-		Kind: "github_app", InstallationID: inst, AccountLogin: "", Status: "active",
-		MetaJSON: fmt.Sprintf(`{"setup_action":%q}`, setup), CreatedAt: now, UpdatedAt: now,
+		ID: id, OrganizationID: org, ProjectID: proj, Scope: credScopeOrg, UserID: userID,
+		Kind: "github_app", InstallationID: inst, AccountLogin: "", Status: status,
+		MetaJSON: string(metaJSON), CreatedAt: now, UpdatedAt: now,
 	}
 	connectorLive.Store(id, c)
 	persistConnector(c)
@@ -723,7 +764,9 @@ func watchedFromCHRow(row map[string]interface{}) *opaWatchedRepo {
 		Enabled: enabled, ServiceName: str("service_name"), Profile: nz(str("profile"), "auto"),
 		ChecksJSON: nz(str("checks_json"), "[]"), MinSeverity: nz(str("min_severity"), "high"),
 		AIBlocking: ai, AutoRequestReviewer: autoReq, AutoApproveMinScore: minScore,
-		LinkGroupID: str("link_group_id"), UpdatedAt: str("updated_at"),
+		LinkGroupID: str("link_group_id"),
+		GithubHookID: watchedHookIDFromRow(row), WebhookSecretRef: str("webhook_secret_ref"),
+		WebhookMode: nz(str("webhook_mode"), "app"), UpdatedAt: str("updated_at"),
 	}
 }
 
@@ -776,22 +819,9 @@ func handleWatchedPut(w http.ResponseWriter, r *http.Request, connectorID string
 		return
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 2<<20))
-	var body struct {
-		Repos []struct {
-			RepoFullName          string   `json:"repo_full_name"`
-			RepoID                string   `json:"repo_id"`
-			Enabled               *bool    `json:"enabled"`
-			ServiceName           string   `json:"service_name"`
-			Profile               string   `json:"profile"`
-			Checks                []string `json:"checks"`
-			MinSeverity           string   `json:"min_severity"`
-			AIBlocking            bool     `json:"ai_blocking"`
-			AutoRequestReviewer   bool     `json:"auto_request_reviewer"`
-			AutoApproveMinScore   int      `json:"auto_approve_min_score"`
-		} `json:"repos"`
-	}
-	if json.Unmarshal(raw, &body) != nil {
-		http.Error(w, "bad json", 400)
+	items, err := parseWatchedPutItems(raw)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
 		return
 	}
 	org, proj := c.OrganizationID, c.ProjectID
@@ -800,7 +830,7 @@ func handleWatchedPut(w http.ResponseWriter, r *http.Request, connectorID string
 		org, proj = ctx.WriteTenant()
 	}
 	saved := []opaWatchedRepo{}
-	for _, item := range body.Repos {
+	for _, item := range items {
 		repo := strings.TrimSpace(item.RepoFullName)
 		if repo == "" {
 			continue
@@ -825,13 +855,133 @@ func handleWatchedPut(w http.ResponseWriter, r *http.Request, connectorID string
 			wr.ServiceName = item.ServiceName
 			persistWatched(wr)
 		}
+		if c.Kind == "github_pat" {
+			if err := syncWatchedRepoWebhook(c, wr, en); err != nil {
+				log.Printf("[WARN] watched repo webhook sync %s: %v", repo, err)
+			}
+		}
 		saved = append(saved, *wr)
 	}
 	writeJSON(w, map[string]interface{}{"ok": true, "watched": saved})
 }
 
+type watchedPutItem struct {
+	RepoFullName        string
+	RepoID              string
+	Enabled             *bool
+	ServiceName         string
+	Profile             string
+	Checks              []string
+	MinSeverity         string
+	AIBlocking          bool
+	AutoRequestReviewer bool
+	AutoApproveMinScore int
+}
+
+func parseWatchedPutItems(raw []byte) ([]watchedPutItem, error) {
+	var body struct {
+		Repos   []json.RawMessage `json:"repos"`
+		Watched []json.RawMessage `json:"watched"`
+	}
+	if json.Unmarshal(raw, &body) != nil {
+		return nil, fmt.Errorf("bad json")
+	}
+	entries := body.Repos
+	if len(entries) == 0 {
+		entries = body.Watched
+	}
+	out := make([]watchedPutItem, 0, len(entries))
+	for _, entryRaw := range entries {
+		item, err := watchedPutItemFromRaw(entryRaw)
+		if err != nil {
+			return nil, err
+		}
+		if item.RepoFullName != "" {
+			out = append(out, item)
+		}
+	}
+	return out, nil
+}
+
+func watchedPutItemFromRaw(raw json.RawMessage) (watchedPutItem, error) {
+	var item watchedPutItem
+	var row map[string]interface{}
+	if json.Unmarshal(raw, &row) != nil {
+		return item, fmt.Errorf("bad json")
+	}
+	strField := func(keys ...string) string {
+		for _, k := range keys {
+			if v, ok := row[k]; ok {
+				if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+					return strings.TrimSpace(s)
+				}
+			}
+		}
+		return ""
+	}
+	item.RepoFullName = strField("repo_full_name", "repo")
+	item.RepoID = strField("repo_id")
+	item.ServiceName = strField("service_name")
+	item.Profile = strField("profile")
+	item.MinSeverity = strField("min_severity")
+	if v, ok := row["enabled"].(bool); ok {
+		item.Enabled = &v
+	}
+	if v, ok := row["ai_blocking"].(bool); ok {
+		item.AIBlocking = v
+	}
+	if v, ok := row["auto_request_reviewer"].(bool); ok {
+		item.AutoRequestReviewer = v
+	}
+	if v, ok := row["auto_approve_min_score"].(float64); ok {
+		item.AutoApproveMinScore = int(v)
+	}
+	item.Checks = parseChecksField(row["checks"])
+	if len(item.Checks) == 0 {
+		item.Checks = parseChecksField(row["checks_json"])
+	}
+	return item, nil
+}
+
+func parseChecksField(v interface{}) []string {
+	switch t := v.(type) {
+	case nil:
+		return nil
+	case []interface{}:
+		out := make([]string, 0, len(t))
+		for _, x := range t {
+			if s, ok := x.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		return out
+	case []string:
+		return t
+	case string:
+		raw := strings.TrimSpace(t)
+		if raw == "" {
+			return nil
+		}
+		var checks []string
+		if json.Unmarshal([]byte(raw), &checks) == nil {
+			return checks
+		}
+	}
+	return nil
+}
+
 func defaultWatchedChecks() []string {
-	return []string{"secrets", "sast", "iac", "sbom", "ai_review"}
+	checks := []string{"ora:review"}
+	if peerProductConfigured("PEER_OSA_URL") {
+		checks = append(checks, "osa:dependencies")
+	}
+	if peerProductConfigured("PEER_OPL_URL") {
+		checks = append(checks, "opl:perf-gate")
+	}
+	if peerProductConfigured("PEER_OPM_URL") {
+		checks = append(checks, "opm:delivery")
+	}
+	return checks
 }
 
 func upsertWatched(org, proj, connectorID, repo, repoID string, enabled bool, checks []string, profile, minSev string, aiBlock, autoRequest bool, minScore int) *opaWatchedRepo {
@@ -857,7 +1007,16 @@ func upsertWatched(org, proj, connectorID, repo, repoID string, enabled bool, ch
 		Profile: profile, ChecksJSON: string(checksJSON),
 		MinSeverity: minSev, AIBlocking: aiBlock,
 		AutoRequestReviewer: autoRequest, AutoApproveMinScore: minScore,
-		LinkGroupID: prevGroup, UpdatedAt: now,
+		LinkGroupID: prevGroup, WebhookMode: "app", UpdatedAt: now,
+	}
+	if v, ok := watchedLive.Load(connectorID + "|" + repo); ok {
+		if old, ok := v.(*opaWatchedRepo); ok {
+			wr.GithubHookID = old.GithubHookID
+			wr.WebhookSecretRef = old.WebhookSecretRef
+			if old.WebhookMode != "" {
+				wr.WebhookMode = old.WebhookMode
+			}
+		}
 	}
 	watchedLive.Store(connectorID+"|"+repo, wr)
 	persistWatched(wr)
@@ -1092,7 +1251,7 @@ func preferWatchedForChecks(cands []*opaWatchedRepo) *opaWatchedRepo {
 }
 
 // ensureGitHubAppConnector creates or returns the connector for an installation.
-// Used by install webhooks and PR auto-watch so every installed repo can be checked.
+// When org is unknown, status=pending_claim — no silent default-org fallback.
 func ensureGitHubAppConnector(installationID, accountLogin string) *opaConnector {
 	inst := strings.TrimSpace(installationID)
 	if inst == "" || !githubAppConfigured() {
@@ -1106,33 +1265,16 @@ func ensureGitHubAppConnector(installationID, accountLogin string) *opaConnector
 		}
 		return c
 	}
-	org, proj := "default-org", "default-project"
-	connectorLive.Range(func(_, v interface{}) bool {
-		c, ok := v.(*opaConnector)
-		if !ok || c.Status == "deleted" {
-			return true
-		}
-		if c.Kind == "github_app" || c.Kind == "github_pat" {
-			if c.OrganizationID != "" {
-				org = c.OrganizationID
-			}
-			if c.ProjectID != "" {
-				proj = c.ProjectID
-			}
-			return false
-		}
-		return true
-	})
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
-	id := loadID("conn", org, proj, "github_app", inst)
+	id := loadID("conn", "pending", "pending", "github_app", inst)
 	c := &opaConnector{
-		ID: id, OrganizationID: org, ProjectID: proj, Scope: credScopeOrg, UserID: "",
-		Kind: "github_app", InstallationID: inst, AccountLogin: accountLogin, Status: "active",
-		MetaJSON: `{"auto_provisioned":true}`, CreatedAt: now, UpdatedAt: now,
+		ID: id, OrganizationID: "", ProjectID: "", Scope: credScopeOrg, UserID: "",
+		Kind: "github_app", InstallationID: inst, AccountLogin: accountLogin, Status: "pending_claim",
+		MetaJSON: `{"auto_provisioned":true,"pending_claim":true}`, CreatedAt: now, UpdatedAt: now,
 	}
 	connectorLive.Store(id, c)
 	persistConnector(c)
-	log.Printf("[INFO] provisioned github_app connector %s installation=%s account=%s", id, inst, accountLogin)
+	log.Printf("[INFO] provisioned github_app connector %s installation=%s account=%s status=pending_claim", id, inst, accountLogin)
 	return c
 }
 
@@ -1176,13 +1318,13 @@ func autoWatchInstalledRepo(c *opaConnector, repo string) *opaWatchedRepo {
 	})
 	hasAI := false
 	for _, ch := range checks {
-		if ch == "ai_review" {
+		if ch == "ai_review" || ch == "ora:review" {
 			hasAI = true
 			break
 		}
 	}
 	if !hasAI {
-		checks = append(checks, "ai_review")
+		checks = append(checks, "ora:review")
 	}
 	wr := upsertWatched(c.OrganizationID, c.ProjectID, c.ID, repo, "", true, checks, "auto", minSev, false, autoReq, minScore)
 	log.Printf("[INFO] auto-watched %s on connector %s (checks=%v)", repo, c.ID, checks)
@@ -1190,7 +1332,11 @@ func autoWatchInstalledRepo(c *opaConnector, repo string) *opaWatchedRepo {
 }
 
 func persistConnector(c *opaConnector) {
-	if writer == nil || c == nil {
+	if c == nil {
+		return
+	}
+	syncConnectorToOAM(c)
+	if writer == nil {
 		return
 	}
 	tokenRef := ""
@@ -1245,7 +1391,9 @@ func persistWatched(wr *opaWatchedRepo) {
 		"enabled": en, "service_name": wr.ServiceName, "profile": wr.Profile,
 		"checks_json": wr.ChecksJSON, "min_severity": wr.MinSeverity, "ai_blocking": ai,
 		"auto_request_reviewer": autoReq, "auto_approve_min_score": minScore,
-		"link_group_id": wr.LinkGroupID, "updated_at": wr.UpdatedAt,
+		"link_group_id": wr.LinkGroupID, "github_hook_id": wr.GithubHookID,
+		"webhook_secret_ref": wr.WebhookSecretRef, "webhook_mode": nz(wr.WebhookMode, "app"),
+		"updated_at": wr.UpdatedAt,
 	})
 	writer.insertAsync("watched_repos", append(payload, '\n'))
 }
@@ -1391,6 +1539,7 @@ func hydrateSCMOnBoot() {
 	}
 	ensureCredentialScopeColumns()
 	ensureWatchedRepoReviewColumns()
+	ensureWatchedRepoWebhookColumns()
 	ensureAgentsTables()
 	nBackfill := backfillLegacyTablesOnBoot()
 	n := 0
