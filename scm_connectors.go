@@ -334,47 +334,150 @@ func handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "installation_id required", 400)
 		return
 	}
-	org, proj, userID, status := "", "", "", "active"
+	org, proj, userID := "", "", ""
 	if stateRaw != "" {
 		if st, err := parseGitHubInstallState(stateRaw); err == nil && st != nil {
 			org, proj, userID = st.OrganizationID, st.ProjectID, st.UserID
 		}
 	}
-	claimRaw, claimHash := "", ""
-	if org == "" {
-		status = "pending_claim"
-		raw, hash, err := mintConnectorClaimNonce()
-		if err != nil {
-			http.Error(w, "claim nonce unavailable", 500)
-			return
-		}
-		claimRaw, claimHash = raw, hash
+	org = strings.TrimSpace(org)
+	proj = strings.TrimSpace(proj)
+	userID = strings.TrimSpace(userID)
+	if proj == "" || proj == tenantAll {
+		proj = defaultProjectID
 	}
-	id := loadID("conn", nz(org, "pending"), nz(proj, "pending"), "github_app", inst)
-	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
-	meta := map[string]interface{}{"setup_action": setup}
-	if status == "pending_claim" {
-		meta["pending_claim"] = true
-		if claimHash != "" {
-			meta["claim_nonce_hash"] = claimHash
-		}
-	}
-	metaJSON, _ := json.Marshal(meta)
-	c := &opaConnector{
-		ID: id, OrganizationID: org, ProjectID: proj, Scope: credScopeOrg, UserID: userID,
-		Kind: "github_app", InstallationID: inst, AccountLogin: "", Status: status,
-		MetaJSON: string(metaJSON), CreatedAt: now, UpdatedAt: now,
-	}
-	connectorLive.Store(id, c)
-	persistConnector(c)
+
 	dash := strings.TrimRight(envOr("OPA_DASHBOARD_URL", "http://127.0.0.1:8088"), "/")
-	// Put claim_token in the URL fragment so it is not sent as a Referer query
-	// param to third parties. Dashboards also accept ?claim_token= for older links.
-	loc := dash + "/settings/connectors?connector=" + url.QueryEscape(id)
-	if claimRaw != "" {
-		loc += "#claim_token=" + url.QueryEscape(claimRaw)
+	redirectConnectors := func(connectorID, claimRaw string) {
+		loc := dash + "/settings/connectors"
+		if connectorID != "" {
+			loc += "?connector=" + url.QueryEscape(connectorID)
+		}
+		if claimRaw != "" {
+			// Fragment so claim_token is not sent as a Referer query param.
+			loc += "#claim_token=" + url.QueryEscape(claimRaw)
+		}
+		http.Redirect(w, r, loc, http.StatusFound)
 	}
-	http.Redirect(w, r, loc, http.StatusFound)
+
+	connectorClaimMu.Lock()
+	defer connectorClaimMu.Unlock()
+
+	existing := findConnectorByInstallation(inst)
+	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+
+	// Already bound: never reset via unauthenticated callback (takeover vector).
+	if existing != nil && strings.EqualFold(strings.TrimSpace(existing.Status), "active") {
+		softDeleteOtherInstallConnectors(existing.ID, inst)
+		id := ""
+		if org != "" && existing.OrganizationID == org {
+			id = existing.ID
+		}
+		redirectConnectors(id, "")
+		return
+	}
+
+	// Signed install state → bind (or activate an existing pending) into that org.
+	if org != "" {
+		var c *opaConnector
+		if existing != nil && strings.EqualFold(strings.TrimSpace(existing.Status), "pending_claim") {
+			c = existing
+		} else {
+			id := loadID("conn", org, proj, "github_app", inst)
+			c = &opaConnector{
+				ID: id, Kind: "github_app", InstallationID: inst,
+				Scope: credScopeOrg, CreatedAt: now,
+			}
+		}
+		meta := parseConnectorMeta(c.MetaJSON)
+		delete(meta, "pending_claim")
+		delete(meta, "claim_nonce_hash")
+		meta["setup_action"] = setup
+		meta["bound_via"] = "install_state"
+		meta["bound_at"] = now
+		if userID != "" {
+			meta["bound_by"] = userID
+		}
+		b, _ := json.Marshal(meta)
+		c.OrganizationID = org
+		c.ProjectID = proj
+		c.Scope = credScopeOrg
+		c.UserID = userID
+		c.Kind = "github_app"
+		c.InstallationID = inst
+		c.Status = "active"
+		c.MetaJSON = string(b)
+		c.UpdatedAt = now
+		if c.CreatedAt == "" {
+			c.CreatedAt = now
+		}
+		connectorLive.Store(c.ID, c)
+		persistConnector(c)
+		softDeleteOtherInstallConnectors(c.ID, inst)
+		stampWatchedTenantForConnector(c)
+		redirectConnectors(c.ID, "")
+		return
+	}
+
+	// Orphan / marketplace install — pending_claim + one-time claim_token.
+	claimRaw, claimHash, err := mintConnectorClaimNonce()
+	if err != nil {
+		http.Error(w, "claim nonce unavailable", 500)
+		return
+	}
+	var c *opaConnector
+	if existing != nil && strings.EqualFold(strings.TrimSpace(existing.Status), "pending_claim") {
+		c = existing
+	} else {
+		id := loadID("conn", "pending", "pending", "github_app", inst)
+		c = &opaConnector{
+			ID: id, OrganizationID: "", ProjectID: "", Scope: credScopeOrg, UserID: "",
+			Kind: "github_app", InstallationID: inst, CreatedAt: now,
+		}
+	}
+	meta := parseConnectorMeta(c.MetaJSON)
+	meta["setup_action"] = setup
+	meta["pending_claim"] = true
+	meta["claim_nonce_hash"] = claimHash
+	b, _ := json.Marshal(meta)
+	c.Status = "pending_claim"
+	c.OrganizationID = ""
+	c.ProjectID = ""
+	c.MetaJSON = string(b)
+	c.UpdatedAt = now
+	if c.CreatedAt == "" {
+		c.CreatedAt = now
+	}
+	connectorLive.Store(c.ID, c)
+	persistConnector(c)
+	softDeleteOtherInstallConnectors(c.ID, inst)
+	redirectConnectors(c.ID, claimRaw)
+}
+
+// softDeleteOtherInstallConnectors marks every non-deleted connector for the same
+// GitHub installation_id as deleted except keepID — enforces one live binder.
+func softDeleteOtherInstallConnectors(keepID, installationID string) {
+	inst := strings.TrimSpace(installationID)
+	keepID = strings.TrimSpace(keepID)
+	if inst == "" || keepID == "" {
+		return
+	}
+	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	connectorLive.Range(func(_, v interface{}) bool {
+		c, ok := v.(*opaConnector)
+		if !ok || c == nil || c.ID == keepID || c.Status == "deleted" {
+			return true
+		}
+		if strings.TrimSpace(c.InstallationID) != inst {
+			return true
+		}
+		c.Status = "deleted"
+		c.UpdatedAt = now
+		connectorLive.Store(c.ID, c)
+		persistConnector(c)
+		log.Printf("[INFO] soft-deleted duplicate github_app connector %s installation=%s keep=%s", c.ID, inst, keepID)
+		return true
+	})
 }
 
 // mintConnectorClaimNonce returns a high-entropy one-time claim token and its
@@ -504,6 +607,7 @@ func handleConnectorClaim(w http.ResponseWriter, r *http.Request, id string) {
 	c.MetaJSON = string(b)
 	connectorLive.Store(id, c)
 	persistConnector(c)
+	softDeleteOtherInstallConnectors(c.ID, c.InstallationID)
 	stampWatchedTenantForConnector(c)
 	writeJSON(w, map[string]interface{}{
 		"ok": true, "connector": connectorPublic(c),
@@ -1536,8 +1640,10 @@ func handleIssueClaimToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !strings.EqualFold(strings.TrimSpace(c.Status), "pending_claim") {
+		// Prefer-active lookup means an active binder already owns this install.
 		writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
 			"ok": false, "error": "not_pending_claim", "status": c.Status,
+			"message": "installation is already bound or not claimable — callback will not remint over active",
 		})
 		return
 	}
@@ -1549,16 +1655,21 @@ func handleIssueClaimToken(w http.ResponseWriter, r *http.Request) {
 	meta := parseConnectorMeta(c.MetaJSON)
 	meta["pending_claim"] = true
 	meta["claim_nonce_hash"] = hash
+	meta["claim_reminted_at"] = time.Now().UTC().Format(time.RFC3339)
+	if a.Username != "" {
+		meta["claim_reminted_by"] = a.Username
+	}
 	b, _ := json.Marshal(meta)
 	c.MetaJSON = string(b)
 	c.UpdatedAt = time.Now().UTC().Format("2006-01-02 15:04:05.000")
 	connectorLive.Store(c.ID, c)
 	persistConnector(c)
+	log.Printf("[INFO] reminted claim_token connector=%s installation=%s by=%s", c.ID, c.InstallationID, a.Username)
 	dash := strings.TrimRight(envOr("OPA_DASHBOARD_URL", "http://127.0.0.1:8088"), "/")
 	claimURL := dash + "/settings/connectors?connector=" + url.QueryEscape(c.ID) + "#claim_token=" + url.QueryEscape(raw)
 	writeJSON(w, map[string]interface{}{
 		"ok": true, "connector_id": c.ID, "claim_token": raw, "claim_url": claimURL,
-		"honesty": "One-time claim_token — open claim_url while signed into the target Open org. Token is not logged.",
+		"honesty": "One-time claim_token — open claim_url while signed into the target Open org. Confirm the org before claiming. Token is not logged.",
 	})
 }
 

@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -713,6 +714,102 @@ func TestFindConnectorByInstallationPrefersActive(t *testing.T) {
 	got := findConnectorByInstallation(inst)
 	if got == nil || got.ID != active.ID {
 		t.Fatalf("got=%+v want active", got)
+	}
+}
+
+func TestGitHubCallbackDoesNotResetActive(t *testing.T) {
+	t.Setenv("OPA_DASHBOARD_URL", "http://dash.test")
+	t.Setenv("OPEN_SERVICE_JWT_SECRET", "callback-protect-secret-32bytes!!")
+
+	inst := "inst-protect-" + fmt.Sprint(time.Now().UnixNano())
+	active := &opaConnector{
+		ID: "conn-active-protect", Kind: "github_app", InstallationID: inst,
+		Status: "active", OrganizationID: "nas", ProjectID: "infra", Scope: credScopeOrg,
+	}
+	connectorLive.Store(active.ID, active)
+	defer connectorLive.Delete(active.ID)
+
+	// Orphan-style callback (no state) must not demote active → pending_claim.
+	req := httptest.NewRequest(http.MethodGet, "/api/connectors/github/callback?installation_id="+inst, nil)
+	rr := httptest.NewRecorder()
+	handleGitHubCallback(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	}
+	live := getConnector(active.ID)
+	if live == nil || live.Status != "active" || live.OrganizationID != "nas" {
+		t.Fatalf("active was mutated: %+v", live)
+	}
+	loc := rr.Header().Get("Location")
+	if strings.Contains(loc, "claim_token") {
+		t.Fatalf("must not remint claim_token over active: %s", loc)
+	}
+
+	// Stateful callback for a *different* org must also not overwrite.
+	state, err := mintGitHubInstallState("other-org", "infra", "eve")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req2 := httptest.NewRequest(http.MethodGet,
+		"/api/connectors/github/callback?installation_id="+inst+"&state="+url.QueryEscape(state), nil)
+	rr2 := httptest.NewRecorder()
+	handleGitHubCallback(rr2, req2)
+	if rr2.Code != http.StatusFound {
+		t.Fatalf("status %d", rr2.Code)
+	}
+	live = getConnector(active.ID)
+	if live.Status != "active" || live.OrganizationID != "nas" {
+		t.Fatalf("active overwritten by foreign state: %+v", live)
+	}
+	// No second active for same installation.
+	var actives int
+	connectorLive.Range(func(_, v interface{}) bool {
+		c, _ := v.(*opaConnector)
+		if c != nil && c.InstallationID == inst && c.Status == "active" {
+			actives++
+		}
+		return true
+	})
+	if actives != 1 {
+		t.Fatalf("actives=%d want 1", actives)
+	}
+}
+
+func TestGitHubCallbackActivatesPendingWithState(t *testing.T) {
+	t.Setenv("OPA_DASHBOARD_URL", "http://dash.test")
+	t.Setenv("OPEN_SERVICE_JWT_SECRET", "callback-activate-secret-32bytes!")
+
+	inst := "inst-activate-" + fmt.Sprint(time.Now().UnixNano())
+	_, hash, err := mintConnectorClaimNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := &opaConnector{
+		ID: "conn-pend-activate", Kind: "github_app", InstallationID: inst,
+		Status: "pending_claim", Scope: credScopeOrg,
+		MetaJSON: fmt.Sprintf(`{"pending_claim":true,"claim_nonce_hash":%q}`, hash),
+	}
+	connectorLive.Store(pending.ID, pending)
+	defer connectorLive.Delete(pending.ID)
+
+	state, err := mintGitHubInstallState("nas", "infra", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/connectors/github/callback?installation_id="+inst+"&state="+url.QueryEscape(state), nil)
+	rr := httptest.NewRecorder()
+	handleGitHubCallback(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	}
+	live := getConnector(pending.ID)
+	if live == nil || live.Status != "active" || live.OrganizationID != "nas" {
+		t.Fatalf("pending not activated in place: %+v", live)
+	}
+	meta := parseConnectorMeta(live.MetaJSON)
+	if _, ok := meta["claim_nonce_hash"]; ok {
+		t.Fatalf("nonce still present: %v", meta)
 	}
 }
 
