@@ -8,11 +8,11 @@ import (
 	"time"
 )
 
-// Peer code-delivery surface: push credentials + pull-request creation.
+// Peer code-delivery surface: push credentials + pull-request create/merge.
 //
 // Scope `scm:pr` is deliberately narrower than `scm:pm`: it is the only scope
-// that can obtain a write-capable git credential or open a pull request, so a
-// peer that only syncs issues and milestones can never push code.
+// that can obtain a write-capable git credential, open a pull request, or merge
+// one, so a peer that only syncs issues and milestones can never push code.
 //
 // GitHub App/PAT secrets never leave ORA. The push credential is a short-lived,
 // repo-scoped installation token minted per request; ORA does not persist it and
@@ -23,6 +23,7 @@ import (
 //	push-credentials     — Contents: Read and write, Metadata: Read
 //	pull-requests/create — Pull requests: Read and write, Contents: Read and
 //	                       write, Metadata: Read
+//	pull-requests/merge  — same as create (Contents write to land the merge)
 //
 // Workflows is never requested, so a delivery cannot touch .github/workflows.
 //
@@ -54,6 +55,7 @@ const pushCredentialTTL = 10 * time.Minute
 func registerPeerSCMPRMux(mux *http.ServeMux) {
 	mux.HandleFunc("/api/peer/scm/push-credentials", handlePeerPushCredentials)
 	mux.HandleFunc("/api/peer/scm/pull-requests/create", handlePeerPullRequestCreate)
+	mux.HandleFunc("/api/peer/scm/pull-requests/merge", handlePeerPullRequestMerge)
 }
 
 // writePeerPRStatus writes a JSON body with an explicit HTTP status.
@@ -280,5 +282,50 @@ func handlePeerPullRequestCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{
 		"ok": true, "connector_id": c.ID, "repo_full_name": body.RepoFullName,
 		"already_existed": existed, "pull_request": pull,
+	})
+}
+
+// handlePeerPullRequestMerge merges an open delivery pull request. OPM autopilot
+// calls this after review PASS; without it the peer surface returns Go's plain
+// "404 page not found" and the task is left for a human.
+func handlePeerPullRequestMerge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	claims, ok := peerSCMAuth(w, r, peerPRScope)
+	if !ok {
+		return
+	}
+	var body struct {
+		ConnectorID  string `json:"connector_id"`
+		RepoFullName string `json:"repo_full_name"`
+		Number       int    `json:"number"`
+		MergeMethod  string `json:"merge_method"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", 400)
+		return
+	}
+	c, owner, repo, ok := peerDeliveryRepo(w, claims, body.ConnectorID, body.RepoFullName)
+	if !ok {
+		return
+	}
+	if body.Number <= 0 {
+		http.Error(w, "number required", 400)
+		return
+	}
+	if !peerDeliveryPreflight(w, c, true) {
+		return
+	}
+
+	pull, err := githubMergePullRequest(c, owner, repo, body.Number, body.MergeMethod)
+	if err != nil {
+		peerPullRequestError(w, c, err)
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"ok": true, "connector_id": c.ID, "repo_full_name": body.RepoFullName,
+		"pull_request": pull,
 	})
 }

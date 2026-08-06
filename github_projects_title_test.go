@@ -64,7 +64,11 @@ func newStubGraphQL(t *testing.T) *stubGraphQL {
 // stubPATConnector is a PAT connector so githubAccessToken resolves locally and no
 // installation-token round trip is attempted.
 func stubPATConnector() *opaConnector {
-	return &opaConnector{ID: "c-stub", Kind: "github_pat", TokenRef: "stub-token"}
+	return &opaConnector{
+		ID: "c-stub", Kind: "github_pat", TokenRef: "stub-token",
+		OrganizationID: "default-org", ProjectID: "default-project",
+		Status: "active", Scope: credScopeOrg,
+	}
 }
 
 func projectsErrStatus(t *testing.T, err error) string {
@@ -236,7 +240,7 @@ func TestClassifyProjectsGraphQLError(t *testing.T) {
 func peerPMRequest(t *testing.T, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	t.Setenv("OPEN_SERVICE_JWT_SECRET", "test-secret")
-	tok, err := openauth.MintServiceJWT([]byte("test-secret"), "opm-api", "ora-api", "scm:pm")
+	tok, err := openauth.MintServiceJWTWithOrg([]byte("test-secret"), "opm-api", "ora-api", "scm:pm", "default-org", 0)
 	if err != nil {
 		t.Fatalf("mint service jwt: %v", err)
 	}
@@ -352,7 +356,11 @@ func TestPeerProjectItemUpsertMissingOrganizationProjects(t *testing.T) {
 		"contents": "write", "metadata": "read", "pull_requests": "write",
 		"issues": "write", "checks": "write",
 	})
-	withStubConnector(t, &opaConnector{ID: "c-stub", Kind: "github_app", InstallationID: "inst-noproj"})
+	withStubConnector(t, &opaConnector{
+		ID: "c-stub", Kind: "github_app", InstallationID: "inst-noproj",
+		OrganizationID: "default-org", ProjectID: "default-project",
+		Status: "active", Scope: credScopeOrg,
+	})
 
 	rec := peerPMRequest(t, `{"connector_id":"c-stub","project_id":"PVT_1","item_id":"PVTI_item1","title":"Renamed"}`)
 

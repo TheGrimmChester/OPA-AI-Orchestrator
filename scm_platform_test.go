@@ -6,11 +6,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	openauth "github.com/TheGrimmChester/open-auth-go"
 )
 
 func TestBuildSCMEventEnvelopePR(t *testing.T) {
@@ -231,6 +235,336 @@ func TestMintAndParseInstallState(t *testing.T) {
 	parsed, err := parseGitHubInstallState(state)
 	if err != nil || parsed.OrganizationID != "nas" || parsed.ProjectID != "infra" {
 		t.Fatalf("parsed=%+v err=%v", parsed, err)
+	}
+}
+
+func TestConnectorClaimSuccess(t *testing.T) {
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+
+	raw, hash, err := mintConnectorClaimNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := "2026-01-01 00:00:00.000"
+	conn := &opaConnector{
+		ID: "conn-claim-ok", Kind: "github_app", InstallationID: "42",
+		Status: "pending_claim", OrganizationID: "", ProjectID: "",
+		Scope: credScopeOrg, MetaJSON: fmt.Sprintf(`{"pending_claim":true,"auto_provisioned":true,"claim_nonce_hash":%q}`, hash),
+		CreatedAt: now, UpdatedAt: now,
+	}
+	connectorLive.Store(conn.ID, conn)
+	defer connectorLive.Delete(conn.ID)
+
+	wr := &opaWatchedRepo{
+		ID: "w-claim", ConnectorID: conn.ID, RepoFullName: "acme/app",
+		OrganizationID: "", ProjectID: "", Enabled: true, UpdatedAt: now,
+	}
+	watchedLive.Store(conn.ID+"|acme/app", wr)
+	defer watchedLive.Delete(conn.ID + "|acme/app")
+
+	body, _ := json.Marshal(map[string]string{"claim_token": raw})
+	req := httptest.NewRequest(http.MethodPost, "/api/connectors/"+conn.ID+"/claim", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-Role", "admin")
+	req.Header.Set("X-User-Username", "alice")
+	req.Header.Set("X-Organization-ID", "nas")
+	req.Header.Set("X-Project-ID", "infra")
+	rr := httptest.NewRecorder()
+	handleConnectorClaim(rr, req, conn.ID)
+	if rr.Code != 200 {
+		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]interface{}
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	cPub, _ := out["connector"].(map[string]interface{})
+	if cPub["status"] != "active" || cPub["organization_id"] != "nas" || cPub["project_id"] != "infra" {
+		t.Fatalf("connector=%v", cPub)
+	}
+	live := getConnector(conn.ID)
+	if live == nil || live.Status != "active" {
+		t.Fatalf("live=%+v", live)
+	}
+	meta := parseConnectorMeta(live.MetaJSON)
+	if _, ok := meta["pending_claim"]; ok {
+		t.Fatalf("pending_claim meta still set: %v", meta)
+	}
+	if _, ok := meta["claim_nonce_hash"]; ok {
+		t.Fatalf("claim_nonce_hash still set: %v", meta)
+	}
+	tenant := resolveSCMTenant(wr, live)
+	if scmTenantBlocksJob(tenant) || tenant.OrganizationID != "nas" {
+		t.Fatalf("tenant after claim=%+v", tenant)
+	}
+	if wr.OrganizationID != "nas" || wr.ProjectID != "infra" {
+		t.Fatalf("watched not stamped: %+v", wr)
+	}
+
+	// Double claim → 409
+	body2, _ := json.Marshal(map[string]string{"claim_token": raw})
+	req2 := httptest.NewRequest(http.MethodPost, "/api/connectors/"+conn.ID+"/claim", strings.NewReader(string(body2)))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("X-User-Role", "admin")
+	req2.Header.Set("X-Organization-ID", "nas")
+	req2.Header.Set("X-Project-ID", "infra")
+	rr2 := httptest.NewRecorder()
+	handleConnectorClaim(rr2, req2, conn.ID)
+	if rr2.Code != http.StatusConflict {
+		t.Fatalf("double claim status %d body %s", rr2.Code, rr2.Body.String())
+	}
+}
+
+func TestConnectorClaimRejectsWrongNonce(t *testing.T) {
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+
+	_, hash, err := mintConnectorClaimNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &opaConnector{
+		ID: "conn-claim-bad-nonce", Kind: "github_app", Status: "pending_claim",
+		Scope: credScopeOrg, MetaJSON: fmt.Sprintf(`{"pending_claim":true,"claim_nonce_hash":%q}`, hash),
+	}
+	connectorLive.Store(conn.ID, conn)
+	defer connectorLive.Delete(conn.ID)
+
+	body, _ := json.Marshal(map[string]string{"claim_token": "deadbeef"})
+	req := httptest.NewRequest(http.MethodPost, "/api/connectors/"+conn.ID+"/claim", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-Role", "admin")
+	req.Header.Set("X-Organization-ID", "nas")
+	req.Header.Set("X-Project-ID", "infra")
+	rr := httptest.NewRecorder()
+	handleConnectorClaim(rr, req, conn.ID)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestConnectorClaimRejectsNotPending(t *testing.T) {
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+
+	conn := &opaConnector{
+		ID: "conn-claim-active", Kind: "github_app", Status: "active",
+		OrganizationID: "nas", ProjectID: "infra", Scope: credScopeOrg,
+	}
+	connectorLive.Store(conn.ID, conn)
+	defer connectorLive.Delete(conn.ID)
+
+	body, _ := json.Marshal(map[string]string{"claim_token": "irrelevant"})
+	req := httptest.NewRequest(http.MethodPost, "/api/connectors/"+conn.ID+"/claim", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-Role", "admin")
+	req.Header.Set("X-Organization-ID", "nas")
+	req.Header.Set("X-Project-ID", "infra")
+	rr := httptest.NewRecorder()
+	handleConnectorClaim(rr, req, conn.ID)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestConnectorClaimRejectsUnauthorized(t *testing.T) {
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+
+	raw, hash, err := mintConnectorClaimNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &opaConnector{
+		ID: "conn-claim-forbidden", Kind: "github_app", Status: "pending_claim",
+		Scope: credScopeOrg, MetaJSON: fmt.Sprintf(`{"pending_claim":true,"claim_nonce_hash":%q}`, hash),
+	}
+	connectorLive.Store(conn.ID, conn)
+	defer connectorLive.Delete(conn.ID)
+
+	body, _ := json.Marshal(map[string]string{"claim_token": raw})
+	req := httptest.NewRequest(http.MethodPost, "/api/connectors/"+conn.ID+"/claim", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-Role", "viewer")
+	req.Header.Set("X-User-Username", "bob")
+	req.Header.Set("X-Organization-ID", "nas")
+	req.Header.Set("X-Project-ID", "infra")
+	rr := httptest.NewRecorder()
+	handleConnectorClaim(rr, req, conn.ID)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestConnectorClaimRejectsPersonalAccount(t *testing.T) {
+	prevAuth := authEnforced
+	prevSecret := jwtSecret
+	authEnforced = true
+	jwtSecret = []byte("claim-personal-test-secret")
+	defer func() {
+		authEnforced = prevAuth
+		jwtSecret = prevSecret
+	}()
+
+	raw, hash, err := mintConnectorClaimNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &opaConnector{
+		ID: "conn-claim-personal", Kind: "github_app", Status: "pending_claim",
+		Scope: credScopeOrg, MetaJSON: fmt.Sprintf(`{"pending_claim":true,"claim_nonce_hash":%q}`, hash),
+	}
+	connectorLive.Store(conn.ID, conn)
+	defer connectorLive.Delete(conn.ID)
+
+	tok, err := openauth.MintUserJWTWithAccount(jwtSecret, "alice", "admin", "ora-api",
+		openauth.AccountTypePersonal, "", nil, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]string{"claim_token": raw})
+	req := httptest.NewRequest(http.MethodPost, "/api/connectors/"+conn.ID+"/claim", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("X-User-Role", "admin")
+	req.Header.Set("X-Organization-ID", "nas")
+	rr := httptest.NewRecorder()
+	handleConnectorClaim(rr, req, conn.ID)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPeerResolveConnectorFailClosed(t *testing.T) {
+	active := &opaConnector{
+		ID: "peer-fc-active", OrganizationID: "org-a", Status: "active", Kind: "github_app",
+	}
+	pending := &opaConnector{
+		ID: "peer-fc-pending", OrganizationID: "", Status: "pending_claim", Kind: "github_app",
+	}
+	emptyOrgActive := &opaConnector{
+		ID: "peer-fc-empty-org", OrganizationID: "", Status: "active", Kind: "github_app",
+	}
+	connectorLive.Store(active.ID, active)
+	connectorLive.Store(pending.ID, pending)
+	connectorLive.Store(emptyOrgActive.ID, emptyOrgActive)
+	defer connectorLive.Delete(active.ID)
+	defer connectorLive.Delete(pending.ID)
+	defer connectorLive.Delete(emptyOrgActive.ID)
+
+	cases := []struct {
+		name   string
+		claims *peerSCMClaims
+		id     string
+		want   int
+	}{
+		{"ok", &peerSCMClaims{OrgID: "org-a"}, active.ID, 0},
+		{"empty_claims_org", &peerSCMClaims{OrgID: ""}, active.ID, 403},
+		{"wrong_org", &peerSCMClaims{OrgID: "org-b"}, active.ID, 403},
+		{"pending", &peerSCMClaims{OrgID: "org-a"}, pending.ID, 403},
+		{"empty_org_active", &peerSCMClaims{OrgID: "org-a"}, emptyOrgActive.ID, 403},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			got := peerResolveConnector(rr, tc.claims, tc.id)
+			if tc.want == 0 {
+				if got == nil || got.ID != active.ID {
+					t.Fatalf("want connector, got %+v status=%d body=%s", got, rr.Code, rr.Body.String())
+				}
+				return
+			}
+			if got != nil || rr.Code != tc.want {
+				t.Fatalf("got conn=%v code=%d want code=%d body=%s", got, rr.Code, tc.want, rr.Body.String())
+			}
+		})
+	}
+}
+
+// Negative isolation: foreign org viewer must not list/get/mutate another org's connector.
+func TestConnectorsForeignViewerIsolation(t *testing.T) {
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+	// Ensure patch/delete reach visibility checks (not OAM write-guard 503).
+	t.Setenv("PEER_OAM_URL", "")
+
+	own := &opaConnector{
+		ID: "iso-own", Kind: "github_app", Status: "active",
+		OrganizationID: "org-a", ProjectID: "p1", Scope: credScopeOrg,
+	}
+	foreign := &opaConnector{
+		ID: "iso-foreign", Kind: "github_app", Status: "active",
+		OrganizationID: "org-b", ProjectID: "p1", Scope: credScopeOrg,
+	}
+	pending := &opaConnector{
+		ID: "iso-pending", Kind: "github_app", Status: "pending_claim",
+		OrganizationID: "", Scope: credScopeOrg,
+	}
+	connectorLive.Store(own.ID, own)
+	connectorLive.Store(foreign.ID, foreign)
+	connectorLive.Store(pending.ID, pending)
+	defer connectorLive.Delete(own.ID)
+	defer connectorLive.Delete(foreign.ID)
+	defer connectorLive.Delete(pending.ID)
+
+	viewerReq := func(method, path, body string) *http.Request {
+		var r *http.Request
+		if body != "" {
+			r = httptest.NewRequest(method, path, strings.NewReader(body))
+			r.Header.Set("Content-Type", "application/json")
+		} else {
+			r = httptest.NewRequest(method, path, nil)
+		}
+		r.Header.Set("X-User-Role", "viewer")
+		r.Header.Set("X-User-Username", "alice")
+		r.Header.Set("X-Organization-ID", "org-a")
+		r.Header.Set("X-Project-ID", "p1")
+		return r
+	}
+
+	// List: only own org active; foreign + pending omitted.
+	rr := httptest.NewRecorder()
+	handleConnectorsList(rr, viewerReq(http.MethodGet, "/api/connectors", ""))
+	if rr.Code != 200 {
+		t.Fatalf("list status %d body %s", rr.Code, rr.Body.String())
+	}
+	var listOut map[string]interface{}
+	_ = json.Unmarshal(rr.Body.Bytes(), &listOut)
+	raw, _ := listOut["connectors"].([]interface{})
+	ids := map[string]bool{}
+	for _, item := range raw {
+		m, _ := item.(map[string]interface{})
+		if id, _ := m["id"].(string); id != "" {
+			ids[id] = true
+		}
+	}
+	if !ids[own.ID] || ids[foreign.ID] || ids[pending.ID] {
+		t.Fatalf("list ids=%v want only %s", ids, own.ID)
+	}
+
+	// Get foreign / pending → 404 (not found; no existence leak).
+	for _, id := range []string{foreign.ID, pending.ID} {
+		rr = httptest.NewRecorder()
+		handleConnectorGet(rr, viewerReq(http.MethodGet, "/api/connectors/"+id, ""), id)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("get %s status %d want 404 body %s", id, rr.Code, rr.Body.String())
+		}
+	}
+
+	// Patch / delete foreign → 404 (invisible before mutate check).
+	rr = httptest.NewRecorder()
+	handleConnectorPatch(rr, viewerReq(http.MethodPatch, "/api/connectors/"+foreign.ID, `{"display_name":"x"}`), foreign.ID)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("patch foreign status %d want 404 body %s", rr.Code, rr.Body.String())
+	}
+	rr = httptest.NewRecorder()
+	handleConnectorDelete(rr, viewerReq(http.MethodDelete, "/api/connectors/"+foreign.ID, ""), foreign.ID)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("delete foreign status %d want 404 body %s", rr.Code, rr.Body.String())
 	}
 }
 

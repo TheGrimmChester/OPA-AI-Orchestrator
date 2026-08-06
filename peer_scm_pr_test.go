@@ -34,7 +34,7 @@ func prTestConnector(t *testing.T, id string) *opaConnector {
 
 func prTestToken(t *testing.T, scope string) string {
 	t.Helper()
-	tok, err := openauth.MintServiceJWT([]byte(testPRSecret), "opm-api", "ora-api", scope)
+	tok, err := openauth.MintServiceJWTWithOrg([]byte(testPRSecret), "opm-api", "ora-api", scope, "default-org", 0)
 	if err != nil {
 		t.Fatalf("mint service jwt: %v", err)
 	}
@@ -66,6 +66,7 @@ func TestPeerDeliveryRequiresPRScope(t *testing.T) {
 	body := map[string]interface{}{
 		"connector_id": "conn-scope", "repo_full_name": "acme/demo",
 		"title": "Deliver", "head": "opm/task", "base": "main",
+		"number": 42,
 	}
 	insufficient := map[string]string{
 		"pm":            "scm:pm",
@@ -74,7 +75,11 @@ func TestPeerDeliveryRequiresPRScope(t *testing.T) {
 		"health":        "health:read",
 		"all_non_write": "connectors:read scm:clone scm:pm health:read",
 	}
-	for _, path := range []string{"/api/peer/scm/push-credentials", "/api/peer/scm/pull-requests/create"} {
+	for _, path := range []string{
+		"/api/peer/scm/push-credentials",
+		"/api/peer/scm/pull-requests/create",
+		"/api/peer/scm/pull-requests/merge",
+	} {
 		for name, scope := range insufficient {
 			t.Run(path+"/refused_with_"+name, func(t *testing.T) {
 				rec := prTestPost(t, mux, path, scope, body)
@@ -210,6 +215,34 @@ func TestPeerPullRequestCreateHappyPath(t *testing.T) {
 	}
 	if !strings.Contains(out.PullRequest.HTMLURL, "/pull/") {
 		t.Fatalf("html_url must point at the PR: %q", out.PullRequest.HTMLURL)
+	}
+}
+
+func TestPeerPullRequestMergeHappyPath(t *testing.T) {
+	mux := prTestMux(t)
+	prTestConnector(t, "conn-merge")
+	rec := prTestPost(t, mux, "/api/peer/scm/pull-requests/merge", peerPRScope, map[string]interface{}{
+		"connector_id": "conn-merge", "repo_full_name": "acme/demo", "number": 83,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		OK          bool `json:"ok"`
+		PullRequest struct {
+			Number  int    `json:"number"`
+			State   string `json:"state"`
+			HTMLURL string `json:"html_url"`
+		} `json:"pull_request"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("body not json: %v", err)
+	}
+	if !out.OK || out.PullRequest.Number != 83 {
+		t.Fatalf("expected merged PR #83: %s", rec.Body.String())
+	}
+	if out.PullRequest.State != "merged" {
+		t.Fatalf("state want merged got %q", out.PullRequest.State)
 	}
 }
 

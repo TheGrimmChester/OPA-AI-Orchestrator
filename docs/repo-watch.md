@@ -31,6 +31,17 @@ ORA supports **two webhook ingress modes**. Both feed the same unified pipeline 
 
 Repository-hook mode: `PUT /api/connectors/{id}/watched` creates GitHub `POST /repos/{owner}/{repo}/hooks` per enabled watch; disable → delete hook. Per-repo encrypted secret on `watched_repos` (`webhook_mode`: `app` | `repo`).
 
+### Account binding (Open tenant, not GitHub login)
+
+GitHub App installs bind to an **Open** org or personal tenant from the **signed-in Open session**, not from the GitHub install target (`account_login`).
+
+| Path | How tenancy is set |
+|------|--------------------|
+| **Happy path (preferred)** | Dashboard **Connect GitHub App** → `GET /api/connectors/github/install-url` mints a short-lived signed `state` JWT (`org` / `proj` / `user`) from an **organization** Open account → GitHub callback → connector `status=active` under that Open tenant |
+| **Orphan / marketplace** | Install without valid `state` → connector `status=pending_claim` + one-time `claim_token` in the dashboard redirect → org admin **`POST /api/connectors/{id}/claim`** with `{ "claim_token": "..." }` |
+
+Do **not** infer Open tenancy from GitHub `account_login` name equality, and do **not** fall back to `default-org` for unscoped installs. `OPA_GITHUB_APP_CLIENT_ID` is optional install-flow OAuth only — not Open↔GitHub user linking.
+
 ### Production — GitHub App
 
 1. Create a GitHub App with:
@@ -236,8 +247,10 @@ Legacy CI without Repo Watch can still call `harness/appsec-pr-check.sh` (tenant
 
 - `GET /api/connectors`
 - `POST /api/connectors/github/pat`
-- `GET /api/connectors/github/install-url`
-- `GET|PATCH|DELETE /api/connectors/{id}` — get / edit (login, display_name, replace PAT) / soft-delete + cascade watched
+- `GET /api/connectors/github/install-url` — mints signed install `state` from the current Open **organization** account (personal accounts → 400)
+- `GET /api/connectors/github/callback` — completes install; orphans redirect to `/settings/connectors?connector=&claim_token=` (raw token once; hash stored)
+- `GET|PATCH|DELETE /api/connectors/{id}` — get / edit (login, display_name, replace PAT) / soft-delete + cascade watched (`pending_claim` invisible/immutable)
+- `POST /api/connectors/{id}/claim` — `{ "claim_token": "..." }` claims a `pending_claim` connector into the caller's Open org (CAS; wipe nonce; sync OAM)
 - `GET /api/connectors/{id}/repos` — installable repos (hydrates encrypted PAT from CH after restart)
 - `GET /api/connectors/{id}/pulls?repo=owner/name` — open PRs
 - `GET|PUT /api/connectors/{id}/watched`
