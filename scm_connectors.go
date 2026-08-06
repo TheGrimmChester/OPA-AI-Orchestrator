@@ -34,6 +34,7 @@ func registerRepoWatchMux(mux *http.ServeMux, authView, authAdmin func(string, h
 	// Connector sub-routes: viewer+ or peer service; mutate gates live in-handler.
 	registerConnectorReadAuth(mux, "/api/connectors/", handleConnectorSub)
 	registerPeerSCMMux(mux)
+	registerInternalConnectorsMux(mux)
 	authView("/api/scm/jobs", handleSCMJobsList)
 	authAdmin("/api/scm/jobs/resume", handleSCMJobsResume)
 	registerSCMAuthFlexible(mux, "/api/scm/jobs/", handleSCMJobSub)
@@ -347,17 +348,8 @@ func handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		proj = defaultProjectID
 	}
 
-	dash := strings.TrimRight(envOr("OPA_DASHBOARD_URL", "http://127.0.0.1:8088"), "/")
 	redirectConnectors := func(connectorID, claimRaw string) {
-		loc := dash + "/settings/connectors"
-		if connectorID != "" {
-			loc += "?connector=" + url.QueryEscape(connectorID)
-		}
-		if claimRaw != "" {
-			// Fragment so claim_token is not sent as a Referer query param.
-			loc += "#claim_token=" + url.QueryEscape(claimRaw)
-		}
-		http.Redirect(w, r, loc, http.StatusFound)
+		http.Redirect(w, r, connectorsDashboardURL(connectorID, claimRaw), http.StatusFound)
 	}
 
 	connectorClaimMu.Lock()
@@ -499,6 +491,22 @@ func mintConnectorClaimNonce() (raw, hash string, err error) {
 // requireOrganizationAccountHTTP rejects personal Open accounts. GitHub App
 // install/claim is organization-only (role admin does not bypass account_type).
 func requireOrganizationAccountHTTP(w http.ResponseWriter, r *http.Request, action string) bool {
+	// OAM peer writes carry delegated account_type (no user JWT on the wire).
+	if isPeerOAMConnectorWrite(r) {
+		at := strings.ToLower(strings.TrimSpace(r.Header.Get(headerDelegatedAccountType)))
+		if at == openauth.AccountTypePersonal {
+			http.Error(w, action+" requires an organization Open account (not personal)", 400)
+			return false
+		}
+		if at == openauth.AccountTypeOrganization {
+			return true
+		}
+		if strings.TrimSpace(r.Header.Get("X-Organization-ID")) != "" {
+			return true
+		}
+		http.Error(w, action+" requires an organization Open account (not personal)", 400)
+		return false
+	}
 	claims := claimsFromRequestToken(r)
 	if claims == nil {
 		return true
@@ -516,12 +524,40 @@ func requireOrganizationAccountHTTP(w http.ResponseWriter, r *http.Request, acti
 	return true
 }
 
+// connectorsDashboardBaseURL prefers OAM_DASHBOARD_URL for post-install / claim
+// browser redirects. OPA_DASHBOARD_URL remains a one-release fallback (often still
+// pointing at the ORA dashboard). Management UI path is always /connectors.
+func connectorsDashboardBaseURL() string {
+	if v := strings.TrimSpace(os.Getenv("OAM_DASHBOARD_URL")); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return strings.TrimRight(envOr("OPA_DASHBOARD_URL", "http://127.0.0.1:8088"), "/")
+}
+
+// connectorsDashboardURL builds the OAM (or fallback) connectors page URL.
+// Query ?connector= and fragment #claim_token= are unchanged from the prior
+// /settings/connectors contract so dashboards keep working during cutover.
+func connectorsDashboardURL(connectorID, claimRaw string) string {
+	loc := connectorsDashboardBaseURL() + "/connectors"
+	if connectorID != "" {
+		loc += "?connector=" + url.QueryEscape(connectorID)
+	}
+	if claimRaw != "" {
+		// Fragment so claim_token is not sent as a Referer query param.
+		loc += "#claim_token=" + url.QueryEscape(claimRaw)
+	}
+	return loc
+}
+
 var connectorClaimMu sync.Mutex
 
 // POST /api/connectors/{id}/claim — organization account attaches a pending_claim
 // GitHub App install using the one-time claim_token from the orphan callback.
 // CAS pending→active; wipe nonce; stamp watches; OAM sync via persist.
 func handleConnectorClaim(w http.ResponseWriter, r *http.Request, id string) {
+	if refuseOAMLocalWrite(w, r) {
+		return
+	}
 	if !requireOrganizationAccountHTTP(w, r, "GitHub App claim") {
 		return
 	}
@@ -619,7 +655,7 @@ func handleConnectorClaim(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func handleGitHubPATConnect(w http.ResponseWriter, r *http.Request) {
-	if refuseOAMLocalWrite(w) {
+	if refuseOAMLocalWrite(w, r) {
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -835,7 +871,7 @@ func handleConnectorGet(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func handleConnectorPatch(w http.ResponseWriter, r *http.Request, id string) {
-	if refuseOAMLocalWrite(w) {
+	if refuseOAMLocalWrite(w, r) {
 		return
 	}
 	c := getOrHydrateConnector(id)
@@ -874,7 +910,7 @@ func handleConnectorPatch(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func handleConnectorDelete(w http.ResponseWriter, r *http.Request, id string) {
-	if refuseOAMLocalWrite(w) {
+	if refuseOAMLocalWrite(w, r) {
 		return
 	}
 	c := getOrHydrateConnector(id)
@@ -1790,8 +1826,7 @@ func handleIssueClaimToken(w http.ResponseWriter, r *http.Request) {
 	connectorLive.Store(c.ID, c)
 	persistConnector(c)
 	log.Printf("[INFO] issued claim_token connector=%s installation=%s by=%s force=%v", c.ID, c.InstallationID, a.Username, body.Force)
-	dash := strings.TrimRight(envOr("OPA_DASHBOARD_URL", "http://127.0.0.1:8088"), "/")
-	claimURL := dash + "/settings/connectors?connector=" + url.QueryEscape(c.ID) + "#claim_token=" + url.QueryEscape(raw)
+	claimURL := connectorsDashboardURL(c.ID, raw)
 	writeJSON(w, map[string]interface{}{
 		"ok": true, "connector_id": c.ID, "claim_token": raw, "claim_url": claimURL,
 		"honesty": "One-time claim_token — open claim_url while signed into the target Open org. Confirm the org before claiming. Token is not logged.",

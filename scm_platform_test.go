@@ -244,6 +244,7 @@ func TestConnectorClaimSuccess(t *testing.T) {
 	prev := authEnforced
 	authEnforced = true
 	defer func() { authEnforced = prev }()
+	t.Setenv("PEER_OAM_URL", "")
 
 	raw, hash, err := mintConnectorClaimNonce()
 	if err != nil {
@@ -321,6 +322,7 @@ func TestConnectorClaimRejectsWrongNonce(t *testing.T) {
 	prev := authEnforced
 	authEnforced = true
 	defer func() { authEnforced = prev }()
+	t.Setenv("PEER_OAM_URL", "")
 
 	_, hash, err := mintConnectorClaimNonce()
 	if err != nil {
@@ -350,6 +352,7 @@ func TestConnectorClaimRejectsNotPending(t *testing.T) {
 	prev := authEnforced
 	authEnforced = true
 	defer func() { authEnforced = prev }()
+	t.Setenv("PEER_OAM_URL", "")
 
 	conn := &opaConnector{
 		ID: "conn-claim-active", Kind: "github_app", Status: "active",
@@ -375,6 +378,7 @@ func TestConnectorClaimRejectsUnauthorized(t *testing.T) {
 	prev := authEnforced
 	authEnforced = true
 	defer func() { authEnforced = prev }()
+	t.Setenv("PEER_OAM_URL", "")
 
 	raw, hash, err := mintConnectorClaimNonce()
 	if err != nil {
@@ -410,6 +414,7 @@ func TestConnectorClaimRejectsPersonalAccount(t *testing.T) {
 		authEnforced = prevAuth
 		jwtSecret = prevSecret
 	}()
+	t.Setenv("PEER_OAM_URL", "")
 
 	raw, hash, err := mintConnectorClaimNonce()
 	if err != nil {
@@ -690,7 +695,10 @@ func TestIssueClaimTokenRemints(t *testing.T) {
 	var out map[string]interface{}
 	_ = json.Unmarshal(rr.Body.Bytes(), &out)
 	raw, _ := out["claim_token"].(string)
-	if raw == "" || !strings.Contains(fmt.Sprint(out["claim_url"]), "#claim_token=") {
+	if raw == "" || !strings.Contains(fmt.Sprint(out["claim_url"]), "/connectors?") {
+		t.Fatalf("claim_url missing /connectors: %v", out)
+	}
+	if !strings.Contains(fmt.Sprint(out["claim_url"]), "#claim_token=") {
 		t.Fatalf("out=%v", out)
 	}
 	live := getConnector(c.ID)

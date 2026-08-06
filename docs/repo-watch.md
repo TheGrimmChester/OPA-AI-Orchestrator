@@ -65,7 +65,8 @@ Do **not** infer Open tenancy from GitHub `account_login` name equality, and do 
 | `OPA_GITHUB_APP_PRIVATE_KEY` | PEM (use `\n` for newlines in env) |
 | `OPA_GITHUB_WEBHOOK_SECRET` | HMAC |
 | `OPA_PUBLIC_URL` | Agent public base |
-| `OPA_DASHBOARD_URL` | Redirect after install |
+| `OAM_DASHBOARD_URL` | Preferred redirect after install / claim (`/connectors`). Falls back to `OPA_DASHBOARD_URL`. |
+| `OPA_DASHBOARD_URL` | Fallback redirect base (one release); also used for job Check Run links |
 | `OPA_SCM_STATE_DIR` | Durable SCM job + OPA Review stack JSON (default `$OPA_SECURITY_WORKSPACE/scm-state`). Survives Agent restart when the workspace (or this dir) is volume-mounted. Dual-written with ClickHouse `opa.scm_jobs` / `opa.scm_review_stacks`. |
 | `OPA_REVIEW_TMP` | OPA Review + context-gen checkout root (default `/tmp/opa-review`) |
 | `CURSOR_API_KEY` | **Unused for tenant jobs** (formerly a process-wide fallback). Set review-runner / model-provider keys via Account settings (`opa.scm_secrets` scopes). Still injected into the child review-runner process after scoped resolution. |
@@ -248,7 +249,7 @@ Legacy CI without Repo Watch can still call `harness/appsec-pr-check.sh` (tenant
 - `GET /api/connectors`
 - `POST /api/connectors/github/pat`
 - `GET /api/connectors/github/install-url` — mints signed install `state` from the current Open **organization** account (personal accounts → 400)
-- `GET /api/connectors/github/callback` — completes install; orphans redirect to `/settings/connectors?connector=…#claim_token=…` (raw token once in fragment; hash stored). Older `?claim_token=` links still work in dashboards.
+- `GET /api/connectors/github/callback` — completes install; orphans redirect to OAM `/connectors?connector=…#claim_token=…` (raw token once in fragment; hash stored). `OAM_DASHBOARD_URL` preferred over `OPA_DASHBOARD_URL`. Older `?claim_token=` links still work in dashboards.
 - `POST /api/connectors/github/issue-claim-token` — admin remint `{ "installation_id": "…" }` → one-time `claim_token` + `claim_url` for webhook-provisioned pendings
 - `GET|PATCH|DELETE /api/connectors/{id}` — get / edit (login, display_name, replace PAT) / soft-delete + cascade watched (`pending_claim` invisible/immutable)
 - `POST /api/connectors/{id}/claim` — `{ "claim_token": "..." }` claims a `pending_claim` connector into the caller's Open org (CAS; wipe nonce; sync OAM)
