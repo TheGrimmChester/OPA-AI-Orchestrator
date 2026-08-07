@@ -157,7 +157,36 @@ func requireEnabledOAMProject(r *http.Request, product string) (status int, msg 
 	return 0, ""
 }
 
+type oamDirectoryProject struct {
+	ID           string   `json:"id"`
+	ProjectID    string   `json:"project_id"`
+	ExternalKey  string   `json:"external_key"`
+	ConnectorIDs []string `json:"connector_ids"`
+}
+
+func (p oamDirectoryProject) directoryID() string {
+	id := strings.TrimSpace(p.ID)
+	if id == "" {
+		id = strings.TrimSpace(p.ProjectID)
+	}
+	return id
+}
+
 func oamDirectoryHasProject(ctx context.Context, r *http.Request, base, product, projectID string) (bool, error) {
+	row, err := lookupOAMDirectoryProject(ctx, r, base, product, projectID)
+	if err != nil {
+		return false, err
+	}
+	return row != nil, nil
+}
+
+// lookupOAMDirectoryProject returns the product-filtered OAM directory row, or
+// (nil, nil) when the id is absent / disabled for the product.
+func lookupOAMDirectoryProject(ctx context.Context, r *http.Request, base, product, projectID string) (*oamDirectoryProject, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return nil, fmt.Errorf("project id required")
+	}
 	q := url.Values{}
 	q.Set("product", product)
 	if org := strings.TrimSpace(r.Header.Get("X-Organization-ID")); org != "" && !strings.EqualFold(org, "all") {
@@ -166,28 +195,51 @@ func oamDirectoryHasProject(ctx context.Context, r *http.Request, base, product,
 	target := oamProjectsTarget(base, q)
 	raw, status, err := proxyOAMProjectsGET(ctx, target, r)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if status < 200 || status >= 300 {
-		return false, fmt.Errorf("oam returned %d", status)
+		return nil, fmt.Errorf("oam returned %d", status)
 	}
 	var payload struct {
-		Projects []struct {
-			ID        string `json:"id"`
-			ProjectID string `json:"project_id"`
-		} `json:"projects"`
+		Projects []oamDirectoryProject `json:"projects"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return false, err
+		return nil, err
 	}
-	for _, row := range payload.Projects {
-		id := strings.TrimSpace(row.ID)
-		if id == "" {
-			id = strings.TrimSpace(row.ProjectID)
-		}
-		if id == projectID {
-			return true, nil
+	for i := range payload.Projects {
+		row := &payload.Projects[i]
+		if row.directoryID() == projectID {
+			return row, nil
 		}
 	}
-	return false, nil
+	return nil, nil
+}
+
+// resolveConnectorFromOAMProject fills connector_id from the OAM directory when
+// the client omitted it. Fail closed when a concrete project has no connector_ids.
+// Skips (returns input unchanged) when PEER_OAM_URL is unset or project is empty/"all".
+func resolveConnectorFromOAMProject(r *http.Request, connectorID string) (string, string, int) {
+	connectorID = strings.TrimSpace(connectorID)
+	if connectorID != "" {
+		return connectorID, "", 0
+	}
+	base := peerOAMBaseURL()
+	if base == "" {
+		return "", "", 0
+	}
+	proj := strings.TrimSpace(r.Header.Get("X-Project-ID"))
+	if proj == "" || strings.EqualFold(proj, "all") {
+		return "", "", 0
+	}
+	row, err := lookupOAMDirectoryProject(r.Context(), r, base, "ora", proj)
+	if err != nil {
+		return "", "could not resolve project connectors from OAM: " + err.Error(), 503
+	}
+	if row == nil {
+		return "", fmt.Sprintf("project %q is disabled for product ora (OAM disabled_products)", proj), 403
+	}
+	if len(row.ConnectorIDs) == 0 || strings.TrimSpace(row.ConnectorIDs[0]) == "" {
+		return "", "project has no connector_ids; attach a connector in Account Manager", 400
+	}
+	return strings.TrimSpace(row.ConnectorIDs[0]), "", 0
 }

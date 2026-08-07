@@ -428,6 +428,14 @@ func handleAgentPrefsGet(w http.ResponseWriter, r *http.Request) {
 	scope := strings.TrimSpace(r.URL.Query().Get("scope_key"))
 	connectorID := strings.TrimSpace(r.URL.Query().Get("connector_id"))
 	repo := strings.TrimSpace(r.URL.Query().Get("repo"))
+	if level == "installation" || level == "repo" {
+		if filled, errMsg, code := resolveConnectorFromOAMProject(r, connectorID); errMsg != "" {
+			http.Error(w, errMsg, code)
+			return
+		} else if filled != "" {
+			connectorID = filled
+		}
+	}
 	if scope == "" {
 		switch level {
 		case "org":
@@ -478,13 +486,23 @@ func handleAgentPrefsPut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "level must be org, installation, or repo", 400)
 		return
 	}
+	connectorID := strings.TrimSpace(body.ConnectorID)
+	if level == "installation" || level == "repo" {
+		if filled, errMsg, code := resolveConnectorFromOAMProject(r, connectorID); errMsg != "" {
+			http.Error(w, errMsg, code)
+			return
+		} else if filled != "" {
+			connectorID = filled
+			body.ConnectorID = filled
+		}
+	}
 	scope := strings.TrimSpace(body.ScopeKey)
 	if scope == "" {
 		switch level {
 		case "org":
 			scope = org + "/" + proj
 		case "installation":
-			scope = strings.TrimSpace(body.ConnectorID)
+			scope = connectorID
 		default:
 			scope = strings.TrimSpace(body.Repo)
 		}
@@ -494,7 +512,7 @@ func handleAgentPrefsPut(w http.ResponseWriter, r *http.Request) {
 		case "org":
 			http.Error(w, "organization scope unavailable — tenant context missing", 400)
 		case "installation":
-			http.Error(w, "connector_id/scope_key required for installation level", 400)
+			http.Error(w, "connector_id/scope_key required for installation level (or attach connector_ids on the OAM project)", 400)
 		default:
 			http.Error(w, "repo/scope_key required for repository level — use level=org for global prefs", 400)
 		}

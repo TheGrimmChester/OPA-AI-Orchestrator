@@ -42,3 +42,41 @@ func TestOAMDirectoryHasProject(t *testing.T) {
 		t.Fatalf("want found, got ok=%v err=%v", ok, err)
 	}
 }
+
+func TestResolveConnectorFromOAMProject(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"projects": []map[string]interface{}{
+				{"id": "web", "connector_ids": []string{"conn-a"}},
+				{"id": "empty", "connector_ids": []string{}},
+			},
+		})
+	}))
+	defer srv.Close()
+	t.Setenv("PEER_OAM_URL", srv.URL)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Project-ID", "web")
+	got, msg, code := resolveConnectorFromOAMProject(req, "")
+	if msg != "" || code != 0 || got != "conn-a" {
+		t.Fatalf("fill got=%q msg=%q code=%d", got, msg, code)
+	}
+
+	got, msg, code = resolveConnectorFromOAMProject(req, "explicit")
+	if msg != "" || code != 0 || got != "explicit" {
+		t.Fatalf("explicit got=%q msg=%q code=%d", got, msg, code)
+	}
+
+	reqEmpty := httptest.NewRequest(http.MethodGet, "/", nil)
+	reqEmpty.Header.Set("X-Project-ID", "empty")
+	_, msg, code = resolveConnectorFromOAMProject(reqEmpty, "")
+	if code != 400 || msg == "" {
+		t.Fatalf("empty connectors want 400, got %d %q", code, msg)
+	}
+
+	t.Setenv("PEER_OAM_URL", "")
+	got, msg, code = resolveConnectorFromOAMProject(req, "")
+	if got != "" || msg != "" || code != 0 {
+		t.Fatalf("unset peer want skip, got %q %q %d", got, msg, code)
+	}
+}
