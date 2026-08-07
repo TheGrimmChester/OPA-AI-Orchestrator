@@ -37,7 +37,7 @@ GitHub App installs bind to an **Open** org or personal tenant from the **signed
 
 | Path | How tenancy is set |
 |------|--------------------|
-| **Happy path (preferred)** | Dashboard **Connect GitHub App** → `GET /api/connectors/github/install-url` mints a short-lived signed `state` JWT (`org` / `proj` / `user`) from an **organization** Open account → GitHub callback → connector `status=active` under that Open tenant |
+| **Happy path (preferred)** | Dashboard **Connect GitHub App** → `GET /api/connectors/github/install-url` mints a short-lived signed `state` JWT (`org` / `proj` / `user`) from the signed-in Open session (organization account → org bind; personal account → `user_id` / empty org) → GitHub callback → connector `status=active` under that Open tenant |
 | **Orphan / marketplace** | Install without valid `state` → connector `status=pending_claim` + one-time `claim_token` in the dashboard redirect → org admin **`POST /api/connectors/{id}/claim`** with `{ "claim_token": "..." }` |
 
 Do **not** infer Open tenancy from GitHub `account_login` name equality, and do **not** fall back to `default-org` for unscoped installs. `OPA_GITHUB_APP_CLIENT_ID` is optional install-flow OAuth only — not Open↔GitHub user linking.
@@ -49,12 +49,12 @@ Do **not** infer Open tenancy from GitHub `account_login` name equality, and do 
    - **Metadata:** read
    - **Pull requests:** read/write
    - **Checks:** write
-   - **Issues:** read/write (**required** for AI Issues, milestones, roadmap publish, and PR conversation comments)
-   - **Organization projects:** read/write — **optional**, only when `roadmap_projects_v2` is enabled
+   - **Issues:** read/write (**required** for AI Issues, milestones, and PR conversation comments)
+   - **Organization projects:** read/write — **optional**, for Projects v2 peer (`scm:pm`)
 2. Events: `pull_request`, `push`, `installation`, `installation_repositories`, **`issues`**, **`issue_comment`**, **`label`**. Optionally `projects_v2_item` when Projects v2 is on.
 3. Webhook URL: `$ORA_PUBLIC_URL/v1/scm/github/webhook` (legacy alias: `$OPA_PUBLIC_URL/v1/scm/github/webhook`)
 4. Dashboard: `GET /api/connectors/{id}/permissions` probes installation grants and lists missing keys (Issues write, etc.).
-5. AI Issues / roadmap: see [ai-issues-roadmap.md](ai-issues-roadmap.md). Only Issues labelled `AI` (configurable) are auto-processed.
+5. AI Issues: see [ai-issues-roadmap.md](ai-issues-roadmap.md). Only Issues labelled `AI` (configurable) are auto-processed.
 4. Agent env:
 
 | Env | Purpose |
@@ -248,7 +248,7 @@ Legacy CI without Repo Watch can still call `harness/appsec-pr-check.sh` (tenant
 
 - `GET /api/connectors`
 - `POST /api/connectors/github/pat`
-- `GET /api/connectors/github/install-url` — mints signed install `state` from the current Open **organization** account (personal accounts → 400)
+- `GET /api/connectors/github/install-url` — mints signed install `state` from the current Open session (organization → org bind; personal → user_id / empty org)
 - `GET /api/connectors/github/callback` — completes install; orphans redirect to OAM `/connectors?connector=…#claim_token=…` (raw token once in fragment; hash stored). `OAM_DASHBOARD_URL` preferred over `OPA_DASHBOARD_URL`. Older `?claim_token=` links still work in dashboards.
 - `POST /api/connectors/github/issue-claim-token` — admin remint `{ "installation_id": "…" }` → one-time `claim_token` + `claim_url` for webhook-provisioned pendings
 - `GET|PATCH|DELETE /api/connectors/{id}` — get / edit (login, display_name, replace PAT) / soft-delete + cascade watched (`pending_claim` invisible/immutable)

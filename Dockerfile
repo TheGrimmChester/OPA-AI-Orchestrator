@@ -7,19 +7,18 @@ ENV GOSUMDB=sum.golang.org
 COPY go.mod go.sum ./
 RUN go mod download
 COPY *.go ./
-COPY gitleaks.toml ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o ora-api .
 
 # Default compose target — keep this stage named; later runner/egress stages must
 # not become the default image (docker build uses the last stage otherwise).
 FROM debian:bookworm-slim AS ora-api
 ARG TARGETARCH
-ARG GITLEAKS_VERSION=8.30.0
 ARG PLAYWRIGHT_VERSION=1.50.1
 
 # Runtime: git/curl + Cursor Agent CLI + Node/npx + Playwright Chromium
 # (required for OPA Review UI visual MCP via @playwright/mcp --headless).
 # docker.io = CLI client for OPA_JOB_SANDBOX=docker (daemon via mounted sock).
+# AppSec scanners live in OSA — do not bake gitleaks or lite scan scripts here.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl wget git bash \
@@ -34,12 +33,6 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && command -v docker \
  && node -v && npm -v && command -v npx \
- && arch="$TARGETARCH" \
- && case "$arch" in amd64|x86_64) gl_arch=x64 ;; arm64|aarch64) gl_arch=arm64 ;; *) gl_arch=x64 ;; esac \
- && wget -qO /tmp/gitleaks.tgz \
-      "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${gl_arch}.tar.gz" \
- && tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks \
- && rm -f /tmp/gitleaks.tgz \
  && (NO_COLOR=1 curl -fsS https://cursor.com/install | bash \
       && test -x /root/.local/bin/agent \
       && ln -sf /root/.local/bin/agent /usr/local/bin/agent \
@@ -51,8 +44,6 @@ RUN apt-get update \
 
 WORKDIR /root/
 COPY --from=builder /app/ora-api .
-COPY gitleaks.toml /etc/opa/gitleaks.toml
-COPY scripts/ /opt/opa/scripts/
 
 # Browser MCP is a required capability for UI OPA Reviews (disable only via env).
 ENV HTTP_ADDR=:8091 \

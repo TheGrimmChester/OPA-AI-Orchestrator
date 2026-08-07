@@ -26,6 +26,8 @@ func registerInternalConnectorsMux(mux *http.ServeMux) {
 		requireORAServiceJWT(serviceScopeConnectorsWrite, handleInternalGitHubPAT))
 	mux.HandleFunc("/api/internal/connectors/github/install-url",
 		requireORAServiceJWT(serviceScopeConnectorsWrite, handleInternalInstallURL))
+	mux.HandleFunc("/api/internal/connectors/github/finish-install",
+		requireORAServiceJWT(serviceScopeConnectorsWrite, handleInternalFinishInstall))
 	mux.HandleFunc("/api/internal/connectors/",
 		requireORAServiceJWT(serviceScopeConnectorsWrite, handleInternalConnectorSub))
 }
@@ -75,7 +77,14 @@ func prepareInternalConnectorRequest(r *http.Request, claims *openauth.ServiceCl
 	if proj := strings.TrimSpace(r.Header.Get(headerDelegatedProjectID)); proj != "" {
 		r.Header.Set("X-Project-ID", proj)
 	}
-	if org := strings.TrimSpace(r.Header.Get("X-Organization-ID")); org == "" && claims != nil {
+	personal := strings.EqualFold(
+		strings.TrimSpace(r.Header.Get(headerDelegatedAccountType)),
+		openauth.AccountTypePersonal,
+	)
+	if personal {
+		// Personal Open sessions bind by user_id; do not inherit a service JWT org.
+		r.Header.Del("X-Organization-ID")
+	} else if org := strings.TrimSpace(r.Header.Get("X-Organization-ID")); org == "" && claims != nil {
 		if co := strings.TrimSpace(claims.OrgID); co != "" {
 			r.Header.Set("X-Organization-ID", co)
 		}
@@ -89,6 +98,10 @@ func handleInternalGitHubPAT(w http.ResponseWriter, r *http.Request, claims *ope
 
 func handleInternalInstallURL(w http.ResponseWriter, r *http.Request, claims *openauth.ServiceClaims) {
 	handleGitHubInstallURL(w, prepareInternalConnectorRequest(r, claims))
+}
+
+func handleInternalFinishInstall(w http.ResponseWriter, r *http.Request, claims *openauth.ServiceClaims) {
+	handleGitHubFinishInstall(w, prepareInternalConnectorRequest(r, claims))
 }
 
 func handleInternalConnectorSub(w http.ResponseWriter, r *http.Request, claims *openauth.ServiceClaims) {
@@ -116,6 +129,14 @@ func handleInternalConnectorSub(w http.ResponseWriter, r *http.Request, claims *
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+	}
+	if len(parts) >= 2 && parts[1] == "repos" && r.Method == http.MethodGet {
+		handleConnectorRepos(w, r, id)
+		return
+	}
+	if len(parts) >= 2 && parts[1] == "permissions" && r.Method == http.MethodGet {
+		handleConnectorPermissions(w, r, id)
+		return
 	}
 	if len(parts) >= 2 && parts[1] == "claim" && r.Method == http.MethodPost {
 		handleConnectorClaim(w, r, id)

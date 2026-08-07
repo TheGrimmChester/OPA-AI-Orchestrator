@@ -10,7 +10,7 @@ HTTP control plane for **Open Review Agent** (`ora-api`).
 - [Repo Watch](repo-watch.md)
 - [Job isolation](job-isolation.md)
 - [Agent taxonomy](agent-taxonomy.md)
-- [Issues and roadmaps](ai-issues-roadmap.md)
+- [AI Issues](ai-issues-roadmap.md)
 - [Interop](interop.md)
 - [Micro-services](microservices.md)
 - [Changelog](changelog.md)

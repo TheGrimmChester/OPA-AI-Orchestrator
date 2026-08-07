@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	openjobenv "github.com/TheGrimmChester/open-job-env-go"
 	openlogger "github.com/TheGrimmChester/open-logger-go"
 )
 
@@ -184,12 +186,7 @@ func networkForPhase(phase jobPhase) string {
 }
 
 func sandboxMode() string {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("OPA_JOB_SANDBOX"))) {
-	case "docker":
-		return "docker"
-	default:
-		return "off"
-	}
+	return openjobenv.SandboxModeFromEnv()
 }
 
 // resolveAgentBin returns the host-side agent binary (allowlisted env →

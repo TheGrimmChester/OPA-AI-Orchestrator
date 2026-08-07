@@ -23,15 +23,12 @@ const (
 	kindCloud      agentKind = "cloud"
 	kindCheckup    agentKind = "checkup"
 
-	// AI Issues / roadmap (separate graphs from PR runs).
+	// AI Issues (separate graphs from PR runs).
 	kindIssueRun         agentKind = "issue_run"
 	kindIssuePrepare     agentKind = "issue_prepare"
 	kindIssueInvestigate agentKind = "issue_investigate"
 	kindIssuePublish     agentKind = "issue_publish"
 	kindIssueImplement   agentKind = "issue_implement"
-	kindRoadmapRun       agentKind = "roadmap_run"
-	kindRoadmapGenerate  agentKind = "roadmap_generate"
-	kindRoadmapPublish    agentKind = "roadmap_publish"
 )
 
 var agentDependsOn = map[agentKind][]agentKind{
@@ -48,9 +45,6 @@ var agentDependsOn = map[agentKind][]agentKind{
 	kindIssueInvestigate: {kindIssuePrepare},
 	kindIssuePublish:     {kindIssueInvestigate},
 	kindIssueImplement:   {kindIssuePublish},
-
-	kindRoadmapGenerate: nil,
-	kindRoadmapPublish:  {kindRoadmapGenerate},
 }
 
 type agentCaps uint16
@@ -95,8 +89,6 @@ var agentStageRegistry = []agentStage{
 	{Name: "issue.publish", Kind: kindIssuePublish, Phase: "", Caps: capGitHubWrite, Timeout: 120 * time.Second, CheckRun: "OPA Issue"},
 	{Name: "issue.implement", Kind: kindIssueImplement, Phase: jobPhaseAutofix, Caps: capExecUntrusted | capWritableTree, Timeout: 1800 * time.Second, CheckRun: "OPA Issue Implement"},
 	{Name: "issue.implement.land", Kind: kindIssueImplement, Phase: "", Caps: capGitHubWrite | capGitPush, Timeout: 300 * time.Second, CheckRun: "OPA Issue Implement"},
-	{Name: "roadmap.generate", Kind: kindRoadmapGenerate, Phase: jobPhaseAITask, Caps: capExecUntrusted, Timeout: 1200 * time.Second, CheckRun: "OPA Roadmap"},
-	{Name: "roadmap.publish", Kind: kindRoadmapPublish, Phase: "", Caps: capGitHubWrite, Timeout: 300 * time.Second, CheckRun: "OPA Roadmap"},
 }
 
 func init() {

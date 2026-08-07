@@ -1,6 +1,6 @@
 # ORA-API
 
-Go API for **Open Review Agent** — Repo Watch, SCM connectors, automated code review, review check-runs, coding agents, and roadmaps.
+Go API for **Open Review Agent** — Repo Watch, SCM connectors, automated code review, review check-runs, and coding agents.
 
 | Port (smoke) | Service |
 |---|---|

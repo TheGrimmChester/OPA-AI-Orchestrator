@@ -1135,6 +1135,10 @@ func handleSCMAIReview(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
+	if st, msg := requireEnabledOAMProject(r, "ora"); st != 0 {
+		http.Error(w, msg, st)
+		return
+	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	var body struct {
 		RepoFullName    string `json:"repo_full_name"`
@@ -1436,7 +1440,7 @@ func processSCMJob(jobID string) {
 // dispatch wiring is unit-testable without running agents.
 func scmJobProcessor(k agentKind) string {
 	switch {
-	case k == kindRun || k == kindIssueRun || k == kindRoadmapRun:
+	case k == kindRun || k == kindIssueRun:
 		return "run"
 	case isAgentChildKind(k):
 		return "agent"
@@ -1452,8 +1456,7 @@ func scmJobProcessor(k agentKind) string {
 func isAgentChildKind(k agentKind) bool {
 	switch k {
 	case kindPrepare, kindSecurity, kindBugbot, kindCheckup, kindApproval, kindCloud,
-		kindIssuePrepare, kindIssueInvestigate, kindIssuePublish, kindIssueImplement,
-		kindRoadmapGenerate, kindRoadmapPublish:
+		kindIssuePrepare, kindIssueInvestigate, kindIssuePublish, kindIssueImplement:
 		return true
 	default:
 		return false

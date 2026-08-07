@@ -29,7 +29,6 @@ func TestProcessSCMJobDispatchesAgentChildren(t *testing.T) {
 	}{
 		{kindRun, "run"},
 		{kindIssueRun, "run"},
-		{kindRoadmapRun, "run"},
 		{kindPrepare, "agent"},
 		{kindSecurity, "agent"},
 		{kindBugbot, "agent"},
@@ -37,7 +36,6 @@ func TestProcessSCMJobDispatchesAgentChildren(t *testing.T) {
 		{kindApproval, "agent"},
 		{kindCloud, "agent"},
 		{kindIssueInvestigate, "agent"},
-		{kindRoadmapGenerate, "agent"},
 		{kindContinuous, "continuous"},
 		{agentKind(""), "unknown"},
 		{agentKind("unknown"), "unknown"},

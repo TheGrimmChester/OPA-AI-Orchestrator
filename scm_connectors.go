@@ -26,8 +26,12 @@ import (
 func registerRepoWatchMux(mux *http.ServeMux, authView, authAdmin func(string, http.HandlerFunc)) {
 	// Connector list/read accept user JWT or peer service JWT (connectors:read).
 	registerConnectorReadAuth(mux, "/api/connectors", handleConnectorsList)
-	authAdmin("/api/connectors/github/install-url", handleGitHubInstallURL)
-	authAdmin("/api/connectors/github/issue-claim-token", handleIssueClaimToken)
+	// Install URL: viewer+ (org members / personal users manage their own binds).
+	authView("/api/connectors/github/install-url", handleGitHubInstallURL)
+	// Finish install after webhook-only App installs (Setup URL / callback miss).
+	authView("/api/connectors/github/finish-install", handleGitHubFinishInstall)
+	// Remint claim token: viewer+ with installation_id (self-service recovery).
+	authView("/api/connectors/github/issue-claim-token", handleIssueClaimToken)
 	mux.HandleFunc("/api/connectors/github/callback", handleGitHubCallback)
 	// PAT connect: viewer+ (scope gates in-handler — users can add personal PATs).
 	registerAISettingsAuth(mux, "/api/connectors/github/pat", handleGitHubPATConnect)
@@ -207,14 +211,15 @@ func handleConnectorsList(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	canEditOrg, canEditAdmin, canEditUser := connectorEditFlags(a)
 	writeJSON(w, map[string]interface{}{
 		"connectors":            list,
 		"github_app_configured": githubAppConfigured(),
 		"scopes":                []string{credScopeUser, credScopeOrg, credScopeAdmin},
-		"can_edit_org":          a.isAdmin() && a.OrganizationID != "",
-		"can_edit_admin":        a.isAdmin(),
-		"can_edit_user":         a.Username != "" || !authEnforced,
-		"honesty":               "Connectors are scoped admin|org|user. Admin connectors are never shared. Org connectors are inherited by members; users may add personal overrides.",
+		"can_edit_org":          canEditOrg,
+		"can_edit_admin":        canEditAdmin,
+		"can_edit_user":         canEditUser,
+		"honesty":               "Connectors are scoped admin|org|user. Admin connectors are never shared. Org connectors are managed by org members; users may add personal overrides. Platform admin overview does not replace member self-service.",
 	})
 }
 
@@ -271,9 +276,6 @@ func handleGitHubInstallURL(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
-	if !requireOrganizationAccountHTTP(w, r, "GitHub App install") {
-		return
-	}
 	appSlug := envOr("OPA_GITHUB_APP_SLUG", "")
 	appID := strings.TrimSpace(os.Getenv("OPA_GITHUB_APP_ID"))
 	public := strings.TrimRight(envOr("OPA_PUBLIC_URL", "http://127.0.0.1:8080"), "/")
@@ -286,6 +288,7 @@ func handleGitHubInstallURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a := actorFromRequest(r)
+	personal := requestIsPersonalAccount(r)
 	ctx, _ := ExtractTenantContext(r, queryClient)
 	org, proj := ctx.WriteTenant()
 	if a.OrganizationID != "" {
@@ -297,14 +300,25 @@ func handleGitHubInstallURL(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	org = strings.TrimSpace(org)
-	if org == "" {
+	if personal {
+		// Personal Open session: never inherit leftover/default-org; bind by user.
+		org = ""
+		if strings.TrimSpace(a.Username) == "" {
+			http.Error(w, "username required for personal GitHub App install", 400)
+			return
+		}
+	} else if org == "" {
 		http.Error(w, "organization_id required — GitHub App install binds to an Open organization account", 400)
 		return
+	}
+	if proj == "" || proj == tenantAll {
+		proj = defaultProjectID
 	}
 	state := ""
 	stateNote := ""
 	if s, err := mintGitHubInstallState(org, proj, a.Username); err == nil {
 		state = s
+		rememberInstallIntent(org, proj, a.Username, personal)
 	} else {
 		stateNote = err.Error()
 	}
@@ -312,18 +326,19 @@ func handleGitHubInstallURL(w http.ResponseWriter, r *http.Request) {
 	if state != "" {
 		installURL += "?state=" + state
 	}
-	if cid := strings.TrimSpace(os.Getenv("OPA_GITHUB_APP_CLIENT_ID")); cid != "" {
-		installURL = fmt.Sprintf("https://github.com/login/oauth/authorize?client_id=%s", cid)
-		if state != "" {
-			installURL += "&state=" + state
-		}
-	}
+	// Do not rewrite to login/oauth/authorize — that is user OAuth, not App
+	// install, and drops the installation callback + state bind path.
+	callbackURL := public + "/api/connectors/github/callback"
 	writeJSON(w, map[string]interface{}{
 		"ok": true, "configured": true, "install_url": installURL,
-		"webhook_url":  public + "/v1/scm/github/webhook",
-		"callback_url": public + "/api/connectors/github/callback",
+		"webhook_url":     public + "/v1/scm/github/webhook",
+		"callback_url":    callbackURL,
+		"setup_url":       callbackURL,
+		"setup_url_note":  "GitHub App → Setup URL (optional) must be this callback so installs bind with state. If Setup URL is blank, return to Connectors after install — finish-install binds the pending webhook row.",
 		"organization_id": org, "project_id": proj,
+		"user_id": a.Username, "personal": personal,
 		"state_signed": state != "", "state_note": stateNote,
+		"finish_hint":  "After installing on GitHub, return to Connectors — the console completes binding even when the Setup callback was missed.",
 	})
 }
 
@@ -364,21 +379,34 @@ func handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		id := ""
 		if org != "" && existing.OrganizationID == org {
 			id = existing.ID
+		} else if org == "" && userID != "" &&
+			strings.TrimSpace(existing.UserID) == userID &&
+			strings.TrimSpace(existing.OrganizationID) == "" {
+			id = existing.ID
 		}
 		redirectConnectors(id, "")
 		return
 	}
 
-	// Signed install state → bind (or activate an existing pending) into that org.
-	if org != "" {
+	// Signed install state → bind (or activate an existing pending) into that tenant.
+	// Org accounts: non-empty org + scope=org. Personal: empty org + user + scope=user.
+	if org != "" || userID != "" {
+		bindScope := credScopeOrg
+		if org == "" {
+			bindScope = credScopeUser
+		}
 		var c *opaConnector
 		if existing != nil && strings.EqualFold(strings.TrimSpace(existing.Status), "pending_claim") {
 			c = existing
 		} else {
-			id := loadID("conn", org, proj, "github_app", inst)
+			idKey := org
+			if idKey == "" {
+				idKey = "user:" + userID
+			}
+			id := loadID("conn", idKey, proj, "github_app", inst)
 			c = &opaConnector{
 				ID: id, Kind: "github_app", InstallationID: inst,
-				Scope: credScopeOrg, CreatedAt: now,
+				Scope: bindScope, CreatedAt: now,
 			}
 		}
 		meta := parseConnectorMeta(c.MetaJSON)
@@ -394,7 +422,7 @@ func handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		prevOrg, prevProj := c.OrganizationID, c.ProjectID
 		c.OrganizationID = org
 		c.ProjectID = proj
-		c.Scope = credScopeOrg
+		c.Scope = bindScope
 		c.UserID = userID
 		c.Kind = "github_app"
 		c.InstallationID = inst
@@ -488,40 +516,22 @@ func mintConnectorClaimNonce() (raw, hash string, err error) {
 	return raw, hash, nil
 }
 
-// requireOrganizationAccountHTTP rejects personal Open accounts. GitHub App
-// install/claim is organization-only (role admin does not bypass account_type).
-func requireOrganizationAccountHTTP(w http.ResponseWriter, r *http.Request, action string) bool {
-	// OAM peer writes carry delegated account_type (no user JWT on the wire).
+// requestIsPersonalAccount reports whether the caller is a personal Open account
+// (JWT account_type or OAM-delegated header). Personal accounts may install/claim
+// GitHub Apps under user_id ownership; organization ACL is unchanged for org accounts.
+func requestIsPersonalAccount(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
 	if isPeerOAMConnectorWrite(r) {
 		at := strings.ToLower(strings.TrimSpace(r.Header.Get(headerDelegatedAccountType)))
-		if at == openauth.AccountTypePersonal {
-			http.Error(w, action+" requires an organization Open account (not personal)", 400)
-			return false
-		}
-		if at == openauth.AccountTypeOrganization {
-			return true
-		}
-		if strings.TrimSpace(r.Header.Get("X-Organization-ID")) != "" {
-			return true
-		}
-		http.Error(w, action+" requires an organization Open account (not personal)", 400)
-		return false
+		return at == openauth.AccountTypePersonal
 	}
 	claims := claimsFromRequestToken(r)
 	if claims == nil {
-		return true
-	}
-	at := strings.ToLower(strings.TrimSpace(claims.AccountType))
-	if at == openauth.AccountTypePersonal {
-		http.Error(w, action+" requires an organization Open account (not personal)", 400)
 		return false
 	}
-	if at == "" && strings.TrimSpace(claims.OrgID) == "" {
-		// Legacy unbound token without account_type — treat as personal for App bind.
-		http.Error(w, action+" requires an organization Open account (not personal)", 400)
-		return false
-	}
-	return true
+	return strings.EqualFold(strings.TrimSpace(claims.AccountType), openauth.AccountTypePersonal)
 }
 
 // connectorsDashboardBaseURL prefers OAM_DASHBOARD_URL for post-install / claim
@@ -551,14 +561,13 @@ func connectorsDashboardURL(connectorID, claimRaw string) string {
 
 var connectorClaimMu sync.Mutex
 
-// POST /api/connectors/{id}/claim — organization account attaches a pending_claim
-// GitHub App install using the one-time claim_token from the orphan callback.
+// POST /api/connectors/{id}/claim — attaches a pending_claim GitHub App install
+// using the one-time claim_token from the orphan callback.
+// Org Open accounts claim into their JWT org (scope=org); personal Open accounts
+// claim into user_id ownership (empty org, scope=user).
 // CAS pending→active; wipe nonce; stamp watches; OAM sync via persist.
 func handleConnectorClaim(w http.ResponseWriter, r *http.Request, id string) {
 	if refuseOAMLocalWrite(w, r) {
-		return
-	}
-	if !requireOrganizationAccountHTTP(w, r, "GitHub App claim") {
 		return
 	}
 	rawBody, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
@@ -580,11 +589,6 @@ func handleConnectorClaim(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "not found", 404)
 		return
 	}
-	a := actorFromRequest(r)
-	if !a.isAdmin() {
-		http.Error(w, "admin role required to claim a connector", 403)
-		return
-	}
 	if !strings.EqualFold(strings.TrimSpace(c.Status), "pending_claim") {
 		writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
 			"ok": false, "error": "not_pending_claim",
@@ -603,33 +607,70 @@ func handleConnectorClaim(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
-	org := strings.TrimSpace(a.OrganizationID)
-	proj := strings.TrimSpace(a.ProjectID)
+	org, proj, uid, bindScope, personal, err := claimTenantFromRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	activatePendingConnectorLocked(c, org, proj, uid, bindScope, personal, "claim_token")
+	honesty := "Claimed into the Open organization from your session — not from GitHub account_login."
+	if personal {
+		honesty = "Claimed into your personal Open account (user_id) — not from GitHub account_login."
+	}
+	writeJSON(w, map[string]interface{}{
+		"ok": true, "connector": connectorPublic(c),
+		"honesty": honesty,
+	})
+}
+
+// claimTenantFromRequest resolves org/user bind targets for claim / finish-install.
+func claimTenantFromRequest(r *http.Request) (org, proj, uid, bindScope string, personal bool, err error) {
+	a := actorFromRequest(r)
+	personal = requestIsPersonalAccount(r)
+	org = strings.TrimSpace(a.OrganizationID)
+	proj = strings.TrimSpace(a.ProjectID)
 	if claims := claimsFromRequestToken(r); claims != nil {
 		if jo := strings.TrimSpace(claims.OrgID); jo != "" {
 			org = jo
 		}
 	}
-	if org == "" {
+	if !personal && org == "" {
 		ctx, _ := ExtractTenantContext(r, queryClient)
 		if ctx != nil {
 			org, proj = ctx.WriteTenant()
 		}
 	}
 	org = strings.TrimSpace(org)
-	if org == "" {
-		http.Error(w, "organization_id required — select an Open organization before claiming", 400)
-		return
+	uid = strings.TrimSpace(a.Username)
+	bindScope = credScopeOrg
+	if personal {
+		if uid == "" {
+			return "", "", "", "", personal, fmt.Errorf("username required for personal GitHub App claim")
+		}
+		org = ""
+		bindScope = credScopeUser
+	} else if org == "" {
+		return "", "", "", "", personal, fmt.Errorf("organization_id required — select an Open organization before claiming")
 	}
 	if proj == "" || proj == tenantAll {
 		proj = defaultProjectID
 	}
+	return org, proj, uid, bindScope, personal, nil
+}
+
+// activatePendingConnectorLocked requires connectorClaimMu held. Turns a
+// pending_claim row into an active binder under the caller's Open tenant.
+func activatePendingConnectorLocked(c *opaConnector, org, proj, uid, bindScope string, personal bool, via string) {
+	if c == nil {
+		return
+	}
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000")
+	meta := parseConnectorMeta(c.MetaJSON)
 	prevOrg, prevProj := c.OrganizationID, c.ProjectID
 	c.OrganizationID = org
 	c.ProjectID = proj
-	c.Scope = credScopeOrg
-	if uid := strings.TrimSpace(a.Username); uid != "" {
+	c.Scope = bindScope
+	if uid != "" {
 		c.UserID = uid
 	}
 	c.Status = "active"
@@ -637,21 +678,207 @@ func handleConnectorClaim(w http.ResponseWriter, r *http.Request, id string) {
 	delete(meta, "pending_claim")
 	delete(meta, "claim_nonce_hash")
 	meta["claimed_at"] = now
-	if a.Username != "" {
-		meta["claimed_by"] = a.Username
+	if uid != "" {
+		meta["claimed_by"] = uid
 	}
-	meta["claimed_organization_id"] = org
+	if via != "" {
+		meta["bound_via"] = via
+	}
+	if personal {
+		meta["claimed_user_id"] = uid
+	} else {
+		meta["claimed_organization_id"] = org
+	}
 	meta["claimed_project_id"] = proj
 	b, _ := json.Marshal(meta)
 	c.MetaJSON = string(b)
-	connectorLive.Store(id, c)
+	connectorLive.Store(c.ID, c)
 	persistConnectorOrgMove(c, prevOrg, prevProj)
 	softDeleteOtherInstallConnectors(c.ID, c.InstallationID)
 	stampWatchedTenantForConnectorForce(c)
+}
+
+// POST /api/connectors/github/finish-install — bind a pending_claim App install
+// after a webhook-only install (Setup callback missed). Proof is either:
+//  1. a recent install-url intent for this Open session, or
+//  2. an explicit installation_id (from GitHub App settings) claimed into the
+//     caller's Open tenant.
+// No GitHub↔Open OAuth account link is required.
+func handleGitHubFinishInstall(w http.ResponseWriter, r *http.Request) {
+	if refuseOAMLocalWrite(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	rawBody, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	var body struct {
+		InstallationID string `json:"installation_id"`
+	}
+	_ = json.Unmarshal(rawBody, &body)
+	installationID := strings.TrimSpace(body.InstallationID)
+
+	org, proj, uid, bindScope, personal, err := claimTenantFromRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	connectorClaimMu.Lock()
+	defer connectorClaimMu.Unlock()
+
+	var target *opaConnector
+	via := "finish_install"
+	if installationID != "" {
+		c := findConnectorByInstallation(installationID)
+		if c == nil || c.Status == "deleted" {
+			writeJSONStatus(w, http.StatusNotFound, map[string]interface{}{
+				"ok": false, "error": "not_found",
+				"message": "no connector for that installation_id",
+			})
+			return
+		}
+		if strings.EqualFold(strings.TrimSpace(c.Status), "active") {
+			// Already bound — idempotent success when caller owns it.
+			if canSeeConnector(actorFromRequest(r), c) {
+				writeJSON(w, map[string]interface{}{
+					"ok": true, "connector": connectorPublic(c),
+					"already_active": true,
+					"honesty":        "Installation already bound to an Open tenant.",
+				})
+				return
+			}
+			writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
+				"ok": false, "error": "already_bound",
+				"message": "installation is already bound to another Open tenant",
+			})
+			return
+		}
+		if !strings.EqualFold(strings.TrimSpace(c.Status), "pending_claim") {
+			writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
+				"ok": false, "error": "not_pending_claim", "status": c.Status,
+			})
+			return
+		}
+		target = c
+		via = "finish_install_installation_id"
+		// Explicit installation_id is enough; drop a matching intent if present.
+		_, _ = consumeInstallIntent(uid, org, personal)
+	} else {
+		intent, ok := peekInstallIntent(uid, org, personal)
+		if !ok {
+			writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
+				"ok": false, "error": "no_install_intent",
+				"message": "No recent Connect GitHub App click for this session. Click Connect again, install on GitHub, then return here — or pass installation_id from the GitHub App installation settings URL.",
+			})
+			return
+		}
+		candidates := listPendingClaimConnectorsLocked()
+		var matched []*opaConnector
+		for _, c := range candidates {
+			updated, _ := time.Parse("2006-01-02 15:04:05.000", strings.TrimSpace(c.UpdatedAt))
+			created, _ := time.Parse("2006-01-02 15:04:05.000", strings.TrimSpace(c.CreatedAt))
+			when := updated
+			if created.After(when) {
+				when = created
+			}
+			// Allow webhook slightly before mint (clock / race) — 2 minutes slack.
+			if when.Before(intent.MintedAt.Add(-2 * time.Minute)) {
+				continue
+			}
+			matched = append(matched, c)
+		}
+		if len(matched) == 0 {
+			writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
+				"ok": false, "error": "no_pending_install",
+				"message": "No pending GitHub App install found since you clicked Connect. Confirm the App was installed, then retry or pass installation_id.",
+				"setup_url": strings.TrimRight(envOr("OPA_PUBLIC_URL", ""), "/") + "/api/connectors/github/callback",
+			})
+			return
+		}
+		if len(matched) > 1 {
+			rows := make([]map[string]interface{}, 0, len(matched))
+			for _, c := range matched {
+				rows = append(rows, map[string]interface{}{
+					"id": c.ID, "installation_id": c.InstallationID,
+					"account_login": c.AccountLogin, "status": c.Status,
+				})
+			}
+			writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
+				"ok": false, "error": "multiple_pending",
+				"message":    "Several pending installs — pick one installation_id and POST finish-install again.",
+				"candidates": rows,
+			})
+			return
+		}
+		target = matched[0]
+		_, _ = consumeInstallIntent(uid, org, personal)
+		via = "finish_install_intent"
+	}
+
+	activatePendingConnectorLocked(target, org, proj, uid, bindScope, personal, via)
+	honesty := "Bound into the Open organization from your session — not from GitHub account_login."
+	if personal {
+		honesty = "Bound into your personal Open account — not from GitHub account_login."
+	}
 	writeJSON(w, map[string]interface{}{
-		"ok": true, "connector": connectorPublic(c),
-		"honesty": "Claimed into the Open organization from your session — not from GitHub account_login.",
+		"ok": true, "connector": connectorPublic(target),
+		"honesty": honesty,
 	})
+}
+
+// listPendingClaimConnectorsLocked gathers pending_claim rows from live + CH.
+// Caller must hold connectorClaimMu.
+func listPendingClaimConnectorsLocked() []*opaConnector {
+	seen := map[string]struct{}{}
+	out := []*opaConnector{}
+	appendPending := func(c *opaConnector) {
+		if c == nil || c.Status == "deleted" {
+			return
+		}
+		if !strings.EqualFold(strings.TrimSpace(c.Status), "pending_claim") {
+			return
+		}
+		if _, ok := seen[c.ID]; ok {
+			return
+		}
+		seen[c.ID] = struct{}{}
+		out = append(out, c)
+	}
+	connectorLive.Range(func(_, v interface{}) bool {
+		c, ok := v.(*opaConnector)
+		if ok {
+			appendPending(c)
+		}
+		return true
+	})
+	if queryClient != nil {
+		rows, err := queryClient.Query(`
+			SELECT id, organization_id, project_id, scope, user_id, kind, installation_id, account_login,
+			       status, token_ref, meta_json, created_at, updated_at
+			FROM opa.connectors WHERE status = 'pending_claim' ORDER BY updated_at DESC LIMIT 100`)
+		if err != nil {
+			rows, err = queryClient.Query(`
+				SELECT id, organization_id, project_id, kind, installation_id, account_login,
+				       status, token_ref, meta_json, created_at, updated_at
+				FROM opa.connectors WHERE status = 'pending_claim' ORDER BY updated_at DESC LIMIT 100`)
+		}
+		if err == nil {
+			for _, row := range rows {
+				id, _ := row["id"].(string)
+				if id == "" {
+					continue
+				}
+				if live := getOrHydrateConnector(id); live != nil {
+					appendPending(live)
+					continue
+				}
+				appendPending(connectorFromCHRow(context.Background(), row, false))
+			}
+		}
+	}
+	return out
 }
 
 func handleGitHubPATConnect(w http.ResponseWriter, r *http.Request) {
@@ -679,11 +906,8 @@ func handleGitHubPATConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	// Non-admins may only create personal connectors.
-	if !a.isAdmin() {
-		scope = credScopeUser
-	}
-	if err := canWriteCredScope(a, scope); err != nil {
+	// Org members may create org-scoped PATs; personal users create user-scoped.
+	if err := canWriteConnectorScope(a, scope); err != nil {
 		http.Error(w, err.Error(), 403)
 		return
 	}
@@ -810,7 +1034,7 @@ func stampWatchedTenantForConnectorOpts(c *opaConnector, force bool) {
 }
 
 // GET /api/connectors/{id}/permissions — installation permission health for
-// AI Issues / roadmap (Dashboard banner).
+// AI Issues and scm:pm Projects v2 (Dashboard banner).
 func handleConnectorPermissions(w http.ResponseWriter, r *http.Request, id string) {
 	c := getOrHydrateConnector(id)
 	if denyConnectorIfInvisible(w, r, c) {
@@ -855,7 +1079,7 @@ func denyConnectorIfImmutable(w http.ResponseWriter, r *http.Request, c *opaConn
 	}
 	a := actorFromRequest(r)
 	scope := inferLegacyScope(c.OrganizationID, c.Scope)
-	if err := canMutateCred(a, scope, c.UserID, c.OrganizationID); err != nil {
+	if err := canMutateConnector(a, scope, c.UserID, c.OrganizationID); err != nil {
 		http.Error(w, err.Error(), 403)
 		return true
 	}
@@ -1605,7 +1829,8 @@ func findWatched(repo string) (*opaWatchedRepo, *opaConnector) {
 	return found, getOrHydrateConnector(found.ConnectorID)
 }
 
-// connectorUsableForWatch is true only for active binders with a non-empty org.
+// connectorUsableForWatch is true for active binders that are org-bound or
+// personal user-owned (empty org + scope=user + user_id).
 func connectorUsableForWatch(c *opaConnector) bool {
 	if c == nil || c.Status == "deleted" {
 		return false
@@ -1613,7 +1838,11 @@ func connectorUsableForWatch(c *opaConnector) bool {
 	if !strings.EqualFold(strings.TrimSpace(c.Status), "active") {
 		return false
 	}
-	return strings.TrimSpace(c.OrganizationID) != ""
+	if strings.TrimSpace(c.OrganizationID) != "" {
+		return true
+	}
+	scope := inferLegacyScope(c.OrganizationID, c.Scope)
+	return scope == credScopeUser && strings.TrimSpace(c.UserID) != ""
 }
 
 // preferWatchedForChecks picks the github_app watch when both App and PAT watch
@@ -1724,17 +1953,16 @@ func ensureGitHubAppConnector(installationID, accountLogin string) *opaConnector
 // POST /api/connectors/github/issue-claim-token — remint a one-time claim_token
 // for a pending_claim install identified by GitHub installation_id. Knowing the
 // installation id (from GitHub) is the gate; pendings stay invisible on list/get.
+// Viewer+ may remint (self-service). Prefer finish-install when returning from
+// Connect GitHub App; this remains for claim_token deep-links.
 func handleIssueClaimToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
-	if !requireOrganizationAccountHTTP(w, r, "issue claim token") {
-		return
-	}
 	a := actorFromRequest(r)
-	if !a.isAdmin() {
-		http.Error(w, "admin role required", 403)
+	if strings.TrimSpace(a.Username) == "" && authEnforced {
+		http.Error(w, "authentication required", 401)
 		return
 	}
 	rawBody, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
@@ -1765,26 +1993,26 @@ func handleIssueClaimToken(w http.ResponseWriter, r *http.Request) {
 	}
 	meta := parseConnectorMeta(c.MetaJSON)
 	existingHash := strings.TrimSpace(fmt.Sprint(meta["claim_nonce_hash"]))
-	// Default: only backfill hash-less rows. Force remint requires possession of
-	// the prior claim_token so foreign admins cannot invalidate callback links.
-	if existingHash != "" {
-		if !body.Force {
-			writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
-				"ok": false, "error": "claim_token_already_issued",
-				"message": "claim_token already minted — use the original callback link, or pass force=true with prior_claim_token",
-				"connector_id": c.ID,
-			})
-			return
-		}
+	// Force remint: installation_id is the capability. Optional prior_claim_token
+	// still accepted when the caller has the old fragment; not required so lost
+	// Setup redirects remain recoverable.
+	if existingHash != "" && !body.Force {
+		writeJSONStatus(w, http.StatusConflict, map[string]interface{}{
+			"ok": false, "error": "claim_token_already_issued",
+			"message": "claim_token already minted — use finish-install, the original callback link, or pass force=true",
+			"connector_id": c.ID,
+			"finish_hint":  "POST /api/connectors/github/finish-install with this installation_id",
+		})
+		return
+	}
+	if existingHash != "" && body.Force {
 		prior := strings.TrimSpace(body.PriorClaimToken)
-		if prior == "" {
-			http.Error(w, "prior_claim_token required when force=true", 400)
-			return
-		}
-		sum := sha256.Sum256([]byte(prior))
-		if !hmac.Equal([]byte(existingHash), []byte(hex.EncodeToString(sum[:]))) {
-			http.Error(w, "invalid prior_claim_token", 403)
-			return
+		if prior != "" {
+			sum := sha256.Sum256([]byte(prior))
+			if !hmac.Equal([]byte(existingHash), []byte(hex.EncodeToString(sum[:]))) {
+				http.Error(w, "invalid prior_claim_token", 403)
+				return
+			}
 		}
 	}
 	raw, hash, err := mintConnectorClaimNonce()
@@ -1810,7 +2038,7 @@ func handleIssueClaimToken(w http.ResponseWriter, r *http.Request) {
 	claimURL := connectorsDashboardURL(c.ID, raw)
 	writeJSON(w, map[string]interface{}{
 		"ok": true, "connector_id": c.ID, "claim_token": raw, "claim_url": claimURL,
-		"honesty": "One-time claim_token — open claim_url while signed into the target Open org. Confirm the org before claiming. Token is not logged.",
+		"honesty": "One-time claim_token — open claim_url while signed into the target Open org or personal account. Confirm the tenant before claiming. Token is not logged.",
 	})
 }
 
@@ -1991,6 +2219,9 @@ func handleSCMSettings(w http.ResponseWriter, r *http.Request) {
 func handleCursorKeySet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
+		return
+	}
+	if refuseOAMLocalWrite(w, r) {
 		return
 	}
 	a := actorFromRequest(r)

@@ -9,8 +9,8 @@ func scmRunSkipGate(job *scmJob) (skip bool, reason, priorID string) {
 		return true, "missing job", ""
 	}
 	switch agentKind(job.Kind) {
-	case kindIssueRun, kindRoadmapRun:
-		// Issue/roadmap parents are not PR review jobs — skip merge/SHA gates.
+	case kindIssueRun:
+		// Issue parents are not PR review jobs — skip merge/SHA gates.
 		return false, "", ""
 	}
 	// Defense-in-depth: never start AppSec/AI on an already-merged PR —

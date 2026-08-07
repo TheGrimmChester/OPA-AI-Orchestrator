@@ -43,10 +43,9 @@ type agentPrefs struct {
 	CloudEnabled             bool   `json:"cloud_enabled"`
 	CloudRunTests            bool   `json:"cloud_run_tests"`
 	CheckupEnabled           bool   `json:"checkup_enabled"`
-	// AI Issues / roadmap (Aperant-style autonomy). Fail-closed capabilities.
+	// AI Issues. Fail-closed capabilities.
 	AIIssueLabels            []string `json:"ai_issue_labels"`
 	IssueAutoImplement       bool     `json:"issue_auto_implement"`
-	RoadmapProjectsV2        bool     `json:"roadmap_projects_v2"`
 	RequireHumanBeforeCoding bool     `json:"require_human_before_coding"`
 	AIIssuesEnabled          bool     `json:"ai_issues_enabled"`
 }
@@ -75,7 +74,6 @@ func builtinAgentPrefs() agentPrefs {
 		CheckupEnabled:           false,
 		AIIssueLabels:            []string{"AI"},
 		IssueAutoImplement:       false,
-		RoadmapProjectsV2:        false,
 		RequireHumanBeforeCoding: true,
 		AIIssuesEnabled:          true,
 	}
@@ -85,7 +83,7 @@ func builtinAgentPrefs() agentPrefs {
 var agentPrefsCapabilityFields = map[string]bool{
 	"cloud_enabled": true, "cloud_run_tests": true, "autofix_mode": true,
 	"auto_approve": true, "learned_rules": true, "checkup_enabled": true,
-	"issue_auto_implement": true, "roadmap_projects_v2": true,
+	"issue_auto_implement": true,
 	"ai_issues_enabled": true,
 }
 
@@ -215,7 +213,6 @@ func applyPrefsPatch(out *agentPrefs, sources map[string]string, patch map[strin
 	takeBool("cloud_run_tests", &out.CloudRunTests)
 	takeBool("checkup_enabled", &out.CheckupEnabled)
 	takeBool("issue_auto_implement", &out.IssueAutoImplement)
-	takeBool("roadmap_projects_v2", &out.RoadmapProjectsV2)
 	takeBool("require_human_before_coding", &out.RequireHumanBeforeCoding)
 	takeBool("ai_issues_enabled", &out.AIIssuesEnabled)
 	if raw, ok := patch["ai_issue_labels"]; ok && string(raw) != "null" {

@@ -146,7 +146,8 @@ func normalizeCredScope(raw string, a credActor) (string, error) {
 	}
 }
 
-// canWriteCredScope enforces who may create/update credentials at a scope.
+// canWriteCredScope enforces who may create/update AI credentials at a scope.
+// Org-scoped secrets remain admin-gated. Connectors use canWriteConnectorScope.
 func canWriteCredScope(a credActor, scope string) error {
 	switch scope {
 	case credScopeAdmin:
@@ -172,10 +173,76 @@ func canWriteCredScope(a credActor, scope string) error {
 	}
 }
 
-// connectorIsUnclaimed reports pending_claim or empty-org non-admin rows. These
+// canWriteConnectorScope allows org members (viewer+) to manage org connectors
+// and authenticated users to manage user connectors. Admin scope stays admin-only.
+func canWriteConnectorScope(a credActor, scope string) error {
+	switch scope {
+	case credScopeAdmin:
+		if !a.isAdmin() {
+			return fmt.Errorf("admin scope requires admin role")
+		}
+		return nil
+	case credScopeOrg:
+		if strings.TrimSpace(a.OrganizationID) == "" {
+			return fmt.Errorf("org scope requires X-Organization-ID")
+		}
+		if a.Username == "" && authEnforced {
+			return fmt.Errorf("org connector write requires authenticated user")
+		}
+		return nil
+	case credScopeUser:
+		if a.Username == "" && authEnforced {
+			return fmt.Errorf("user scope requires authenticated username")
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid scope %q", scope)
+	}
+}
+
+// canMutateConnector enforces write/delete on an existing connector row.
+func canMutateConnector(a credActor, scope, ownerUser, ownerOrg string) error {
+	scope = inferLegacyScope(ownerOrg, scope)
+	if err := canWriteConnectorScope(a, scope); err != nil {
+		return err
+	}
+	switch scope {
+	case credScopeAdmin:
+		return nil
+	case credScopeOrg:
+		if a.OrganizationID == "" {
+			return fmt.Errorf("org scope requires X-Organization-ID")
+		}
+		if ownerOrg != "" && ownerOrg != a.OrganizationID {
+			return fmt.Errorf("forbidden: connector belongs to another organization")
+		}
+		return nil
+	case credScopeUser:
+		if !userCredOwnerMatch(a.Username, ownerUser) {
+			return fmt.Errorf("forbidden: not connector owner")
+		}
+		if a.Username == "" && authEnforced {
+			return fmt.Errorf("user scope requires authenticated username")
+		}
+		return nil
+	default:
+		return fmt.Errorf("forbidden")
+	}
+}
+
+// connectorEditFlags drives Connectors list UI flags (can_edit_*).
+func connectorEditFlags(a credActor) (canEditOrg, canEditAdmin, canEditUser bool) {
+	canEditAdmin = a.isAdmin()
+	canEditUser = a.Username != "" || !authEnforced
+	canEditOrg = strings.TrimSpace(a.OrganizationID) != "" && canEditUser
+	return canEditOrg, canEditAdmin, canEditUser
+}
+
+// connectorIsUnclaimed reports pending_claim or empty-org non-owned rows. These
 // are invisible and immutable for everyone (including platform admin / service-as-admin);
 // claim with a one-time nonce is the only mutation path. Admin-scoped connectors
-// intentionally have empty organization_id and remain listable to admins.
+// and personal user-scoped connectors (empty org + user_id) intentionally remain
+// listable to their owners.
 func connectorIsUnclaimed(c *opaConnector) bool {
 	if c == nil {
 		return true
@@ -187,7 +254,13 @@ func connectorIsUnclaimed(c *opaConnector) bool {
 		return false
 	}
 	scope := inferLegacyScope(c.OrganizationID, c.Scope)
-	return scope != credScopeAdmin
+	if scope == credScopeAdmin {
+		return false
+	}
+	if scope == credScopeUser && strings.TrimSpace(c.UserID) != "" {
+		return false
+	}
+	return true
 }
 
 // isServiceCredActor detects peer service JWT callers (role mapped to admin).
@@ -210,11 +283,19 @@ func canSeeConnector(a credActor, c *opaConnector) bool {
 		if !strings.EqualFold(strings.TrimSpace(c.Status), "active") {
 			return false
 		}
-		sel := strings.TrimSpace(a.OrganizationID)
-		if sel == "" || sel != strings.TrimSpace(c.OrganizationID) {
+		// Service JWT (connectors:read) may list org-scoped connectors for the
+		// minted org only. Personal/user-scoped rows require a delegated user
+		// actor via /api/internal/connectors/{id}/repos — never open empty-org
+		// user connectors to a bare service token.
+		scope := inferLegacyScope(c.OrganizationID, c.Scope)
+		if scope == credScopeUser || scope == credScopeAdmin {
 			return false
 		}
-		return true
+		sel := strings.TrimSpace(a.OrganizationID)
+		if sel == "" {
+			return false
+		}
+		return normalizeTenantOrg(sel) == normalizeTenantOrg(c.OrganizationID)
 	}
 	scope := inferLegacyScope(c.OrganizationID, c.Scope)
 	return canSeeCredScope(a, scope, c.UserID, c.OrganizationID)
@@ -251,7 +332,10 @@ func canSeeCredScope(a credActor, scope, ownerUser, ownerOrg string) bool {
 		if sel := strings.TrimSpace(a.OrganizationID); sel != "" {
 			return normalizeTenantOrg(ownerOrg) == normalizeTenantOrg(sel)
 		}
-		return !authEnforced
+		// Personal / empty-org owner: see own rows at empty org and legacy
+		// default-org+user_id dual-writes.
+		ownerOrg = strings.TrimSpace(ownerOrg)
+		return ownerOrg == "" || ownerOrg == defaultOrgID || !authEnforced
 	default:
 		return false
 	}

@@ -1,6 +1,6 @@
-# AI Issues and Roadmap automation
+# AI Issues automation
 
-ORA can investigate GitHub Issues labelled for AI, generate product roadmaps from ORA-Dashboard, publish milestones + Issues, and (opt-in) open implementation PRs. Patterns follow a structured issue-to-roadmap lifecycle, implemented in the Go job orchestrator.
+ORA can investigate GitHub Issues labelled for AI and (opt-in) open implementation PRs. Product roadmaps live in **OPM**; ORA keeps GitHub Issues / milestones / Projects v2 helpers for peers via `scm:pm` (see [Interop](interop.md)).
 
 ## Gate
 
@@ -12,13 +12,12 @@ Only Issues whose labels intersect agent prefs `ai_issue_labels` (default `["AI"
 | `ai_issue_labels` | `["AI"]` | Gate labels (case-insensitive) |
 | `issue_auto_implement` | `false` | Auto enqueue implement after plan |
 | `require_human_before_coding` | `true` | Block implement until Dashboard approve |
-| `roadmap_projects_v2` | `false` | Also link published Issues into a Projects v2 board |
 
 ## GitHub App
 
 Required: **Issues write**, Contents write, Pull requests write, Checks write, Metadata. Events: `issues`, `issue_comment`, `label` (plus existing PR/push/installation).
 
-Optional: **Organization projects** write + `projects_v2_item` when `roadmap_projects_v2` is on.
+Optional: **Organization projects** write + `projects_v2_item` when peers use the Projects v2 `scm:pm` surface.
 
 Probe: `GET /api/connectors/{id}/permissions`.
 
@@ -31,21 +30,3 @@ Lifecycle labels: `opa:plan-ready`, `opa:building`, `opa:pr-open`.
 Approve coding: `POST /api/scm/jobs/{issue_run_id}/approve-coding`.
 
 No auto-merge.
-
-## Roadmap APIs
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| POST | `/api/scm/roadmap/generate` | `{repo_full_name, connector_id?, contexts[], competitors[], audience_notes?, publish?}` |
-| GET | `/api/scm/roadmap/runs` | List roadmap runs |
-| GET | `/api/scm/roadmap/runs/{id}` | Run + artifacts |
-| POST | `/api/scm/roadmap/publish` | Milestones + Issues (label AI); Projects v2 if flagged |
-
-Contexts: `discovery`, `competitor`, `audience`, `features`.
-
-Publish creates GitHub **milestones** and Issues (with gate labels). Projects v2 is best-effort behind the flag.
-
-Projects v2 needs **Organization permissions › Projects: Read and write** (`organization_projects: write`) on the
-App installation, which the current installation does not have. Without it publish reports
-`missing_organization_projects` and links no board items; milestones and Issues are unaffected. See
-[Interop](interop.md#projects-v2-peer-surface-scmpm).

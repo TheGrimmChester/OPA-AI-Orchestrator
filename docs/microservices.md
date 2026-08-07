@@ -7,8 +7,7 @@ ora-gateway
   ├── ora-scm
   ├── ora-review
   ├── ora-agents
-  ├── ora-ai          # review-provider settings / runner dispatch
-  └── ora-roadmap
+  └── ora-ai          # review-provider settings / runner dispatch
 ora-orchestrator      # remains the job owner
 ora-runner-{git,ai,php}
 ora-egress-proxy

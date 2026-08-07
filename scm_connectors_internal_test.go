@@ -52,6 +52,48 @@ func TestInternalConnectorPATBypassesOAMGuard(t *testing.T) {
 	connectorLive.Delete(id)
 }
 
+func TestInternalConnectorReposDelegatesPersonal(t *testing.T) {
+	t.Setenv("PEER_OAM_URL", "http://oam:8090")
+	t.Setenv("OPEN_SERVICE_JWT_SECRET", "internal-conn-test-secret-32b!!")
+	t.Setenv("OPA_SCM_MOCK_GITHUB", "1")
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+
+	c := &opaConnector{
+		ID: "conn-personal-repos", Kind: "github_app", Status: "active",
+		Scope: credScopeUser, UserID: "solo", OrganizationID: "",
+		InstallationID: "inst-personal-1", AccountLogin: "solo",
+	}
+	connectorLive.Store(c.ID, c)
+	defer connectorLive.Delete(c.ID)
+
+	secret := []byte("internal-conn-test-secret-32b!!")
+	tok, err := openauth.MintServiceJWTWithOrg(secret, "oam-api", "ora-api", serviceScopeConnectorsWrite, "default-org", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/internal/connectors/"+c.ID+"/repos", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set(headerDelegatedUsername, "solo")
+	req.Header.Set(headerDelegatedRole, "editor")
+	req.Header.Set(headerDelegatedAccountType, openauth.AccountTypePersonal)
+
+	rr := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	registerInternalConnectorsMux(mux)
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out map[string]interface{}
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	repos, _ := out["repos"].([]interface{})
+	if repos == nil {
+		t.Fatalf("expected repos array: %v", out)
+	}
+}
+
 func TestInternalConnectorRejectsNonOAMIssuer(t *testing.T) {
 	t.Setenv("OPEN_SERVICE_JWT_SECRET", "internal-conn-test-secret-32b!!")
 	secret := []byte("internal-conn-test-secret-32b!!")

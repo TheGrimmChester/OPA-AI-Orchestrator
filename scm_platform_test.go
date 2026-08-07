@@ -227,6 +227,66 @@ func TestPendingClaimBlocksPRWebhook(t *testing.T) {
 	}
 }
 
+func TestGitHubInstallURLPersonalAccount(t *testing.T) {
+	prevAuth := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prevAuth }()
+	t.Setenv("OPA_GITHUB_APP_ID", "12345")
+	t.Setenv("OPA_GITHUB_APP_SLUG", "opa-repo-watch")
+	t.Setenv("OPA_GITHUB_INSTALL_STATE_SECRET", "install-state-secret-32bytes!!")
+	t.Setenv("OPEN_SERVICE_JWT_SECRET", "")
+	t.Setenv("PEER_OAM_URL", "")
+
+	secret := []byte("install-personal-jwt-secret-32b!!")
+	prevSecret := jwtSecret
+	jwtSecret = secret
+	defer func() { jwtSecret = prevSecret }()
+	tok, err := openauth.MintUserJWTWithAccount(secret, "solo", "admin", "ora-api",
+		openauth.AccountTypePersonal, "", nil, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/connectors/github/install-url", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("X-User-Role", "admin")
+	req.Header.Set("X-User-Username", "solo")
+	rr := httptest.NewRecorder()
+	handleGitHubInstallURL(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]interface{}
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	if out["ok"] != true {
+		t.Fatalf("want ok: %v", out)
+	}
+	if out["personal"] != true {
+		t.Fatalf("want personal=true: %v", out)
+	}
+	if strings.TrimSpace(fmt.Sprint(out["organization_id"])) != "" {
+		t.Fatalf("personal install must not stamp org: %v", out)
+	}
+	if !out["state_signed"].(bool) {
+		t.Fatalf("expected signed state: %v", out)
+	}
+	installURL, _ := out["install_url"].(string)
+	if !strings.Contains(installURL, "state=") {
+		t.Fatalf("install_url missing state: %s", installURL)
+	}
+}
+
+func TestConnectorIsUnclaimedPersonalUserScoped(t *testing.T) {
+	c := &opaConnector{
+		ID: "u1", Status: "active", Scope: credScopeUser, UserID: "solo", OrganizationID: "",
+	}
+	if connectorIsUnclaimed(c) {
+		t.Fatal("personal user-scoped active connector must not be unclaimed")
+	}
+	if !connectorUsableForWatch(c) {
+		t.Fatal("personal user-scoped active connector must be usable for watch")
+	}
+}
+
 func TestMintAndParseInstallState(t *testing.T) {
 	t.Setenv("OPA_GITHUB_INSTALL_STATE_SECRET", "install-state-secret-32bytes!!")
 	t.Setenv("OPEN_SERVICE_JWT_SECRET", "")
@@ -237,6 +297,18 @@ func TestMintAndParseInstallState(t *testing.T) {
 	parsed, err := parseGitHubInstallState(state)
 	if err != nil || parsed.OrganizationID != "nas" || parsed.ProjectID != "infra" {
 		t.Fatalf("parsed=%+v err=%v", parsed, err)
+	}
+
+	personal, err := mintGitHubInstallState("", "infra", "solo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := parseGitHubInstallState(personal)
+	if err != nil || p2.OrganizationID != "" || p2.UserID != "solo" || p2.ProjectID != "infra" {
+		t.Fatalf("personal parsed=%+v err=%v", p2, err)
+	}
+	if _, err := mintGitHubInstallState("", "infra", ""); err == nil {
+		t.Fatal("empty org without user must fail")
 	}
 }
 
@@ -374,7 +446,7 @@ func TestConnectorClaimRejectsNotPending(t *testing.T) {
 	}
 }
 
-func TestConnectorClaimRejectsUnauthorized(t *testing.T) {
+func TestConnectorClaimAllowsOrgMemberViewer(t *testing.T) {
 	prev := authEnforced
 	authEnforced = true
 	defer func() { authEnforced = prev }()
@@ -385,7 +457,7 @@ func TestConnectorClaimRejectsUnauthorized(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn := &opaConnector{
-		ID: "conn-claim-forbidden", Kind: "github_app", Status: "pending_claim",
+		ID: "conn-claim-member", Kind: "github_app", Status: "pending_claim",
 		Scope: credScopeOrg, MetaJSON: fmt.Sprintf(`{"pending_claim":true,"claim_nonce_hash":%q}`, hash),
 	}
 	connectorLive.Store(conn.ID, conn)
@@ -400,12 +472,42 @@ func TestConnectorClaimRejectsUnauthorized(t *testing.T) {
 	req.Header.Set("X-Project-ID", "infra")
 	rr := httptest.NewRecorder()
 	handleConnectorClaim(rr, req, conn.ID)
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("org member viewer should claim; status %d body %s", rr.Code, rr.Body.String())
+	}
+	got := getOrHydrateConnector(conn.ID)
+	if got == nil || got.Status != "active" || got.OrganizationID != "nas" {
+		t.Fatalf("after claim: %+v", got)
 	}
 }
 
-func TestConnectorClaimRejectsPersonalAccount(t *testing.T) {
+func TestCanWriteConnectorScopeAllowsOrgMember(t *testing.T) {
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+
+	viewer := credActor{Username: "u", Role: "viewer", OrganizationID: "org-a"}
+	if err := canWriteConnectorScope(viewer, credScopeOrg); err != nil {
+		t.Fatalf("org member should write org connectors: %v", err)
+	}
+	if err := canMutateConnector(viewer, credScopeOrg, "", "org-a"); err != nil {
+		t.Fatalf("org member should mutate org connector: %v", err)
+	}
+	if err := canMutateConnector(viewer, credScopeOrg, "", "org-b"); err == nil {
+		t.Fatal("member must not mutate foreign org connector")
+	}
+	if err := canMutateConnector(
+		credActor{Username: "solo", Role: "editor", OrganizationID: ""},
+		credScopeUser, "other", "",
+	); err == nil {
+		t.Fatal("user must not mutate someone else's personal connector")
+	}
+	if err := canWriteCredScope(viewer, credScopeOrg); err == nil {
+		t.Fatal("AI org credentials must remain admin-gated")
+	}
+}
+
+func TestConnectorClaimAllowsPersonalAccount(t *testing.T) {
 	prevAuth := authEnforced
 	prevSecret := jwtSecret
 	authEnforced = true
@@ -437,50 +539,80 @@ func TestConnectorClaimRejectsPersonalAccount(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("X-User-Role", "admin")
-	req.Header.Set("X-Organization-ID", "nas")
+	req.Header.Set("X-User-Username", "alice")
+	req.Header.Set("X-Delegated-Account-Type", openauth.AccountTypePersonal)
 	rr := httptest.NewRecorder()
 	handleConnectorClaim(rr, req, conn.ID)
-	if rr.Code != http.StatusBadRequest {
+	if rr.Code != http.StatusOK {
 		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	}
+	live := getConnector(conn.ID)
+	if live == nil || live.Status != "active" {
+		t.Fatalf("live=%+v", live)
+	}
+	if live.OrganizationID != "" || live.Scope != credScopeUser || live.UserID != "alice" {
+		t.Fatalf("want personal user-scoped bind, got org=%q scope=%q user=%q",
+			live.OrganizationID, live.Scope, live.UserID)
 	}
 }
 
 func TestPeerResolveConnectorFailClosed(t *testing.T) {
 	active := &opaConnector{
 		ID: "peer-fc-active", OrganizationID: "org-a", Status: "active", Kind: "github_app",
+		Scope: credScopeOrg,
 	}
 	pending := &opaConnector{
 		ID: "peer-fc-pending", OrganizationID: "", Status: "pending_claim", Kind: "github_app",
 	}
 	emptyOrgActive := &opaConnector{
 		ID: "peer-fc-empty-org", OrganizationID: "", Status: "active", Kind: "github_app",
+		Scope: credScopeOrg,
+	}
+	personal := &opaConnector{
+		ID: "peer-fc-personal", OrganizationID: "", Status: "active", Kind: "github_app",
+		Scope: credScopeUser, UserID: "TheGrimmChester",
+	}
+	adminConn := &opaConnector{
+		ID: "peer-fc-admin", OrganizationID: "", Status: "active", Kind: "github_app",
+		Scope: credScopeAdmin,
 	}
 	connectorLive.Store(active.ID, active)
 	connectorLive.Store(pending.ID, pending)
 	connectorLive.Store(emptyOrgActive.ID, emptyOrgActive)
+	connectorLive.Store(personal.ID, personal)
+	connectorLive.Store(adminConn.ID, adminConn)
 	defer connectorLive.Delete(active.ID)
 	defer connectorLive.Delete(pending.ID)
 	defer connectorLive.Delete(emptyOrgActive.ID)
+	defer connectorLive.Delete(personal.ID)
+	defer connectorLive.Delete(adminConn.ID)
 
 	cases := []struct {
 		name   string
 		claims *peerSCMClaims
 		id     string
 		want   int
+		wantID string
 	}{
-		{"ok", &peerSCMClaims{OrgID: "org-a"}, active.ID, 0},
-		{"empty_claims_org", &peerSCMClaims{OrgID: ""}, active.ID, 403},
-		{"wrong_org", &peerSCMClaims{OrgID: "org-b"}, active.ID, 403},
-		{"pending", &peerSCMClaims{OrgID: "org-a"}, pending.ID, 403},
-		{"empty_org_active", &peerSCMClaims{OrgID: "org-a"}, emptyOrgActive.ID, 403},
+		{"ok", &peerSCMClaims{OrgID: "org-a"}, active.ID, 0, active.ID},
+		{"empty_claims_org", &peerSCMClaims{OrgID: ""}, active.ID, 403, ""},
+		{"wrong_org", &peerSCMClaims{OrgID: "org-b"}, active.ID, 403, ""},
+		{"pending", &peerSCMClaims{OrgID: "org-a"}, pending.ID, 403, ""},
+		{"empty_org_active", &peerSCMClaims{OrgID: "org-a"}, emptyOrgActive.ID, 403, ""},
+		{"personal_ok", &peerSCMClaims{OrgID: "", UserID: "TheGrimmChester"}, personal.ID, 0, personal.ID},
+		{"personal_wrong_user", &peerSCMClaims{OrgID: "", UserID: "other"}, personal.ID, 403, ""},
+		{"personal_missing_user", &peerSCMClaims{OrgID: "", UserID: ""}, personal.ID, 403, ""},
+		{"personal_org_claims_denied", &peerSCMClaims{OrgID: "org-a", UserID: "TheGrimmChester"}, personal.ID, 403, ""},
+		{"empty_org_org_scope_no_user", &peerSCMClaims{OrgID: "", UserID: "alice"}, emptyOrgActive.ID, 403, ""},
+		{"admin_scope_denied", &peerSCMClaims{OrgID: "", UserID: "alice"}, adminConn.ID, 403, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rr := httptest.NewRecorder()
 			got := peerResolveConnector(rr, tc.claims, tc.id)
 			if tc.want == 0 {
-				if got == nil || got.ID != active.ID {
-					t.Fatalf("want connector, got %+v status=%d body=%s", got, rr.Code, rr.Body.String())
+				if got == nil || got.ID != tc.wantID {
+					t.Fatalf("want connector %s, got %+v status=%d body=%s", tc.wantID, got, rr.Code, rr.Body.String())
 				}
 				return
 			}
@@ -808,7 +940,8 @@ func TestIssueClaimTokenRequiresForceWhenHashPresent(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"installation_id": inst})
 	req := httptest.NewRequest(http.MethodPost, "/api/connectors/github/issue-claim-token", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-User-Role", "admin")
+	req.Header.Set("X-User-Username", "alice")
+	req.Header.Set("X-User-Role", "viewer")
 	req.Header.Set("X-Organization-ID", "nas")
 	rr := httptest.NewRecorder()
 	handleIssueClaimToken(rr, req)

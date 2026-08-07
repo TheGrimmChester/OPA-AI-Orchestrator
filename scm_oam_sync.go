@@ -29,8 +29,16 @@ func syncConnectorToOAM(c *opaConnector) {
 	deleted := c.Status == "deleted"
 	org := strings.TrimSpace(c.OrganizationID)
 	proj := strings.TrimSpace(c.ProjectID)
-	if !deleted && (org == "" || proj == "") {
-		return
+	scope := inferLegacyScope(c.OrganizationID, c.Scope)
+	userID := strings.TrimSpace(c.UserID)
+	personal := scope == credScopeUser && userID != "" && org == ""
+	if !deleted {
+		if proj == "" {
+			return
+		}
+		if org == "" && !personal {
+			return
+		}
 	}
 	display := ""
 	if meta := parseConnectorMeta(c.MetaJSON); meta != nil {
@@ -49,8 +57,8 @@ func syncConnectorToOAM(c *opaConnector) {
 		"id":              c.ID,
 		"organization_id": org,
 		"project_id":      proj,
-		"scope":           inferLegacyScope(c.OrganizationID, c.Scope),
-		"user_id":         c.UserID,
+		"scope":           scope,
+		"user_id":         userID,
 		"kind":            c.Kind,
 		"name":            name,
 		"webhook_mode":    connectorWebhookMode(c),

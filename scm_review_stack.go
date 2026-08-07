@@ -74,6 +74,12 @@ func handleOPAReviewStack(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
+	if st, msg := requireEnabledOAMProject(r, "ora"); st != 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(st)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": msg})
+		return
+	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	var body struct {
 		Items   []opaReviewStackItem `json:"items"`

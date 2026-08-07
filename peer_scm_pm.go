@@ -65,14 +65,28 @@ func peerResolveConnector(w http.ResponseWriter, claims *peerSCMClaims, connecto
 		http.Error(w, "connector not active", 403)
 		return nil
 	}
-	// Fail closed: both sides must carry a non-empty org and they must match.
-	// Empty service org_id or empty-org / pending connectors must never mint tokens.
+	// Fail closed for org connectors: both sides must carry a non-empty org and they must match.
+	// Personal path: empty claims org + user-scoped empty-org connector + matching user_id.
 	claimsOrg := ""
+	claimsUser := ""
 	if claims != nil {
 		claimsOrg = strings.TrimSpace(claims.OrgID)
+		claimsUser = strings.TrimSpace(claims.UserID)
 	}
 	connOrg := strings.TrimSpace(c.OrganizationID)
-	if claimsOrg == "" || connOrg == "" || claimsOrg != connOrg {
+	scope := inferLegacyScope(c.OrganizationID, c.Scope)
+
+	if claimsOrg != "" {
+		// Org connector path: reject user-scoped / empty-org / admin rows and org mismatches.
+		if scope == credScopeUser || scope == credScopeAdmin || connOrg == "" || claimsOrg != connOrg {
+			http.Error(w, "connector org mismatch", 403)
+			return nil
+		}
+		return c
+	}
+
+	// Personal peer authorization: service/job JWT carries user_id, no invented org.
+	if scope != credScopeUser || connOrg != "" || !userCredOwnerMatch(claimsUser, c.UserID) {
 		http.Error(w, "connector org mismatch", 403)
 		return nil
 	}

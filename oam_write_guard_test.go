@@ -30,6 +30,26 @@ func TestRefuseOAMLocalWrite(t *testing.T) {
 	}
 }
 
+func TestCursorKeySetRefusedWhenOAM(t *testing.T) {
+	t.Setenv("PEER_OAM_URL", "http://oam:8090")
+	prev := authEnforced
+	authEnforced = true
+	defer func() { authEnforced = prev }()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/scm/settings/cursor-key", strings.NewReader(`{"api_key":"sk-test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-Role", "admin")
+	req.Header.Set("X-Organization-ID", "nas")
+	rr := httptest.NewRecorder()
+	handleCursorKeySet(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want 503 body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "credentials_home_oam") {
+		t.Fatalf("body=%s", rr.Body.String())
+	}
+}
+
 func TestRefuseOAMLocalWriteAllowsPeerContext(t *testing.T) {
 	t.Setenv("PEER_OAM_URL", "http://oam:8090")
 	rr := httptest.NewRecorder()

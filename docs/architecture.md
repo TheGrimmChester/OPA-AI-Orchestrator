@@ -17,7 +17,8 @@ flowchart LR
 |---------|---------|
 | Repo Watch, SCM connectors/webhooks | ORA |
 | Review jobs, review check-runs, coding agents | ORA |
-| Review-provider settings, roadmaps | ORA |
+| Review-provider settings | ORA |
+| Product roadmaps / ideation | **OPM** (ORA keeps Issues/milestones/Projects v2 protocol for peers) |
 | Security runs, AppSec findings, AppSec gate | **OSA** (peer) |
 
 ## Containers
@@ -35,4 +36,4 @@ Image tags: `*:smoke` (laptop) · `*:nas` (production / NAS only).
 
 ## Optional micro-services (Phase 3)
 
-Behind an optional `ora-gateway`: `ora-scm`, `ora-review`, `ora-agents`, `ora-ai`, `ora-roadmap`. See [microservices.md](microservices.md).
+Behind an optional `ora-gateway`: `ora-scm`, `ora-review`, `ora-agents`, `ora-ai`. See [microservices.md](microservices.md).

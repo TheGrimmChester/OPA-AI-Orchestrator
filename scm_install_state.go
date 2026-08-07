@@ -85,8 +85,11 @@ func mintGitHubInstallState(org, proj, userID string) (string, error) {
 	}
 	org = strings.TrimSpace(org)
 	proj = strings.TrimSpace(proj)
-	if org == "" {
-		return "", fmt.Errorf("organization_id required for GitHub App install state")
+	userID = strings.TrimSpace(userID)
+	// Org Open accounts bind by organization_id; personal Open accounts bind by
+	// user_id with an empty org (same ownership model as personal PAT / import).
+	if org == "" && userID == "" {
+		return "", fmt.Errorf("organization_id or user_id required for GitHub App install state")
 	}
 	if proj == "" {
 		proj = defaultProjectID
@@ -99,7 +102,7 @@ func mintGitHubInstallState(org, proj, userID string) (string, error) {
 		"exp":  now.Add(30 * time.Minute).Unix(),
 		"org":  org,
 		"proj": proj,
-		"user": strings.TrimSpace(userID),
+		"user": userID,
 	})
 	return tok.SignedString(key)
 }
@@ -134,14 +137,15 @@ func parseGitHubInstallState(raw string) (*githubInstallState, error) {
 		proj, _ := claims["proj"].(string)
 		user, _ := claims["user"].(string)
 		org = strings.TrimSpace(org)
-		if org == "" {
-			lastErr = fmt.Errorf("install state missing org")
+		user = strings.TrimSpace(user)
+		if org == "" && user == "" {
+			lastErr = fmt.Errorf("install state missing org or user")
 			continue
 		}
 		return &githubInstallState{
 			OrganizationID: org,
 			ProjectID:      strings.TrimSpace(proj),
-			UserID:         strings.TrimSpace(user),
+			UserID:         user,
 		}, nil
 	}
 	if lastErr != nil {

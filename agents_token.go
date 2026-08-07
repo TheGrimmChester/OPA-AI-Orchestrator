@@ -63,7 +63,7 @@ func githubPermsCreatePR() map[string]string {
 }
 
 // githubPermsIssuesWrite is required for standalone Issues (labels, body,
-// milestones, comments) and for AI-issue / roadmap automation.
+// milestones, comments) and for AI-issue automation.
 func githubPermsIssuesWrite() map[string]string {
 	return map[string]string{
 		"issues":   "write",
@@ -71,8 +71,8 @@ func githubPermsIssuesWrite() map[string]string {
 	}
 }
 
-// githubPermsProjectsWrite is org Projects (classic + v2 GraphQL). Only
-// requested when roadmap_projects_v2 is enabled.
+// githubPermsProjectsWrite is org Projects (classic + v2 GraphQL). Used by the
+// scm:pm Projects v2 peer surface.
 func githubPermsProjectsWrite() map[string]string {
 	return map[string]string{
 		"organization_projects": "write",
@@ -81,7 +81,7 @@ func githubPermsProjectsWrite() map[string]string {
 }
 
 // githubAppRequiredPermsForAIIssues lists App permission keys/levels needed for
-// AI-labelled issue + roadmap (milestones) features. Projects is optional.
+// AI-labelled issue features. Projects is optional (scm:pm peers).
 func githubAppRequiredPermsForAIIssues() map[string]string {
 	return map[string]string{
 		"contents":      "write",
@@ -93,7 +93,7 @@ func githubAppRequiredPermsForAIIssues() map[string]string {
 }
 
 // githubAppOptionalPermsForProjects is probed separately; missing is OK unless
-// roadmap_projects_v2 is on.
+// a peer uses the Projects v2 scm:pm surface.
 func githubAppOptionalPermsForProjects() map[string]string {
 	return map[string]string{
 		"organization_projects": "write",
@@ -165,7 +165,7 @@ func assessInstallationPermHealth(conn *opaConnector) installationPermHealth {
 		out.Notes = append(out.Notes, "grant Issues write (+ Contents write, PRs, Checks) on the GitHub App and re-accept permissions")
 	}
 	if !out.ProjectsOK {
-		out.Notes = append(out.Notes, "organization_projects write required only when roadmap_projects_v2 is enabled")
+		out.Notes = append(out.Notes, "organization_projects write required for Projects v2 peer (scm:pm)")
 	}
 	return out
 }

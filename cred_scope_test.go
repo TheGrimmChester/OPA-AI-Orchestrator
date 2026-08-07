@@ -43,6 +43,16 @@ func TestCanSeeConnectorHidesPending(t *testing.T) {
 	if !canSeeConnector(admin, adminConn) {
 		t.Fatal("admin-scoped empty-org connector stays visible to platform admin")
 	}
+	userConn := &opaConnector{
+		ID: "u", Status: "active", OrganizationID: "", Scope: credScopeUser, UserID: "solo",
+	}
+	if canSeeConnector(svc, userConn) {
+		t.Fatal("service JWT must not see personal/user-scoped connectors")
+	}
+	owner := credActor{Username: "solo", Role: "editor", OrganizationID: ""}
+	if !canSeeConnector(owner, userConn) {
+		t.Fatal("owner must see own user-scoped connector")
+	}
 }
 
 func TestCanSeeCredScope(t *testing.T) {

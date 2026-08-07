@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// GitHub Issues / milestones REST helpers for AI Issues + roadmap publish.
+// GitHub Issues / milestones REST helpers for AI Issues and scm:pm peers.
 
 // githubIssueAPIError carries the upstream HTTP status so callers can tell a
 // deleted/renumbered issue (404) apart from a missing permission (403) and

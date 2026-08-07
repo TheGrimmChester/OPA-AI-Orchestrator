@@ -72,18 +72,6 @@ func TestIssueLabelMatchesPrefs(t *testing.T) {
 	}
 }
 
-func TestValidateRoadmapJSON(t *testing.T) {
-	if err := validateRoadmapJSON(nil); err == nil {
-		t.Fatal("nil")
-	}
-	if err := validateRoadmapJSON(map[string]interface{}{"features": []interface{}{}}); err == nil {
-		t.Fatal("missing phases")
-	}
-	if err := validateRoadmapJSON(heuristicRoadmap("a/b", heuristicDiscovery("a/b", ""))); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestMergeIssueLabels(t *testing.T) {
 	got := mergeIssueLabels([]string{"AI", "bug"}, []string{"ai", "opa:plan-ready"})
 	if len(got) != 3 {
@@ -93,7 +81,7 @@ func TestMergeIssueLabels(t *testing.T) {
 
 func TestBuiltinAIIssuePrefs(t *testing.T) {
 	p := builtinAgentPrefs()
-	if !p.AIIssuesEnabled || p.IssueAutoImplement || p.RoadmapProjectsV2 {
+	if !p.AIIssuesEnabled || p.IssueAutoImplement {
 		t.Fatalf("%+v", p)
 	}
 	if !p.RequireHumanBeforeCoding {
@@ -108,13 +96,12 @@ func TestApplyPrefsAIIssueFields(t *testing.T) {
 	out := builtinAgentPrefs()
 	sources := map[string]string{}
 	raw := map[string]json.RawMessage{
-		"issue_auto_implement":       json.RawMessage(`true`),
-		"roadmap_projects_v2":        json.RawMessage(`true`),
+		"issue_auto_implement":        json.RawMessage(`true`),
 		"require_human_before_coding": json.RawMessage(`false`),
-		"ai_issue_labels":            json.RawMessage(`["AI","auto"]`),
+		"ai_issue_labels":             json.RawMessage(`["AI","auto"]`),
 	}
 	applyPrefsPatch(&out, sources, raw, "repo")
-	if !out.IssueAutoImplement || !out.RoadmapProjectsV2 || out.RequireHumanBeforeCoding {
+	if !out.IssueAutoImplement || out.RequireHumanBeforeCoding {
 		t.Fatalf("%+v", out)
 	}
 	if len(out.AIIssueLabels) != 2 {

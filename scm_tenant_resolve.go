@@ -26,7 +26,18 @@ func resolveSCMTenant(wr *opaWatchedRepo, conn *opaConnector) scmTenantResolutio
 			OrganizationID: org,
 			ProjectID:      proj,
 			PendingClaim:   true,
-			Reason:         "GitHub App install pending OAM org claim",
+			Reason:         "GitHub App install pending Open account claim",
+		}
+	}
+	// Personal user-scoped connectors: empty org is intentional — jobs run under
+	// the owner user_id, not an Open organization tenant.
+	if org == "" && conn != nil {
+		scope := inferLegacyScope(conn.OrganizationID, conn.Scope)
+		if scope == credScopeUser && strings.TrimSpace(conn.UserID) != "" {
+			if proj == "" {
+				proj = defaultProjectID
+			}
+			return scmTenantResolution{OrganizationID: "", ProjectID: proj}
 		}
 	}
 	if org == "" {

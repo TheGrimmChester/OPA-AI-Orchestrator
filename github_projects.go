@@ -10,8 +10,7 @@ import (
 	"strings"
 )
 
-// Projects v2 (GraphQL) publish — only when roadmap_projects_v2 prefs is on
-// and the installation granted organization_projects write.
+// Projects v2 (GraphQL) helpers for the scm:pm peer surface.
 
 // Projects v2 title/body sync statuses. Every outcome is machine-readable so a
 // caller can report the concrete reason instead of assuming success:
@@ -93,53 +92,6 @@ func classifyProjectsGraphQLError(op string, err error) error {
 // stub and so GitHub Enterprise installs can target their own host.
 func githubGraphQLEndpoint() string {
 	return envOr("OPA_GITHUB_GRAPHQL_URL", "https://api.github.com/graphql")
-}
-
-func publishRoadmapProjectsV2(conn *opaConnector, owner, repoFull string, issues []map[string]interface{}) (map[string]interface{}, error) {
-	out := map[string]interface{}{"enabled": true, "status": "skipped"}
-	if conn == nil {
-		out["status"] = "no_connector"
-		return out, nil
-	}
-	health := assessInstallationPermHealth(conn)
-	if !health.ProjectsOK && conn.Kind == "github_app" {
-		out["status"] = "missing_organization_projects"
-		out["missing"] = health.OptionalMissing
-		return out, fmt.Errorf("installation lacks organization_projects write")
-	}
-	if githubUseMockAPI(conn) {
-		out["status"] = "mock"
-		out["project_title"] = "OPA Roadmap (mock)"
-		out["items"] = len(issues)
-		return out, nil
-	}
-
-	title := "OPA Roadmap — " + repoFull
-	projectID, err := githubEnsureOrgProjectV2(conn, owner, title)
-	if err != nil {
-		out["status"] = "error"
-		out["error"] = err.Error()
-		return out, err
-	}
-	out["project_id"] = projectID
-	out["project_title"] = title
-	linked := 0
-	for _, iss := range issues {
-		num := intFromAny(iss["number"])
-		if num <= 0 {
-			continue
-		}
-		nodeID, err := githubIssueNodeID(conn, owner, strings.TrimPrefix(repoFull, owner+"/"), num)
-		if err != nil {
-			continue
-		}
-		if err := githubAddProjectV2Item(conn, projectID, nodeID); err == nil {
-			linked++
-		}
-	}
-	out["status"] = "ok"
-	out["items"] = linked
-	return out, nil
 }
 
 func githubGraphQL(conn *opaConnector, query string, variables map[string]interface{}) (map[string]interface{}, error) {
