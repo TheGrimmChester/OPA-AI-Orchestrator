@@ -229,7 +229,7 @@ func runOneCloudAttempt(job *scmJob, conn *opaConnector, auth autofixAuthOK, pre
 	}
 
 	// --- cloud.patch (no-.git sandbox; never --trust on live shared-bare worktree) ---
-	skippedAI := envOr("SKIP_CURSOR_AI", "0") == "1" || resolveCursorAPIKey(job.OrganizationID, job.ProjectID, job.ActorUserID) == ""
+	skippedAI := envOr("SKIP_CURSOR_AI", "0") == "1" || !hasCLIAgentCredential(job.OrganizationID, job.ProjectID, job.ActorUserID)
 	if skippedAI || githubUseMockAPI(conn) {
 		note := filepath.Join(absRoot, ".opa-review-autofix.md")
 		var b strings.Builder
@@ -268,7 +268,7 @@ func runOneCloudAttempt(job *scmJob, conn *opaConnector, auth autofixAuthOK, pre
 			}
 		}
 		fixStub := &opaAutoFixJob{ID: fmt.Sprintf("%s-%d", job.ID, iteration), FindingKeys: keysFromFindings(auth.Findings), Findings: findings}
-		if err := runAutoFixAgent(job, agentRoot, job.ID, patchWtID, fixStub); err != nil {
+		if err := runAutoFixAgent(job, agentRoot, job.ID, patchWtID, fixStub, agentKeyCloud); err != nil {
 			out["status"] = "failed"
 			out["honesty"] = "cloud.patch: " + err.Error()
 			return out, err

@@ -9,6 +9,7 @@ flowchart LR
   Orch --> Runner[ora-runner]
   API --> CH[(ClickHouse)]
   API -.->|PEER_OSA_URL| OSA[osa-api]
+  API -.->|PEER_OAM_URL lease/redeem| OAM[oam-api]
 ```
 
 ## Ownership
@@ -17,7 +18,7 @@ flowchart LR
 |---------|---------|
 | Repo Watch, SCM connectors/webhooks | ORA |
 | Review jobs, review check-runs, coding agents | ORA |
-| Review-provider settings | ORA |
+| AI provider keys / per-agent model bindings | **OAM** (AI Endpoints `/endpoints`; ORA leases per job when `PEER_OAM_URL` set) |
 | Product roadmaps / ideation | **OPM** (ORA keeps Issues/milestones/Projects v2 protocol for peers) |
 | Security runs, AppSec findings, AppSec gate | **OSA** (peer) |
 

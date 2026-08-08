@@ -1149,7 +1149,7 @@ func handleSCMJobSub(w http.ResponseWriter, r *http.Request) {
 			"force_ai":       true,
 			"kind":           job.Kind,
 			"actor_user_id":  job.ActorUserID,
-			"cursor_key_set": resolveCursorAPIKey(job.OrganizationID, job.ProjectID, job.ActorUserID) != "",
+			"cursor_key_set": hasCLIAgentCredential(job.OrganizationID, job.ProjectID, job.ActorUserID),
 			"honesty":        "Retry stamps actor_user_id from the signed-in user, upgrades empty kind for legacy PR/push rows, and sets force_ai so already-reviewed SHAs re-run. Personal CLI keys apply; webhook-origin jobs without an actor still need an org key under Account → Organization.",
 		})
 		return
@@ -1272,7 +1272,7 @@ func handleSCMAIReview(w http.ResponseWriter, r *http.Request) {
 		"ok": true, "job_id": job.ID, "status": "queued",
 		"repo_full_name": repo, "pr_number": pr,
 		"force_ai": job.ForceAI, "ai_only": job.AIOnly,
-		"cursor_key_set": resolveCursorAPIKey(job.OrganizationID, job.ProjectID, job.ActorUserID) != "",
+		"cursor_key_set": hasCLIAgentCredential(job.OrganizationID, job.ProjectID, job.ActorUserID),
 		"skip_cursor_ai": envOr("SKIP_CURSOR_AI", "0") == "1",
 		"review_contexts": summarizeAppliedContexts(applied),
 		"honesty":         "Manual OPA Review — Check Runs need GitHub App (PAT often cannot create checks). SKIP_CURSOR_AI=1 still completes with ai.status=skipped. Reviewer contexts: full primary for this repo + linked awareness; related repos are shallow-cloned under job/related/. Findings sync as inline PR comments (add/update/resolve on re-run); global body is a short résumé upserted in place.",

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -75,14 +76,21 @@ func main() {
 	registerRepoWatchMux(mux, authView, authAdmin)
 	registerAIMux(mux, authView, authAdmin)
 	registerAgentsPrefsMux(mux, authView, authAdmin)
-	loadAISettingsFromFileOnBoot()
+	if oamConfigured() {
+		go publishAgentCatalog(context.Background())
+	} else {
+		log.Printf("oam: PEER_OAM_URL unset — AI job keys stay on local settings until OAM is configured")
+		loadAISettingsFromFileOnBoot()
+	}
 
 	go func() {
 		// Give CH a moment, then hydrate SCM state (PATs, jobs, stacks).
 		time.Sleep(2 * time.Second)
 		hydrateSCMOnBoot()
 		bootSandboxMaintenance()
-		loadAISettingsFromFileOnBoot()
+		if !oamConfigured() {
+			loadAISettingsFromFileOnBoot()
+		}
 	}()
 
 	srv := &http.Server{

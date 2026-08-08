@@ -2187,13 +2187,15 @@ func handleSCMSettings(w http.ResponseWriter, r *http.Request) {
 		proj = defProj
 	}
 	userID := strings.TrimSpace(a.Username)
-	// Same resolution as OPA Review / Generate: user → org → fail closed.
-	hit := resolveSCMSecret(credResolveQuery{
-		OrganizationID: org, ProjectID: proj, UserID: userID,
-	}, scmCursorSecretKey)
-	hasKey := hit.Plain != ""
-	_, _, cursorModel, _ := resolveCLICursorConfig(org, proj, userID)
-	honesty := "OPA Review CLI key resolves user → org → fail closed (never admin, never process env). Manage under Account (personal or org)."
+	// Same resolution as OPA Review / Generate: under PEER_OAM_URL keys come from
+	// OAM lease/redeem; otherwise user → org → fail closed on local settings.
+	// Do not lease here — settings GET must not burn a one-shot redeem.
+	hasKey := hasCLIAgentCredential(org, proj, userID)
+	cursorModel := envOr("OPA_CURSOR_MODEL", "auto")
+	if !oamConfigured() {
+		_, _, cursorModel, _ = resolveCLICursorConfig(agentKeyReview, org, proj, userID)
+	}
+	honesty := "OPA Review CLI keys resolve from OAM AI Endpoints when PEER_OAM_URL is set (lease/redeem per job). Solo: user → org → fail closed on local settings."
 	if !hasKey {
 		who := userID
 		if who == "" {
@@ -2203,13 +2205,18 @@ func handleSCMSettings(w http.ResponseWriter, r *http.Request) {
 		if orgLabel == "" {
 			orgLabel = "(no org selected)"
 		}
-		honesty = "No CLI agent API key for user " + who + " in org " + orgLabel +
-			". Save a personal key while signed in as that user, or an org key under Account → Organization. Keys are not shared across usernames (e.g. admin ≠ opa-admin)."
+		if oamConfigured() {
+			honesty = "PEER_OAM_URL is set but AI credentials are not reachable for user " + who + " in org " + orgLabel +
+				". Bind ORA agent keys under OAM → AI Endpoints."
+		} else {
+			honesty = "No CLI agent API key for user " + who + " in org " + orgLabel +
+				". Save a personal key while signed in as that user, or an org key under Account → Organization. Keys are not shared across usernames (e.g. admin ≠ opa-admin)."
+		}
 	}
 	writeJSON(w, map[string]interface{}{
 		"github_app_configured": githubAppConfigured(),
 		"cursor_key_set":        hasKey,
-		"cursor_key_scope":      hit.Scope,
+		"cursor_key_scope":      "",
 		"cursor_model":          cursorModel,
 		"organization_id":       org,
 		"project_id":            proj,
@@ -2218,7 +2225,7 @@ func handleSCMSettings(w http.ResponseWriter, r *http.Request) {
 		"skip_cursor_ai":        envOr("SKIP_CURSOR_AI", "0") == "1",
 		"workspace":             securityWorkspaceRoot(),
 		"ai_settings_path":      "/api/ai/settings",
-		"account_path":          "/settings/account",
+		"account_path":          "/endpoints",
 		"honesty":               honesty,
 	})
 }
@@ -2228,7 +2235,9 @@ func handleCursorKeySet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
-	if refuseOAMLocalWrite(w, r) {
+	// Family stacks: AI keys live in OAM Endpoints — local cursor-key alias is gone.
+	if localOAMWritesBlocked() {
+		http.NotFound(w, r)
 		return
 	}
 	a := actorFromRequest(r)
@@ -2277,20 +2286,11 @@ func handleCursorKeySet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"ok": true, "cursor_key_set": true, "organization_id": org, "project_id": proj, "alias_of": "cli_cursor"})
 }
 
-// resolveCursorAPIKey returns the CLI agent API key for a tenant job.
-// Resolution: user (optional) → org → fail closed. Never admin, never env.
-func resolveCursorAPIKey(orgProj ...string) string {
-	org, proj, userID := "", "", ""
-	if len(orgProj) >= 1 {
-		org = orgProj[0]
-	}
-	if len(orgProj) >= 2 {
-		proj = orgProj[1]
-	}
-	if len(orgProj) >= 3 {
-		userID = orgProj[2]
-	}
-	key, _, _, _ := resolveCLICursorConfig(org, proj, userID)
+// resolveCursorAPIKey returns the CLI agent API key for a tenant job and agent key.
+// When PEER_OAM_URL is set: OAM lease/redeem only (no scm_secrets).
+// Otherwise: user (optional) → org → fail closed. Never admin, never env.
+func resolveCursorAPIKey(agentKey string, orgProj ...string) string {
+	key, _, _, _ := resolveCLICursorConfig(agentKey, orgProj...)
 	return key
 }
 
@@ -2363,16 +2363,19 @@ func hydrateSCMOnBoot() {
 	nLegacy := backfillLegacyConnectorsOnBoot()
 	nw := hydrateWatchedReposOnBoot()
 	_ = hydrateAgentPrefsOnBoot()
-	nWide := ensureOrgWideCLICursorKeys()
-	hydrateCursorKeyFromCH("", "")
+	nWide := 0
+	if !oamConfigured() {
+		nWide = ensureOrgWideCLICursorKeys()
+		hydrateCursorKeyFromCH("", "")
+	}
 	hydrateSCMJobsAndStacksOnBoot()
 	cursorKeyMu.Lock()
 	hasCursor := cursorKeyMem != ""
 	cursorKeyMu.Unlock()
 	// cursor_key_set here is legacy admin/mem hydrate (empty org) — per-tenant
-	// resolution uses scm_secrets via resolveCursorAPIKey. Prefer org keys.
-	orgKeyHint := nWide > 0 || resolveCursorAPIKey("default-org", "default-project", "") != "" ||
-		resolveCursorAPIKey("nas", "infra", "") != ""
+	// resolution uses OAM lease under PEER_OAM_URL, else scm_secrets via resolveCursorAPIKey.
+	orgKeyHint := nWide > 0 || oamConfigured() || resolveCursorAPIKey(agentKeyReview, "default-org", "default-project", "") != "" ||
+		resolveCursorAPIKey(agentKeyReview, "nas", "infra", "") != ""
 	log.Printf("[INFO] SCM hydrate: %d connector(s), %d connector legacy backfill, %d table rows backfilled, %d watched repo(s) from ClickHouse; cursor_key_mem=%v org_cli_keys=%v org_wide_seeded=%d",
 		n+nLegacy, nLegacy, nBackfill, nw, hasCursor, orgKeyHint, nWide)
 }

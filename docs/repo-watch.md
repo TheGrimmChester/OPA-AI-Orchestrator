@@ -106,7 +106,7 @@ $OPA_REVIEW_TMP/                     # default /tmp/opa-review
 - Review runner: `cmd.Dir = checkout`, prompt + `OPA_SCAN_WORKTREE` env point at the full tree; brief instructs **surrounding-code analysis** (callers, neighbors, related tests) — not hunk-only. `--trust` by default (`OPA_CURSOR_AGENT_FORCE=1` adds `--force`). Reviews run **per changed file** (or package group when over `OPA_AI_REVIEW_MAX_UNITS`), then findings are aggregated.
 - Gitleaks uses `/etc/opa/gitleaks.toml` (UI `key:` / React prop allowlists) plus an Agent post-filter; AppSec gate default `min_severity=high` ignores medium-only generic-api-key noise. Manual `force_ai` / `ai_only` jobs still run review and report gate+ai together.
 - Old `$OPA_REVIEW_TMP/*` (and legacy `worktrees/`/`jobs/`) cleaned after ~24h (`git worktree remove` + delete).
-- **Review API key tenancy:** stored in `opa.scm_secrets` with `scope` (`admin`|`org`|`user`) + `organization_id`/`user_id`. Job resolution: **user → org → fail closed**. Admin keys are never inherited. Process env `CURSOR_API_KEY` / `OPA_OPENAI_API_KEY` / `OPA_ANTHROPIC_API_KEY` are **not** used as tenant fallbacks.
+- **Review API key tenancy:** when `PEER_OAM_URL` is set, jobs obtain keys only via OAM lease → redeem (`product:"ora"`, agent keys such as `review`, `auto_fix`, `cloud`, `context_generate`). Bind models/keys in OAM **AI Endpoints**. Local `/api/ai/settings*` and cursor-key writes return **404**. Solo (peer unset): stored in `opa.scm_secrets` with `scope` (`admin`|`org`|`user`) + `organization_id`/`user_id`; resolution **user → org → fail closed**. Admin keys are never inherited. Process env `CURSOR_API_KEY` / `OPA_OPENAI_API_KEY` / `OPA_ANTHROPIC_API_KEY` are **not** used as tenant fallbacks.
 
 Dashboard: **PR Jobs** shows SHA + Worktree path from job summary.
 
@@ -277,7 +277,9 @@ Legacy CI without Repo Watch can still call `harness/appsec-pr-check.sh` (tenant
   - `OPA_REVIEW_MCP_CONFIG` — optional host JSON of `mcpServers` merged into a host-owned overlay under `$OPA_SCM_STATE_DIR/mcp-overlay/.../.cursor/mcp.json` via `prepareOPAReviewMCP` / `writeReviewMCPOverlay` (never the PR worktree). Only allowlisted server names are accepted (currently `browser`); others are dropped.
 - `GET|POST /api/scm/contexts`, `GET|PATCH|DELETE /api/scm/contexts/{id}`, `POST /api/scm/contexts/generate`
 - `PUT /api/scm/context-links`
-- `GET /api/scm/settings`, `POST /api/scm/settings/cursor-key` — `cursor_key_set` only; key AES-GCM in `opa.scm_secrets`
+- `GET /api/scm/settings` — honesty + `cursor_key_set` (under `PEER_OAM_URL`, keys resolve from OAM; no local key surface)
+- `POST /api/scm/settings/cursor-key` — solo local alias only; **404** when `PEER_OAM_URL` set (use OAM `/endpoints`)
+- `GET`/`PUT` `/api/ai/settings`, `/api/ai/settings/test` — solo local plane; **404** when `PEER_OAM_URL` set
 - `POST /v1/scm/github/webhook`
 - `POST /api/scm/simulate`
 - `POST /api/security/runs` (Security runs workspace scans)

@@ -447,7 +447,7 @@ func runOPAAutoFix(parent *scmJob, conn *opaConnector, fix *opaAutoFixJob) (*opa
 		return fix, err
 	}
 
-	skippedAI := envOr("SKIP_CURSOR_AI", "0") == "1" || resolveCursorAPIKey(parent.OrganizationID, parent.ProjectID, parent.ActorUserID) == ""
+	skippedAI := envOr("SKIP_CURSOR_AI", "0") == "1" || !hasCLIAgentCredential(parent.OrganizationID, parent.ProjectID, parent.ActorUserID)
 	if skippedAI || githubUseMockAPI(conn) {
 		// Mock / skipped: write a small honesty note file so there is something to commit.
 		note := filepath.Join(absRoot, ".opa-review-autofix.md")
@@ -485,7 +485,7 @@ func runOPAAutoFix(parent *scmJob, conn *opaConnector, fix *opaAutoFixJob) (*opa
 				return fix, terr
 			}
 		}
-		if err := runAutoFixAgent(parent, agentRoot, parent.ID, wtID, fix); err != nil {
+		if err := runAutoFixAgent(parent, agentRoot, parent.ID, wtID, fix, agentKeyAutoFix); err != nil {
 			fix.Status = "failed"
 			fix.Error = "agent: " + err.Error()
 			fix.Honesty = "Auto-fix agent failed"
@@ -715,10 +715,13 @@ func buildAutoFixPRBody(parent *scmJob, fix *opaAutoFixJob) string {
 	return b.String()
 }
 
-func runAutoFixAgent(parent *scmJob, checkoutRoot, scmJobID, worktreeID string, fix *opaAutoFixJob) error {
-	key, agentBin, model, force := resolveCLICursorConfig(parent.OrganizationID, parent.ProjectID, parent.ActorUserID)
+func runAutoFixAgent(parent *scmJob, checkoutRoot, scmJobID, worktreeID string, fix *opaAutoFixJob, agentKey string) error {
+	if strings.TrimSpace(agentKey) == "" {
+		agentKey = agentKeyAutoFix
+	}
+	key, agentBin, model, force := resolveCLICursorConfig(agentKey, parent.OrganizationID, parent.ProjectID, parent.ActorUserID)
 	if key == "" {
-		return fmt.Errorf("CLI agent API key not set — save one under Account (personal or org)")
+		return fmt.Errorf("CLI agent API key not set — bind ORA %s in OAM AI Endpoints (or save a local key when PEER_OAM_URL is unset)", agentKey)
 	}
 	brief := packAutoFixBrief(parent, checkoutRoot, fix)
 	// opa.job = SCM job/child id (cancel teardown); LayoutID = worktree bind
