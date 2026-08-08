@@ -20,7 +20,7 @@ flowchart LR
 | Review jobs, review check-runs, coding agents | ORA |
 | AI provider keys / per-agent model bindings | **OAM** (AI Endpoints `/endpoints`; ORA leases per job when `PEER_OAM_URL` set) |
 | Product roadmaps / ideation | **OPM** (ORA keeps Issues/milestones/Projects v2 protocol for peers) |
-| Security runs, AppSec findings, AppSec gate | **OSA** (peer) |
+| Security runs, AppSec findings, AppSec gate | **OSA** (peer: create run, `GET …/runs/{id}/findings`, gate) |
 
 ## Containers
 
