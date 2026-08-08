@@ -141,23 +141,68 @@ func handlePRWebhookIngress(w http.ResponseWriter, raw []byte, rec *scmWebhookRe
 	if payload.Installation.ID != 0 {
 		inst = strconv.FormatInt(payload.Installation.ID, 10)
 	}
-	if inst != "" && githubAppConfigured() && forcedConn == nil {
-		if appConn := ensureGitHubAppConnector(inst, ""); appConn != nil {
-			if wrApp := autoWatchInstalledRepo(appConn, repo); wrApp != nil {
-				wr, conn = wrApp, appConn
+	if wr == nil && peerOAMBaseURL() != "" {
+		// OAM project enablement is SoT — do not unconstrained auto-watch.
+		cid := strings.TrimSpace(connectorID)
+		org := ""
+		if forcedConn != nil {
+			org = forcedConn.OrganizationID
+			if cid == "" {
+				cid = forcedConn.ID
 			}
 		}
-	}
-	if wr == nil {
-		conn = findConnectorByInstallation(inst)
-		if conn != nil {
-			wr = autoWatchInstalledRepo(conn, repo)
+		if cid == "" || org == "" {
+			if c := findConnectorByInstallation(inst); c != nil {
+				if org == "" {
+					org = c.OrganizationID
+				}
+				if cid == "" {
+					cid = c.ID
+				}
+				if conn == nil {
+					conn = c
+				}
+			}
 		}
-	}
-	if wr == nil {
-		finishWebhookReceipt(rec, "ignored", "Repo not watched and no GitHub App connector — no job queued.", 200, "")
-		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "repo not watched", "repo": repo, "webhook_id": rec.ID})
-		return
+		if (cid == "" || org == "") && inst != "" && githubAppConfigured() && forcedConn == nil {
+			if appConn := ensureGitHubAppConnector(inst, ""); appConn != nil {
+				if org == "" {
+					org = appConn.OrganizationID
+				}
+				if cid == "" {
+					cid = appConn.ID
+				}
+				if conn == nil {
+					conn = appConn
+				}
+			}
+		}
+		wr2, conn2, skip := ensureWatchedFromOAM(org, repo, cid)
+		if skip != "" {
+			finishWebhookReceipt(rec, "ignored", skip, 200, "")
+			writeJSON(w, map[string]interface{}{"ok": true, "skipped": skip, "repo": repo, "webhook_id": rec.ID})
+			return
+		}
+		wr, conn = wr2, conn2
+	} else if wr == nil {
+		if inst != "" && githubAppConfigured() && forcedConn == nil {
+			if appConn := ensureGitHubAppConnector(inst, ""); appConn != nil {
+				if wrApp := autoWatchInstalledRepo(appConn, repo); wrApp != nil {
+					wr, conn = wrApp, appConn
+				}
+			}
+		}
+		if wr == nil {
+			conn = findConnectorByInstallation(inst)
+			if conn != nil {
+				wr = autoWatchInstalledRepo(conn, repo)
+			}
+		}
+		if wr == nil {
+			finishWebhookReceipt(rec, "ignored", "Repo not watched and no GitHub App connector — no job queued.", 200, "")
+			writeJSON(w, map[string]interface{}{"ok": true, "skipped": "repo not watched", "repo": repo, "webhook_id": rec.ID})
+			return
+		}
 	}
 	if forcedConn != nil {
 		conn = forcedConn
@@ -239,7 +284,40 @@ func handlePushWebhookIngress(w http.ResponseWriter, raw []byte, rec *scmWebhook
 	if wr == nil {
 		wr, conn = findWatched(repo)
 	}
-	if wr == nil {
+	if wr == nil && peerOAMBaseURL() != "" {
+		cid := strings.TrimSpace(connectorID)
+		org := ""
+		if forcedConn != nil {
+			org = forcedConn.OrganizationID
+			if cid == "" {
+				cid = forcedConn.ID
+			}
+		}
+		inst := ""
+		if payload.Installation.ID != 0 {
+			inst = strconv.FormatInt(payload.Installation.ID, 10)
+		}
+		if cid == "" || org == "" {
+			if c := findConnectorByInstallation(inst); c != nil {
+				if org == "" {
+					org = c.OrganizationID
+				}
+				if cid == "" {
+					cid = c.ID
+				}
+				if conn == nil {
+					conn = c
+				}
+			}
+		}
+		wr2, conn2, skip := ensureWatchedFromOAM(org, repo, cid)
+		if skip != "" {
+			finishWebhookReceipt(rec, "ignored", skip, 200, "")
+			writeJSON(w, map[string]interface{}{"ok": true, "skipped": skip, "webhook_id": rec.ID})
+			return
+		}
+		wr, conn = wr2, conn2
+	} else if wr == nil {
 		finishWebhookReceipt(rec, "ignored", "Repo not watched — no job queued.", 200, "")
 		writeJSON(w, map[string]interface{}{"ok": true, "skipped": "repo not watched", "webhook_id": rec.ID})
 		return
@@ -351,13 +429,25 @@ func handleInstallationWebhook(w http.ResponseWriter, event string, raw []byte, 
 	conn := ensureGitHubAppConnector(inst, payload.Installation.Account.Login)
 	watched := []string{}
 	if conn != nil {
-		for _, repo := range repos {
-			if wr := autoWatchInstalledRepo(conn, repo); wr != nil && wr.Enabled {
-				watched = append(watched, repo)
+		if peerOAMBaseURL() != "" {
+			// Under peer OAM, only upsert when an ora-enabled project matches.
+			for _, repo := range repos {
+				if wr, _, skip := ensureWatchedFromOAM(conn.OrganizationID, repo, conn.ID); skip == "" && wr != nil && wr.Enabled {
+					watched = append(watched, repo)
+				}
+			}
+		} else {
+			for _, repo := range repos {
+				if wr := autoWatchInstalledRepo(conn, repo); wr != nil && wr.Enabled {
+					watched = append(watched, repo)
+				}
 			}
 		}
 	}
 	honesty := fmt.Sprintf("Installation %s: auto-watched %d repo(s) for automatic PR checks.", action, len(watched))
+	if peerOAMBaseURL() != "" {
+		honesty = fmt.Sprintf("Installation %s: ensured %d repo(s) from OAM project enablement.", action, len(watched))
+	}
 	if conn == nil {
 		honesty = "Installation recorded but GitHub App env not configured — could not auto-watch."
 	}

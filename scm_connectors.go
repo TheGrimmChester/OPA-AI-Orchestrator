@@ -1373,6 +1373,13 @@ func chInt(v interface{}, def int) int {
 }
 
 func handleWatchedPut(w http.ResponseWriter, r *http.Request, connectorID string) {
+	// Under peer OAM, enablement is OAM project product access + SCM bind —
+	// browser PUT watched is removed (plain 404). Internal OAM peer writes
+	// (withPeerOAMWrite) may still upsert runtime rows.
+	if localOAMWritesBlocked() && !isPeerOAMConnectorWrite(r) {
+		http.NotFound(w, r)
+		return
+	}
 	c := getOrHydrateConnector(connectorID)
 	if denyConnectorIfImmutable(w, r, c) {
 		return

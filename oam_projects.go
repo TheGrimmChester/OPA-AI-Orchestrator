@@ -13,6 +13,7 @@ import (
 	"time"
 
 	openauth "github.com/TheGrimmChester/open-auth-go"
+	openclient "github.com/TheGrimmChester/open-client-go"
 )
 
 // registerOAMProjectsMux exposes GET /api/oam/projects for the dashboard switcher.
@@ -158,10 +159,11 @@ func requireEnabledOAMProject(r *http.Request, product string) (status int, msg 
 }
 
 type oamDirectoryProject struct {
-	ID           string   `json:"id"`
-	ProjectID    string   `json:"project_id"`
-	ExternalKey  string   `json:"external_key"`
-	ConnectorIDs []string `json:"connector_ids"`
+	ID             string   `json:"id"`
+	ProjectID      string   `json:"project_id"`
+	OrganizationID string   `json:"organization_id"`
+	ExternalKey    string   `json:"external_key"`
+	ConnectorIDs   []string `json:"connector_ids"`
 }
 
 func (p oamDirectoryProject) directoryID() string {
@@ -170,6 +172,143 @@ func (p oamDirectoryProject) directoryID() string {
 		id = strings.TrimSpace(p.ProjectID)
 	}
 	return id
+}
+
+func normalizeRepoFullName(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// listOAMDirectoryProjects fetches GET OAM /api/projects?product=… (optional org).
+// Uses a service JWT when OPEN_SERVICE_JWT_SECRET is set (open-client PeerJSON).
+func listOAMDirectoryProjects(ctx context.Context, org, product string) ([]oamDirectoryProject, error) {
+	base := peerOAMBaseURL()
+	if base == "" {
+		return nil, fmt.Errorf("PEER_OAM_URL unset")
+	}
+	product = strings.TrimSpace(product)
+	if product == "" {
+		return nil, fmt.Errorf("product required")
+	}
+	q := url.Values{}
+	q.Set("product", product)
+	org = strings.TrimSpace(org)
+	if org != "" && !strings.EqualFold(org, "all") {
+		q.Set("organization_id", org)
+	}
+	path := "/api/projects"
+	if enc := q.Encode(); enc != "" {
+		path += "?" + enc
+	}
+	cfg := openclient.PeerFromEnv("PEER_OAM_URL", "ora-api", "oam-api", "orgs:read")
+	cfg.OrgID = org
+	var payload struct {
+		Projects []oamDirectoryProject `json:"projects"`
+	}
+	if err := openclient.PeerJSON(ctx, cfg, http.MethodGet, path, nil, &payload); err != nil {
+		return nil, err
+	}
+	return payload.Projects, nil
+}
+
+// lookupOAMProjectByExternalKey finds an ora-enabled OAM project whose
+// external_key matches owner/repo (case-insensitive). Returns (nil, nil) on miss.
+func lookupOAMProjectByExternalKey(ctx context.Context, org, repoFullName string) (*oamDirectoryProject, error) {
+	want := normalizeRepoFullName(repoFullName)
+	if want == "" || !strings.Contains(want, "/") {
+		return nil, nil
+	}
+	rows, err := listOAMDirectoryProjects(ctx, org, "ora")
+	if err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		row := &rows[i]
+		if normalizeRepoFullName(row.ExternalKey) == want {
+			return row, nil
+		}
+	}
+	return nil, nil
+}
+
+func resolveConnectorOnOAMProject(proj *oamDirectoryProject, connectorID string) (string, string) {
+	if proj == nil {
+		return "", "no OAM project with ora enabled for repo"
+	}
+	connectorID = strings.TrimSpace(connectorID)
+	bound := make([]string, 0, len(proj.ConnectorIDs))
+	for _, id := range proj.ConnectorIDs {
+		if t := strings.TrimSpace(id); t != "" {
+			bound = append(bound, t)
+		}
+	}
+	if connectorID != "" {
+		for _, id := range bound {
+			if id == connectorID {
+				return connectorID, ""
+			}
+		}
+		return "", "connector not bound on OAM project"
+	}
+	switch len(bound) {
+	case 0:
+		return "", "project has no connector_ids"
+	case 1:
+		return bound[0], ""
+	default:
+		return "", "connector not bound on OAM project"
+	}
+}
+
+// ensureWatchedFromOAM upserts a runtime watched row when an OAM project has
+// product ora enabled and external_key matches the repo. Returns a skip reason
+// (no invent) when there is no match. No-op path when PEER_OAM_URL is unset
+// should be handled by the caller (solo lab keeps auto-watch).
+func ensureWatchedFromOAM(org, repo, connectorID string) (*opaWatchedRepo, *opaConnector, string) {
+	if peerOAMBaseURL() == "" {
+		return nil, nil, "PEER_OAM_URL unset"
+	}
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return nil, nil, "repo required"
+	}
+	org = strings.TrimSpace(org)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	proj, err := lookupOAMProjectByExternalKey(ctx, org, repo)
+	if err != nil {
+		return nil, nil, "could not verify OAM project enablement: " + err.Error()
+	}
+	if proj == nil {
+		return nil, nil, "no OAM project with ora enabled for repo"
+	}
+	resolvedConn, skip := resolveConnectorOnOAMProject(proj, connectorID)
+	if skip != "" {
+		return nil, nil, skip
+	}
+	conn := getOrHydrateConnector(resolvedConn)
+	if conn == nil {
+		return nil, nil, "connector not found locally"
+	}
+	projID := proj.directoryID()
+	orgID := org
+	if orgID == "" {
+		orgID = strings.TrimSpace(proj.OrganizationID)
+	}
+	if orgID == "" {
+		orgID = strings.TrimSpace(conn.OrganizationID)
+	}
+	if projID == "" {
+		projID = strings.TrimSpace(conn.ProjectID)
+	}
+	// Idempotent: leave an already-enabled watch as-is (do not clobber checks).
+	key := conn.ID + "|" + repo
+	if v, ok := watchedLive.Load(key); ok {
+		if wr, ok := v.(*opaWatchedRepo); ok && wr.Enabled {
+			return wr, conn, ""
+		}
+	}
+	wr := upsertWatched(orgID, projID, conn.ID, repo, "", true, defaultWatchedChecks(), "auto", "high", false, false, 0)
+	return wr, conn, ""
 }
 
 func oamDirectoryHasProject(ctx context.Context, r *http.Request, base, product, projectID string) (bool, error) {
