@@ -44,7 +44,7 @@ API notes (`?view=ops|org|client`, artifact GET).
 
 ## Enable cloud locally
 
-Set repo/installation prefs:
+Set org/project/repo prefs:
 
 ```json
 {"cloud_enabled": true, "autofix_mode": "branch", "autofix_severity_threshold": "high"}

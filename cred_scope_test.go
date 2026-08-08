@@ -216,13 +216,15 @@ func TestActorFromRequestWriteTenant(t *testing.T) {
 
 	r, _ := http.NewRequest(http.MethodGet, "/api/connectors", nil)
 	a := actorFromRequest(r)
-	if a.OrganizationID != defaultOrgID || a.ProjectID != defaultProjectID {
+	// Open-Tenant-Go WriteTenant no longer invents default-org; empty/"all" org
+	// stays empty while project collapses to default-project.
+	if a.OrganizationID != "" || a.ProjectID != defaultProjectID {
 		t.Fatalf("missing headers under auth → WriteTenant, got %q/%q", a.OrganizationID, a.ProjectID)
 	}
 	r.Header.Set("X-Organization-ID", "all")
 	r.Header.Set("X-Project-ID", "all")
 	a = actorFromRequest(r)
-	if a.OrganizationID != defaultOrgID || a.ProjectID != defaultProjectID {
+	if a.OrganizationID != "" || a.ProjectID != defaultProjectID {
 		t.Fatalf("all/all under auth → WriteTenant, got %q/%q", a.OrganizationID, a.ProjectID)
 	}
 	r.Header.Set("X-Organization-ID", "nas")
