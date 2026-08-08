@@ -2,15 +2,15 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	openegress "github.com/TheGrimmChester/open-egress-proxy/orchestrate"
 	openlogger "github.com/TheGrimmChester/open-logger-go"
 )
 
@@ -28,7 +28,6 @@ const (
 )
 
 var (
-	egressProxyMu       sync.Mutex
 	// Cursor agent endpoints rotate (api, api2, api5 / agentn.global.api5…).
 	// Suffix match covers regional hosts like agentn.global.api5.cursor.sh.
 	defaultAIAllowHosts = []string{
@@ -75,39 +74,6 @@ func egressProxyEnabled() bool {
 	}
 }
 
-// parseEgressAllowlist splits a comma/space-separated host list. Empty tokens dropped.
-// Hosts are lowercased; optional trailing :port is stripped for the allow entry.
-func parseEgressAllowlist(raw string) []string {
-	fields := strings.FieldsFunc(raw, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == ';'
-	})
-	out := make([]string, 0, len(fields))
-	seen := map[string]bool{}
-	for _, f := range fields {
-		h := normalizeAllowHost(f)
-		if h == "" || seen[h] {
-			continue
-		}
-		seen[h] = true
-		out = append(out, h)
-	}
-	return out
-}
-
-func normalizeAllowHost(h string) string {
-	h = strings.ToLower(strings.TrimSpace(h))
-	h = strings.TrimPrefix(h, "https://")
-	h = strings.TrimPrefix(h, "http://")
-	if i := strings.IndexByte(h, '/'); i >= 0 {
-		h = h[:i]
-	}
-	if host, _, err := net.SplitHostPort(h); err == nil {
-		h = host
-	}
-	h = strings.TrimSuffix(h, ".")
-	return h
-}
-
 // checkupEgressEnabled adds package-registry hosts to the shared proxy allowlist.
 // Default ON in docker sandbox so heuristic checkup (npm ci / go test / composer)
 // can reach registries; set OPA_JOB_EGRESS_CHECKUP=0 for sealed offline checkup.
@@ -139,21 +105,17 @@ func aiEgressAllowlist() []string {
 	return out
 }
 
+// parseEgressAllowlist delegates to open-egress-proxy/orchestrate.
+func parseEgressAllowlist(raw string) []string {
+	return openegress.ParseAllowlist(raw)
+}
+
+func normalizeAllowHost(h string) string {
+	return openegress.NormalizeHost(h)
+}
+
 func hostOnEgressAllowlist(hostport string, allow []string) bool {
-	host := normalizeAllowHost(hostport)
-	if host == "" {
-		return false
-	}
-	for _, a := range allow {
-		a = normalizeAllowHost(a)
-		if a == "" {
-			continue
-		}
-		if host == a || strings.HasSuffix(host, "."+a) {
-			return true
-		}
-	}
-	return false
+	return openegress.HostAllowed(hostport, allow)
 }
 
 func egressProxyImage() string {
@@ -182,54 +144,42 @@ func egressStackNetworks() []string {
 	return []string{"opa-stack_opa_internal", "opa_network"}
 }
 
-// attachEgressProxyToStackNetworks connects the proxy to compose/stack bridges.
-// Missing networks are skipped; "already connected" is OK.
-func attachEgressProxyToStackNetworks(ctx context.Context, proxyName string) {
-	proxyName = strings.TrimSpace(proxyName)
-	if proxyName == "" {
-		return
-	}
-	for _, netName := range egressStackNetworks() {
-		netName = strings.TrimSpace(netName)
-		if netName == "" {
-			continue
-		}
-		if _, err := dockerCmd(ctx, "network", "inspect", netName); err != nil {
-			continue
-		}
-		out, err := dockerCmd(ctx, "network", "connect", netName, proxyName)
-		if err != nil {
-			low := strings.ToLower(string(out) + err.Error())
-			if strings.Contains(low, "already") {
-				continue
-			}
-			openlogger.LogWarn("egress proxy stack network connect failed", map[string]interface{}{
-				"network": netName, "proxy": proxyName,
-				"error": truncateStr(string(out)+" "+err.Error(), 160),
-			})
-		}
-	}
-}
-
 func jobNetworkName(jobID string) string {
 	return "opa-job-" + sanitizeDockerName(jobID)
 }
 
-// egressProxyEnvVars are injected into AI job boxes when using internal+proxy.
-func egressProxyEnvVars() map[string]string {
-	url := fmt.Sprintf("http://%s:%d", egressProxyAlias, egressProxyPort)
-	return map[string]string{
-		"HTTP_PROXY":  url,
-		"HTTPS_PROXY": url,
-		"http_proxy":  url,
-		"https_proxy": url,
-		"NO_PROXY":    "localhost,127.0.0.1," + egressProxyAlias,
-		"no_proxy":    "localhost,127.0.0.1," + egressProxyAlias,
+type oraEgressDocker struct{}
+
+func (oraEgressDocker) Cmd(ctx context.Context, args ...string) ([]byte, error) {
+	return dockerCmd(ctx, args...)
+}
+
+func (oraEgressDocker) RmForce(ctx context.Context, name string) error {
+	return dockerRmForce(ctx, name)
+}
+
+func egressOrchestrateConfig() openegress.Config {
+	return openegress.Config{
+		ContainerName: egressProxyContainerName(),
+		NetworkName:   egressNetworkName(),
+		Image:         egressProxyImage(),
+		Allowlist:     aiEgressAllowlist(),
+		OwnerLabel:    "opa.owner=opa-orchestrator",
+		InstanceLabel: "opa.instance=" + opaInstanceID(),
+		RoleLabelKey:  "opa.role",
+		StackNetworks: egressStackNetworks(),
+		Alias:         egressProxyAlias,
+		Port:          egressProxyPort,
 	}
 }
 
+// egressProxyEnvVars are injected into AI job boxes when using internal+proxy.
+func egressProxyEnvVars() map[string]string {
+	return openegress.ProxyEnvVars(egressProxyAlias, egressProxyPort)
+}
+
 // ensureSharedEgressProxy starts (or reuses) the long-lived allowlist proxy for
-// this orchestrator instance. Labels: opa.owner, opa.role=egress-proxy, opa.instance.
+// this orchestrator instance via open-egress-proxy/orchestrate.
 func ensureSharedEgressProxy(ctx context.Context) (string, error) {
 	if sandboxMode() != "docker" {
 		return "", nil
@@ -237,146 +187,26 @@ func ensureSharedEgressProxy(ctx context.Context) (string, error) {
 	if err := requireDockerCLI(); err != nil {
 		return "", err
 	}
-	egressProxyMu.Lock()
-	defer egressProxyMu.Unlock()
-
-	name := egressProxyContainerName()
-	wantAllow := strings.Join(aiEgressAllowlist(), ",")
-	if id, err := dockerContainerIDByName(ctx, name); err == nil && id != "" {
-		if running, _ := dockerContainerRunning(ctx, name); running {
-			if got, ok := dockerContainerEnv(ctx, name, "OPA_EGRESS_ALLOWLIST"); ok && got == wantAllow {
-				attachEgressProxyToStackNetworks(ctx, name)
-				return name, nil
-			}
-			// Allowlist drifted (e.g. new Cursor API hosts) — recreate.
-			openlogger.LogInfo("egress proxy allowlist drift — recreating", map[string]interface{}{
-				"name": name, "want": wantAllow,
-			})
-		}
-		_ = dockerRmForce(ctx, name)
-	}
-
-	egNet := egressNetworkName()
-	if out, err := dockerCmd(ctx, "network", "create", egNet); err != nil {
-		low := strings.ToLower(string(out) + err.Error())
-		if !strings.Contains(low, "already") {
-			return "", fmt.Errorf("egress network: %w (%s)", err, truncateStr(string(out), 160))
-		}
-	}
-
-	allow := wantAllow
-	image := egressProxyImage()
-	argv := []string{
-		"run", "-d",
-		"--name", name,
-		"--label", "opa.owner=opa-orchestrator",
-		"--label", "opa.role=" + egressProxyRoleLabel,
-		"--label", "opa.instance=" + opaInstanceID(),
-		"--network", egNet,
-		"--restart", "unless-stopped",
-		"-e", "OPA_EGRESS_ALLOWLIST=" + allow,
-		"-e", "OPA_EGRESS_PROXY_LISTEN=:" + strconv.Itoa(egressProxyPort),
-		image,
-	}
-	out, err := dockerCmd(ctx, argv...)
-	if err != nil {
-		low := strings.ToLower(string(out) + err.Error())
-		// Concurrent ensure / prior rm race: name still held → force remove and retry once.
-		if strings.Contains(low, "already in use") || strings.Contains(low, "conflict") {
-			_ = dockerRmForce(ctx, name)
-			out, err = dockerCmd(ctx, argv...)
-		}
-	}
-	if err != nil {
-		return "", fmt.Errorf("egress proxy start: %w (%s)", err, truncateStr(string(out), 240))
-	}
-	// Brief ready wait — CONNECT listener.
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
-		if running, _ := dockerContainerRunning(ctx, name); running {
-			attachEgressProxyToStackNetworks(ctx, name)
-			return name, nil
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	attachEgressProxyToStackNetworks(ctx, name)
-	return name, nil
-}
-
-func dockerContainerIDByName(ctx context.Context, name string) (string, error) {
-	out, err := dockerCmd(ctx, "ps", "-aq", "--filter", "name=^/"+name+"$")
-	if err != nil {
-		return "", err
-	}
-	ids := strings.Fields(string(out))
-	if len(ids) == 0 {
-		// Docker name filter is substring; fall back to inspect.
-		out2, err2 := dockerCmd(ctx, "inspect", "-f", "{{.Id}}", name)
-		if err2 != nil {
-			return "", err2
-		}
-		return strings.TrimSpace(string(out2)), nil
-	}
-	return ids[0], nil
-}
-
-func dockerContainerRunning(ctx context.Context, name string) (bool, error) {
-	out, err := dockerCmd(ctx, "inspect", "-f", "{{.State.Running}}", name)
-	if err != nil {
-		return false, err
-	}
-	return strings.TrimSpace(string(out)) == "true", nil
-}
-
-// dockerContainerEnv returns one container env value when present.
-func dockerContainerEnv(ctx context.Context, name, key string) (string, bool) {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return "", false
-	}
-	out, err := dockerCmd(ctx, "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", name)
-	if err != nil {
-		return "", false
-	}
-	prefix := key + "="
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimRight(line, "\r")
-		if strings.HasPrefix(line, prefix) {
-			return strings.TrimPrefix(line, prefix), true
-		}
-	}
-	return "", false
+	return openegress.EnsureShared(ctx, oraEgressDocker{}, egressOrchestrateConfig())
 }
 
 // attachEgressProxyToJobNetwork connects the shared proxy to a per-job --internal
 // network with a stable DNS alias jobs use in HTTP(S)_PROXY.
 func attachEgressProxyToJobNetwork(ctx context.Context, jobNet string) error {
-	jobNet = strings.TrimSpace(jobNet)
-	if jobNet == "" {
-		return fmt.Errorf("empty job network")
+	if sandboxMode() != "docker" {
+		return nil
 	}
-	proxy, err := ensureSharedEgressProxy(ctx)
-	if err != nil {
+	if err := requireDockerCLI(); err != nil {
 		return err
 	}
-	out, err := dockerCmd(ctx, "network", "connect", "--alias", egressProxyAlias, jobNet, proxy)
-	if err != nil {
-		low := strings.ToLower(string(out) + err.Error())
-		if strings.Contains(low, "already") {
-			return nil
-		}
-		return fmt.Errorf("proxy network connect: %w (%s)", err, truncateStr(string(out), 160))
-	}
-	return nil
+	return openegress.AttachToNetwork(ctx, oraEgressDocker{}, egressOrchestrateConfig(), jobNet)
 }
 
 func detachEgressProxyFromNetwork(ctx context.Context, jobNet string) {
-	jobNet = strings.TrimSpace(jobNet)
-	if jobNet == "" || sandboxMode() != "docker" {
+	if sandboxMode() != "docker" {
 		return
 	}
-	name := egressProxyContainerName()
-	_, _ = dockerCmd(ctx, "network", "disconnect", "-f", jobNet, name)
+	openegress.DetachFromNetwork(ctx, oraEgressDocker{}, egressOrchestrateConfig(), jobNet)
 }
 
 // prepareAIJobNetwork creates --internal job net, attaches the shared proxy, and

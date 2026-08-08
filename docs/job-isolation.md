@@ -12,6 +12,8 @@ Default remains `off` so existing smoke stays host-exec with curated `jobEnv`.
 ./job-escape-smoke.sh           # every probe must FAIL inside the box
 
 export OPA_JOB_SANDBOX=docker
+Proxy spawn/attach uses `github.com/TheGrimmChester/open-egress-proxy/orchestrate` (product wrappers only for allowlist defaults + naming).
+
 # Egress proxy defaults ON in docker mode (OPA_JOB_EGRESS_PROXY=0 → old bridge fallback)
 export OPA_JOB_EGRESS_PROXY_IMAGE=opa-egress-proxy:smoke
 export OPA_JOB_IMAGE_SCAN=opa-runner-scan:smoke

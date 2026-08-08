@@ -14,6 +14,8 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 )
 
+require github.com/TheGrimmChester/open-egress-proxy v0.0.0-20260808055639-6b52fa909452 // indirect
+
 // The family libraries were wired with filesystem replaces (=> ../Open-Auth-Go).
 // Those resolve in a developer tree but not in a single-repo checkout, so every
 // CI checkup aborted before a test ran:
