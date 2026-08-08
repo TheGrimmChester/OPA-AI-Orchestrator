@@ -10,8 +10,7 @@
 | `CLICKHOUSE_URL` | ClickHouse HTTP endpoint |
 | `CLICKHOUSE_DB` | Product database (default `ora`). Alias: `CLICKHOUSE_DATABASE` |
 | `PEER_OSA_URL` | OSA base URL (AppSec runs + gate + SCM checker fan-out target) |
-| `PEER_OAM_URL` | OAM base URL (connector directory sync via `POST /api/internal/connectors/sync`; dashboard project switcher via `GET /api/oam/projects?product=ora`). When set, browser connector/credential writes are refused (`credentials_home_oam`); OAM peers writes via `/api/internal/connectors/*`. `POST /api/scm/ai-review` and `POST /api/scm/opa-review/stack` fail-closed when a concrete `X-Project-ID` is absent from OAM `?product=ora` (skip when unset or project empty/`all`). |
-| `OAM_DASHBOARD_URL` | Preferred base for post-install / claim browser redirects (`/connectors`). Falls back to `OPA_DASHBOARD_URL` for one release. |
+| `PEER_OAM_URL` | OAM base URL (connector directory sync via `POST /api/internal/connectors/sync`; dashboard project switcher via `GET /api/oam/projects?product=ora`). When set, browser connector/credential writes are refused (`credentials_home_oam`); OAM peers writes via `/api/internal/connectors/*`. `POST /api/scm/ai-review` and `POST /api/scm/opa-review/stack` fail-closed when a concrete `X-Project-ID` is absent from OAM `?product=ora` (skip when unset or project empty/`all`).  With `OPA_AUTH_REQUIRED`, unset `PEER_OAM_URL` makes tenant middleware return **503** (no ClickHouse `opa.organizations` fallback). || `OAM_DASHBOARD_URL` | Preferred base for post-install / claim browser redirects (`/connectors`). Falls back to `OPA_DASHBOARD_URL` for one release. |
 | `PEER_OPL_URL` | OPL base URL (SCM checker fan-out) |
 | `PEER_OPM_URL` | OPM base URL (SCM checker fan-out) |
 | `PEER_OPA_URL` | Optional OPA hub base URL (also selects co-deployed auth when set) |
