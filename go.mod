@@ -10,11 +10,11 @@ require (
 	github.com/TheGrimmChester/open-job-env-go v0.0.0
 	github.com/TheGrimmChester/open-job-go v0.0.0-20260803091535-04d163946627
 	github.com/TheGrimmChester/open-logger-go v0.2.0
-	github.com/TheGrimmChester/open-tenant-go v0.2.2
+	github.com/TheGrimmChester/open-tenant-go v0.3.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
 )
 
-require github.com/TheGrimmChester/open-egress-proxy v0.0.0-20260808055639-6b52fa909452 // indirect
+require github.com/TheGrimmChester/open-egress-proxy v0.0.0-20260808055639-6b52fa909452
 
 // The family libraries were wired with filesystem replaces (=> ../Open-Auth-Go).
 // Those resolve in a developer tree but not in a single-repo checkout, so every
@@ -38,3 +38,5 @@ replace github.com/TheGrimmChester/open-cache-go => ../Open-Cache-Go
 replace github.com/TheGrimmChester/open-crypto-go => ../Open-Crypto-Go
 
 replace github.com/TheGrimmChester/open-job-env-go => ../Open-Job-Env-Go
+
+replace github.com/TheGrimmChester/open-tenant-go => ../Open-Tenant-Go
