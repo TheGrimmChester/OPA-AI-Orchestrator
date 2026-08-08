@@ -2,6 +2,8 @@ github.com/TheGrimmChester/open-clickhouse-go v0.2.0 h1:xEbeefkQvBR0SlWUHwKxZAPV
 github.com/TheGrimmChester/open-clickhouse-go v0.2.0/go.mod h1:bwLzOyXCShpag7Cx7P7vYUBdAHO8oMNhNd2xfy3APiI=
 github.com/TheGrimmChester/open-client-go v0.0.0-20260803093649-eb6d2f7a2423 h1:PnuEUm2b4C6sIANi7YOnzMcQrb8uEyn3PBYvWaDHxlU=
 github.com/TheGrimmChester/open-client-go v0.0.0-20260803093649-eb6d2f7a2423/go.mod h1:u5SZ19+nT/NdAK8zgsWtKFiv13DeGEPf0JCcPgficGU=
+github.com/TheGrimmChester/open-egress-proxy v0.0.0-20260808055639-6b52fa909452 h1:CW8roPyKuOHtJtZoJGVBuuDhaDZ9Q3AceHEKbPErb8Y=
+github.com/TheGrimmChester/open-egress-proxy v0.0.0-20260808055639-6b52fa909452/go.mod h1:Q4bI+DE1FxmGW2vNtLuRmMu6nVsLPo5Q0A9mgrql3Lw=
 github.com/TheGrimmChester/open-http-go v0.0.0-20260804055231-a9462e336412 h1:UnUrc7y/28FUX+nBYTwbfmDJd+lUvsxbBLR5xN1S3SM=
 github.com/TheGrimmChester/open-http-go v0.0.0-20260804055231-a9462e336412/go.mod h1:tlrbASpDDFqFkp2839DEkEzDjZ2mo4ZQiJ5AKGC05qo=
 github.com/TheGrimmChester/open-job-go v0.0.0-20260803091535-04d163946627 h1:SoepdoVShSEjVKYiF5iWg7ZK8Hns+M2PDLr1u4DL/S8=
