@@ -141,8 +141,26 @@ func Complete(ctx context.Context, taskKind string, req aiCompleteRequest) (*aiC
 }
 
 // CompleteFor resolves providers with scoped credentials (user → org; never admin/env).
+// When PEER_OAM_URL is set, credentials come from OAM lease/redeem only (no scm_secrets).
 func CompleteFor(ctx context.Context, taskKind string, req aiCompleteRequest, q credResolveQuery) (*aiCompleteResult, error) {
 	doc := getAISettingsFor(q)
+	if oamConfigured() {
+		agentKey := agentKeyForTaskKind(taskKind)
+		if agentKey == "" {
+			return nil, fmt.Errorf("PEER_OAM_URL set but no ORA agent_key for task %q — bind keys in OAM AI Endpoints", taskKind)
+		}
+		key, bin, model, force := resolveCLICursorConfig(agentKey, q.OrganizationID, q.ProjectID, q.UserID)
+		if key == "" {
+			return nil, errAINoProvider
+		}
+		doc.CLICursor.APIKey = key
+		doc.CLICursor.Enabled = true
+		doc.CLICursor.Model = model
+		doc.CLICursor.Force = force
+		doc.CLICursor.Bin = bin
+		doc.DefaultProvider = aiProviderCLICursor
+		_ = bin
+	}
 	providers := ResolveProvider(taskKind, doc)
 	if len(providers) == 0 {
 		return nil, errAINoProvider
@@ -376,9 +394,14 @@ func buildChatMessages(req aiCompleteRequest) []map[string]string {
 	return out
 }
 
-// resolveCLICursorConfig returns key/bin/model/force from scoped AI settings.
-// Extra orgProj[2] may be acting userID for user→org inheritance.
-func resolveCLICursorConfig(orgProj ...string) (key, bin, model string, force bool) {
+// resolveCLICursorConfig returns key/bin/model/force for an ORA agent phase.
+//
+// When PEER_OAM_URL is set: lease → redeem from OAM (product "ora", agentKey).
+// Fail closed on lease/redeem errors — never falls back to scm_secrets.
+// When PEER_OAM_URL is unset: scoped local AI settings (lab / solo path).
+//
+// orgProj[0]=org, [1]=project, [2]=acting userID for user→org inheritance.
+func resolveCLICursorConfig(agentKey string, orgProj ...string) (key, bin, model string, force bool) {
 	org, proj, userID := "", "", ""
 	if len(orgProj) >= 1 {
 		org = orgProj[0]
@@ -389,14 +412,42 @@ func resolveCLICursorConfig(orgProj ...string) (key, bin, model string, force bo
 	if len(orgProj) >= 3 {
 		userID = orgProj[2]
 	}
+	bin = resolveAgentBin()
+	force = envOr("OPA_CURSOR_AGENT_FORCE", "0") == "1"
+	model = envOr("OPA_CURSOR_MODEL", "auto")
+
+	if oamConfigured() {
+		agentKey = strings.TrimSpace(agentKey)
+		if agentKey == "" {
+			return "", bin, model, force
+		}
+		b, err := resolveAgentFromOAM(context.Background(), org, proj, userID, agentKey)
+		if err != nil || strings.TrimSpace(b.APIKey) == "" {
+			return "", bin, model, force
+		}
+		key = strings.TrimSpace(b.APIKey)
+		if m := strings.TrimSpace(b.Model); m != "" {
+			model = m
+		}
+		return key, bin, model, force
+	}
+
 	doc := getAISettingsFor(credResolveQuery{
 		OrganizationID: org, ProjectID: proj, UserID: userID,
 	})
 	key = doc.CLICursor.APIKey
-	// Inverted precedence: env / baked path win. Settings cli_cursor.bin is
-	// ignored for agent children so a PUT cannot choose the executable.
-	bin = resolveAgentBin()
-	model = nz(doc.CLICursor.Model, envOr("OPA_CURSOR_MODEL", "auto"))
-	force = doc.CLICursor.Force || envOr("OPA_CURSOR_AGENT_FORCE", "0") == "1"
+	model = nz(doc.CLICursor.Model, model)
+	force = doc.CLICursor.Force || force
 	return
+}
+
+// hasCLIAgentCredential reports whether a job may attempt a CLI agent call.
+// Under PEER_OAM_URL this is true when OAM is configured (keys resolve per job);
+// it does not burn a one-shot lease. Without OAM, checks the local settings plane.
+func hasCLIAgentCredential(orgProj ...string) bool {
+	if oamConfigured() {
+		return true
+	}
+	key, _, _, _ := resolveCLICursorConfig(agentKeyReview, orgProj...)
+	return key != ""
 }

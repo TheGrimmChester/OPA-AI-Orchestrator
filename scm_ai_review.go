@@ -95,14 +95,14 @@ func runCursorAIReview(job *scmJob, conn *opaConnector, wr *opaWatchedRepo, chec
 		persistAIReview(job, res)
 		return res
 	}
-	key, agentBin, model, force := resolveCLICursorConfig(job.OrganizationID, job.ProjectID, job.ActorUserID)
+	key, agentBin, model, force := resolveCLICursorConfig(agentKeyReview, job.OrganizationID, job.ProjectID, job.ActorUserID)
 	res.Model = model
 	if key == "" {
 		res.Status = "skipped"
 		if strings.TrimSpace(job.ActorUserID) == "" {
-			res.Summary = "OPA Review API key not set — webhook jobs need an org CLI agent key under Account → Organization (personal keys are ignored when ActorUserID is empty)"
+			res.Summary = "OPA Review API key not set — webhook jobs need an org CLI agent binding in OAM AI Endpoints (or a local org key when PEER_OAM_URL is unset)"
 		} else {
-			res.Summary = "OPA Review API key not set — save a CLI agent key under Account (personal or org)"
+			res.Summary = "OPA Review API key not set — bind ORA review in OAM AI Endpoints (or save a local CLI agent key when PEER_OAM_URL is unset)"
 		}
 		persistAIReview(job, res)
 		return res

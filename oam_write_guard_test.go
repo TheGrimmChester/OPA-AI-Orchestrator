@@ -42,11 +42,8 @@ func TestCursorKeySetRefusedWhenOAM(t *testing.T) {
 	req.Header.Set("X-Organization-ID", "nas")
 	rr := httptest.NewRecorder()
 	handleCursorKeySet(rr, req)
-	if rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status=%d want 503 body=%s", rr.Code, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "credentials_home_oam") {
-		t.Fatalf("body=%s", rr.Body.String())
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status=%d want 404 body=%s", rr.Code, rr.Body.String())
 	}
 }
 

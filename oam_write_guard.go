@@ -6,7 +6,7 @@ import (
 	"net/http"
 )
 
-const oamCredentialHomeMsg = "credentials and connector configuration are managed by OAM when PEER_OAM_URL is set — use OAM /api/credentials and /api/connectors"
+const oamCredentialHomeMsg = "credentials and connector configuration are managed by OAM when PEER_OAM_URL is set — use OAM /endpoints (AI Endpoints) and /connectors"
 
 type ctxKeyPeerOAMWrite struct{}
 

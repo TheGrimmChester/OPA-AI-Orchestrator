@@ -315,7 +315,7 @@ func handleReviewContextGenerate(w http.ResponseWriter, r *http.Request) {
 		_, projKey = ctxTenant.WriteTenant()
 	}
 	userID := strings.TrimSpace(a.Username)
-	key := resolveCursorAPIKey(orgKey, projKey, userID)
+	key := resolveCursorAPIKey(agentKeyContextGenerate, orgKey, projKey, userID)
 	if key == "" {
 		writeJSON(w, map[string]interface{}{
 			"ok": true, "status": "skipped", "reason": "cli_agent_api_key_not_set",
@@ -324,7 +324,7 @@ func handleReviewContextGenerate(w http.ResponseWriter, r *http.Request) {
 				"body_markdown": "",
 				"source":        "skipped",
 			},
-			"honesty": "No CLI agent API key for this user/org — save one under Account (personal or org). Resolution is user → org → fail closed (never admin/env).",
+			"honesty": "No CLI agent API key for this user/org — bind ORA context_generate in OAM AI Endpoints (or save a local key when PEER_OAM_URL is unset). Resolution is user → org → fail closed (never admin/env).",
 		})
 		return
 	}
@@ -530,9 +530,14 @@ Do not commit or push. Do not invent vendor product names.
 		defer os.Remove(promptPath)
 	}
 
-	agentBin, model := "", ""
-	force := false
-	_, agentBin, model, force = resolveCLICursorConfig("", "")
+	agentBin := resolveAgentBin()
+	model := envOr("OPA_CURSOR_MODEL", "auto")
+	force := envOr("OPA_CURSOR_AGENT_FORCE", "0") == "1"
+	// Prefer non-secret defaults from local settings when OAM is unset; under
+	// PEER_OAM_URL the key was already leased by the caller — do not redeem again.
+	if !oamConfigured() {
+		_, agentBin, model, force = resolveCLICursorConfig(agentKeyContextGenerate, "", "")
+	}
 	args := []string{"-p", "--trust", "--output-format", "text", "--model", model}
 	if force {
 		args = append(args, "--force")

@@ -86,6 +86,11 @@ func registerAISettingsAuth(mux *http.ServeMux, pattern string, h http.HandlerFu
 }
 
 func handleAISettings(w http.ResponseWriter, r *http.Request) {
+	// Family stacks: AI credentials live in OAM Endpoints — local settings plane is gone.
+	if localOAMWritesBlocked() {
+		http.NotFound(w, r)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
 		handleAISettingsGet(w, r)
@@ -276,6 +281,11 @@ func getAISettingsFor(q credResolveQuery) aiSettingsDoc {
 }
 
 func hydrateAISecretsFromCHLocked(q credResolveQuery, doc *aiSettingsDoc) {
+	// Family path: never load AI keys from scm_secrets — jobs use OAM lease/redeem.
+	if oamConfigured() {
+		applyAIEnvOverrides(doc)
+		return
+	}
 	if queryClient == nil {
 		applyAIEnvOverrides(doc)
 		return
@@ -720,7 +730,11 @@ func handleAISettingsPut(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAISettingsTest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+	if localOAMWritesBlocked() {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
