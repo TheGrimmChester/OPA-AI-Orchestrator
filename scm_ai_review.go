@@ -1086,23 +1086,11 @@ func packAIContext(job *scmJob, wr *opaWatchedRepo, securityRunID, diff, checkou
 			b.WriteString("\n\n")
 		}
 	}
-	if securityRunID != "" && queryClient != nil {
-		rid := escapeSQL(securityRunID)
-		if rows, err := queryClient.Query(fmt.Sprintf(`
-			SELECT rule, file, line, severity FROM opa.secret_findings WHERE security_run_id = '%s' LIMIT 20`, rid)); err == nil && len(rows) > 0 {
-			b.WriteString("## This-run secret findings\n")
-			jb, _ := json.MarshalIndent(rows, "", "  ")
-			b.Write(jb)
-			b.WriteString("\n\n")
-		}
-		if rows, err := queryClient.Query(fmt.Sprintf(`
-			SELECT rule, file, line, severity, message FROM opa.sast_findings WHERE security_run_id = '%s' LIMIT 20`, rid)); err == nil && len(rows) > 0 {
-			b.WriteString("## This-run SAST findings\n")
-			jb, _ := json.MarshalIndent(rows, "", "  ")
-			b.Write(jb)
-			b.WriteString("\n\n")
-		}
+	org := ""
+	if job != nil {
+		org = job.OrganizationID
 	}
+	writeThisRunSecurityFindingsBrief(&b, org, securityRunID)
 	fmt.Fprintf(&b, "## Worktree isolation\n- Absolute path: `%s`\n- Full PR tree under OPA_REVIEW_TMP. Read surrounding code, callers, and related tests — not the hunk alone.\n\n", checkoutRoot)
 	agentJob := ""
 	if job != nil {

@@ -98,7 +98,7 @@ layout cannot read a previous attempt's log as its own.
 
 | Target | Contents | Phase |
 |--------|----------|-------|
-| `opa-runner-scan` | gitleaks + `/etc/opa/gitleaks.toml` | `security.scan` |
+| `opa-runner-scan` | Historical scan image (gitleaks toml). Family AppSec runs on **OSA**; keep for solo/legacy layouts only | `security.scan` (solo) |
 | `opa-runner-git` | git only | prepare-adjacent |
 | `opa-runner-ai` | Review runner binary, Playwright, pinned `@playwright/mcp` | review / autofix |
 | `opa-runner-php` | PHP 8.4 CLI + common extensions + Composer | checkup / `cloud.verify` |

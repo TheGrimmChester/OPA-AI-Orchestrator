@@ -7,7 +7,7 @@ OPA splits PR work into kinds on the existing `scmJob` row (`kind`, `run_id`,
 |------|------|-------------------------|--------------|
 | `run` | Parent folder for children | No | No |
 | `prepare` | Worktree + related checkouts | No (git only) | No |
-| `security` | Lite scanners + gitleaks | Yes (scan) | Publish only (in-process) |
+| `security` | Fan-out to OSA scanners + gate; findings via peer | No (peer owns scan) | Gate Check Run / publish via peer |
 | `bugbot` | Automated code review (review runner) | Yes (review) | Publish only (in-process) |
 | `approval` | Policy + review event | No | Yes (sole APPROVE path) |
 | `cloud` | Autofix (patch → gate → clean land) | Yes (patch/verify) | Land only (in-process) |

@@ -73,13 +73,13 @@ Do **not** infer Open tenancy from GitHub `account_login` name equality, and do 
 | `OPA_DASHBOARD_URL` | Fallback redirect base (one release); also used for job Check Run links |
 | `OPA_SCM_STATE_DIR` | Durable SCM job + OPA Review stack JSON (default `$OPA_SECURITY_WORKSPACE/scm-state`). Survives Agent restart when the workspace (or this dir) is volume-mounted. Dual-written with ClickHouse `opa.scm_jobs` / `opa.scm_review_stacks`. |
 | `OPA_REVIEW_TMP` | OPA Review + context-gen checkout root (default `/tmp/opa-review`) |
-| `CURSOR_API_KEY` | **Unused for tenant jobs** (formerly a process-wide fallback). Set review-runner / model-provider keys via Account settings (`opa.scm_secrets` scopes). Still injected into the child review-runner process after scoped resolution. |
+| `CURSOR_API_KEY` | **Unused for tenant jobs.** Under `PEER_OAM_URL`, keys come from OAM lease→redeem only. Solo (peer unset): scoped `opa.scm_secrets`. Process env is never a tenant fallback. |
 | `OPA_CURSOR_AGENT_BIN` | Path to review-runner binary (image default `/usr/local/bin/agent`) |
 | `OPA_CURSOR_MODEL` | default `auto` |
 | `SKIP_CURSOR_AI` | `1` to skip automated review. Default `0` in compose — with a scoped user/org API key, OPA Review runs |
 | `OPA_CURSOR_AGENT_FORCE` | `1` to pass `--force` to the review runner (default off; `--trust` alone for headless) |
 | `OPA_AI_REVIEW_MAX_UNITS` | Cap independent review units per PR (default 10, max 12) |
-| `OPA_GITLEAKS_CONFIG` | Path to gitleaks.toml (image default `/etc/opa/gitleaks.toml` allowlists UI `key:` FPs) |
+| `OPA_GITLEAKS_CONFIG` | Legacy solo-scan path only. Family AppSec SoT is **OSA** (`PEER_OSA_URL`); ORA does not own secrets scanning. |
 | `JWT_SECRET` / `OPA_CONNECTOR_SECRET` | AES-256-GCM key material for persisting PAT + review-runner API key in ClickHouse across Agent restarts (`OPA_CONNECTOR_SECRET` preferred; smoke uses compose `JWT_SECRET`). Ephemeral JWT fallbacks are refused for secret encryption. |
 | `OPA_SCM_MOCK_GITHUB` | `1` mock checkout + Check Run ids for smoke/fake tokens (compose). **Real `ghp_` / `github_pat_` PATs still call GitHub** for repo listing and checkout. |
 | `OPA_SCAN_WORKTREE_ENFORCE` | Default `1`. SCM / repo-linked security scans must use an isolated checkout under `OPA_REVIEW_TMP/{id}` (never shared `/workspace` root). Set `0` only for legacy local path scans. |
@@ -98,13 +98,13 @@ $OPA_REVIEW_TMP/                     # default /tmp/opa-review
   ctxgen-{id}/                       # POST /api/scm/contexts/generate checkout
 ```
 
-- Repo Watch jobs (webhook / simulate / manual review) always prepare `$OPA_REVIEW_TMP/{job_id}` before gitleaks/SAST/review.
+- Review jobs (webhook / simulate / manual) always prepare `$OPA_REVIEW_TMP/{job_id}` before AppSec peer fan-out and review.
 - Context generate clones into `$OPA_REVIEW_TMP/ctxgen-{id}` (default branch or optional PR), runs the review runner with `cwd` = that tree, then deletes the dir.
 - Real PAT/App: bare mirror + `git worktree add` via **GIT_ASKPASS** (token never in clone URL). Checkout failure → job `status=error` (no silent shared-fixture scan). Context generate fail-closed the same way with real credentials.
 - Mock / fake token: isolated mock git repo under the same `$OPA_REVIEW_TMP/{id}` path.
 - Webhooks for repos without an OAM ora-enabled project bind (when `PEER_OAM_URL` set) are skipped with an honest reason — no unconstrained App auto-watch. Solo without peer OAM may still auto-watch installed repos.
 - Review runner: `cmd.Dir = checkout`, prompt + `OPA_SCAN_WORKTREE` env point at the full tree; brief instructs **surrounding-code analysis** (callers, neighbors, related tests) — not hunk-only. `--trust` by default (`OPA_CURSOR_AGENT_FORCE=1` adds `--force`). Reviews run **per changed file** (or package group when over `OPA_AI_REVIEW_MAX_UNITS`), then findings are aggregated.
-- Gitleaks uses `/etc/opa/gitleaks.toml` (UI `key:` / React prop allowlists) plus an Agent post-filter; AppSec gate default `min_severity=high` ignores medium-only generic-api-key noise. Manual `force_ai` / `ai_only` jobs still run review and report gate+ai together.
+- **AppSec SoT is OSA** (`PEER_OSA_URL`): secrets/SAST/IaC runs and findings live there. ORA fans out SCM events, evaluates the gate via peer, and loads this-run findings with `GET /api/security/runs/{id}/findings` (no ClickHouse invent of `opa.*_findings` for ledger/brief). Gate default `min_severity=high`. Manual `force_ai` / `ai_only` jobs still run review and report gate+ai together.
 - Old `$OPA_REVIEW_TMP/*` (and legacy `worktrees/`/`jobs/`) cleaned after ~24h (`git worktree remove` + delete).
 - **Review API key tenancy:** when `PEER_OAM_URL` is set, jobs obtain keys only via OAM lease → redeem (`product:"ora"`, agent keys such as `review`, `auto_fix`, `cloud`, `context_generate`). Bind models/keys in OAM **AI Endpoints**. Local `/api/ai/settings*` and cursor-key writes return **404**. Solo (peer unset): stored in `opa.scm_secrets` with `scope` (`admin`|`org`|`user`) + `organization_id`/`user_id`; resolution **user → org → fail closed**. Admin keys are never inherited. Process env `CURSOR_API_KEY` / `OPA_OPENAI_API_KEY` / `OPA_ANTHROPIC_API_KEY` are **not** used as tenant fallbacks.
 
