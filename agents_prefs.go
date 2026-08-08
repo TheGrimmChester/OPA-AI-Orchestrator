@@ -90,7 +90,7 @@ var agentPrefsCapabilityFields = map[string]bool{
 type agentPrefsRow struct {
 	OrganizationID string `json:"organization_id"`
 	ProjectID      string `json:"project_id"`
-	Level          string `json:"level"` // org|installation|repo
+	Level          string `json:"level"` // org|project|repo (historical rows may still use installation)
 	ScopeKey       string `json:"scope_key"`
 	PrefsJSON      string `json:"prefs_json"`
 	UpdatedAt      string `json:"updated_at"`
@@ -122,8 +122,22 @@ func triggerModeAdmits(mode, event string) bool {
 	}
 }
 
-// resolveAgentPrefs merges builtin → org → installation → repo. Returns effective
-// prefs and a per-field source map for Dashboard provenance.
+// loadConnectorScopedPrefsJSON loads project-level prefs for a connector scope,
+// falling back to historically stored level=installation rows (same scope_key).
+// Source provenance for the merge always reports "project".
+func loadConnectorScopedPrefsJSON(org, proj, connectorID string) string {
+	if strings.TrimSpace(connectorID) == "" {
+		return ""
+	}
+	if raw := loadAgentPrefsJSON(org, proj, "project", connectorID); raw != "" {
+		return raw
+	}
+	return loadAgentPrefsJSON(org, proj, "installation", connectorID)
+}
+
+// resolveAgentPrefs merges builtin → org → project (connector) → repo. Returns
+// effective prefs and a per-field source map for Dashboard provenance.
+// Historical installation-keyed JSON is still read for connector scope.
 func resolveAgentPrefs(org, proj, connectorID, repo string) (agentPrefs, map[string]string) {
 	out := builtinAgentPrefs()
 	sources := map[string]string{}
@@ -142,7 +156,7 @@ func resolveAgentPrefs(org, proj, connectorID, repo string) (agentPrefs, map[str
 
 	apply(loadAgentPrefsJSON(org, proj, "org", org+"/"+proj), "org")
 	if connectorID != "" {
-		apply(loadAgentPrefsJSON(org, proj, "installation", connectorID), "installation")
+		apply(loadConnectorScopedPrefsJSON(org, proj, connectorID), "project")
 	}
 	if repo != "" {
 		apply(loadAgentPrefsJSON(org, proj, "repo", repo), "repo")
@@ -153,6 +167,27 @@ func resolveAgentPrefs(org, proj, connectorID, repo string) (agentPrefs, map[str
 		}
 	}
 	return out, sources
+}
+
+// parseAgentPrefsLevel validates public API levels. allowEmpty maps blank → org
+// (GET default). level=installation is rejected (use project + X-Project-ID).
+func parseAgentPrefsLevel(level string, allowEmpty bool) (string, string) {
+	level = strings.ToLower(strings.TrimSpace(level))
+	if level == "" {
+		if allowEmpty {
+			return "org", ""
+		}
+		return "", "level required — use org, project, or repo (omit only on GET, which defaults to org)"
+	}
+	if level == "installation" {
+		return "", "use level=project with X-Project-ID"
+	}
+	switch level {
+	case "org", "project", "repo":
+		return level, ""
+	default:
+		return "", "level must be org, project, or repo"
+	}
 }
 
 func applyPrefsPatch(out *agentPrefs, sources map[string]string, patch map[string]json.RawMessage, level string) {
@@ -424,13 +459,17 @@ func handleAgentPrefs(w http.ResponseWriter, r *http.Request) {
 func handleAgentPrefsGet(w http.ResponseWriter, r *http.Request) {
 	ctx, _ := ExtractTenantContext(r, queryClient)
 	org, proj := ctx.WriteTenant()
-	level := strings.ToLower(strings.TrimSpace(nz(r.URL.Query().Get("level"), "org")))
+	level, errMsg := parseAgentPrefsLevel(r.URL.Query().Get("level"), true)
+	if errMsg != "" {
+		http.Error(w, errMsg, 400)
+		return
+	}
 	scope := strings.TrimSpace(r.URL.Query().Get("scope_key"))
 	connectorID := strings.TrimSpace(r.URL.Query().Get("connector_id"))
 	repo := strings.TrimSpace(r.URL.Query().Get("repo"))
-	if level == "installation" || level == "repo" {
-		if filled, errMsg, code := resolveConnectorFromOAMProject(r, connectorID); errMsg != "" {
-			http.Error(w, errMsg, code)
+	if level == "project" || level == "repo" {
+		if filled, resolveErr, code := resolveConnectorFromOAMProject(r, connectorID); resolveErr != "" {
+			http.Error(w, resolveErr, code)
 			return
 		} else if filled != "" {
 			connectorID = filled
@@ -440,17 +479,18 @@ func handleAgentPrefsGet(w http.ResponseWriter, r *http.Request) {
 		switch level {
 		case "org":
 			scope = org + "/" + proj
-		case "installation":
+		case "project":
 			scope = connectorID
 		case "repo":
 			scope = repo
-		default:
-			level = "org"
-			scope = org + "/" + proj
 		}
 	}
 	effective, sources := resolveAgentPrefs(org, proj, connectorID, repo)
 	stored := loadAgentPrefsJSON(org, proj, level, scope)
+	if level == "project" && stored == "" {
+		// Surface historical installation-keyed blobs under the project level.
+		stored = loadAgentPrefsJSON(org, proj, "installation", scope)
+	}
 	var storedObj interface{} = map[string]interface{}{}
 	_ = json.Unmarshal([]byte(nz(stored, "{}")), &storedObj)
 	writeJSON(w, map[string]interface{}{
@@ -475,21 +515,15 @@ func handleAgentPrefsPut(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, _ := ExtractTenantContext(r, queryClient)
 	org, proj := ctx.WriteTenant()
-	level := strings.ToLower(strings.TrimSpace(body.Level))
-	if level == "" {
-		http.Error(w, "level required — use org, installation, or repo (omit only on GET, which defaults to org)", 400)
-		return
-	}
-	switch level {
-	case "org", "installation", "repo":
-	default:
-		http.Error(w, "level must be org, installation, or repo", 400)
+	level, errMsg := parseAgentPrefsLevel(body.Level, false)
+	if errMsg != "" {
+		http.Error(w, errMsg, 400)
 		return
 	}
 	connectorID := strings.TrimSpace(body.ConnectorID)
-	if level == "installation" || level == "repo" {
-		if filled, errMsg, code := resolveConnectorFromOAMProject(r, connectorID); errMsg != "" {
-			http.Error(w, errMsg, code)
+	if level == "project" || level == "repo" {
+		if filled, resolveErr, code := resolveConnectorFromOAMProject(r, connectorID); resolveErr != "" {
+			http.Error(w, resolveErr, code)
 			return
 		} else if filled != "" {
 			connectorID = filled
@@ -501,7 +535,7 @@ func handleAgentPrefsPut(w http.ResponseWriter, r *http.Request) {
 		switch level {
 		case "org":
 			scope = org + "/" + proj
-		case "installation":
+		case "project":
 			scope = connectorID
 		default:
 			scope = strings.TrimSpace(body.Repo)
@@ -511,16 +545,21 @@ func handleAgentPrefsPut(w http.ResponseWriter, r *http.Request) {
 		switch level {
 		case "org":
 			http.Error(w, "organization scope unavailable — tenant context missing", 400)
-		case "installation":
-			http.Error(w, "connector_id/scope_key required for installation level (or attach connector_ids on the OAM project)", 400)
+		case "project":
+			http.Error(w, "connector_id/scope_key required for project level (or attach connector_ids on the OAM project)", 400)
 		default:
 			http.Error(w, "repo/scope_key required for repository level — use level=org for global prefs", 400)
 		}
 		return
 	}
 	// Merge onto existing blob so unspecified fields keep prior explicit values.
+	// Project level may seed from a historical installation-keyed row.
+	priorRaw := loadAgentPrefsJSON(org, proj, level, scope)
+	if level == "project" && priorRaw == "" {
+		priorRaw = loadAgentPrefsJSON(org, proj, "installation", scope)
+	}
 	existing := map[string]json.RawMessage{}
-	_ = json.Unmarshal([]byte(nz(loadAgentPrefsJSON(org, proj, level, scope), "{}")), &existing)
+	_ = json.Unmarshal([]byte(nz(priorRaw, "{}")), &existing)
 	for k, v := range body.Prefs {
 		if string(v) == "null" {
 			delete(existing, k)

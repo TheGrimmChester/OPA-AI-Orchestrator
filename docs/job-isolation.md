@@ -36,7 +36,7 @@ export OPA_INSTANCE_ID=laptop-dev   # reaper only kills this instance's labels
 #   (default) also join compose bridges so NAS egress routing/DNS matches the stack
 ```
 
-Enable checkup via job prefs (`checkup_enabled: true` at org/installation/repo).
+Enable checkup via job prefs (`checkup_enabled: true` at org/project/repo).
 Without docker sandbox the checkup child is skipped with an honesty reason.
 
 Do **not** deploy `*:smoke` images to NAS prod — use `*:nas` and prod compose only.

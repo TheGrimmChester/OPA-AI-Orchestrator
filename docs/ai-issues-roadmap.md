@@ -4,7 +4,7 @@ ORA can investigate GitHub Issues labelled for AI and (opt-in) open implementati
 
 ## Gate
 
-Only Issues whose labels intersect agent prefs `ai_issue_labels` (default `["AI"]`) are auto-processed. Prefs (org → installation → repo):
+Only Issues whose labels intersect agent prefs `ai_issue_labels` (default `["AI"]`) are auto-processed. Prefs (org → project → repo):
 
 | Pref | Default | Meaning |
 |------|---------|---------|
