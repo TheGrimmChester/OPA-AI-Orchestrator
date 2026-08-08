@@ -89,6 +89,8 @@ func TestCanSeeCredScope(t *testing.T) {
 		{"user_admin_no_peek", adminInA, credScopeUser, "alice", "org-a", false},
 		{"user_legacy_admin_opa_admin", credActor{Username: "opa-admin", Role: "admin", OrganizationID: "nas"}, credScopeUser, "admin", "nas", true},
 		{"user_cross_org_denied", ownerDefault, credScopeUser, "admin", "nas", false},
+		{"user_nohdr_hides_default_org_dual_write", adminNoOrg, credScopeUser, "admin", defaultOrgID, false},
+		{"user_nohdr_sees_empty_org_own", adminNoOrg, credScopeUser, "admin", "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

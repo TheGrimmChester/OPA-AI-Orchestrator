@@ -332,10 +332,14 @@ func canSeeCredScope(a credActor, scope, ownerUser, ownerOrg string) bool {
 		if sel := strings.TrimSpace(a.OrganizationID); sel != "" {
 			return normalizeTenantOrg(ownerOrg) == normalizeTenantOrg(sel)
 		}
-		// Personal / empty-org owner: see own rows at empty org and legacy
-		// default-org+user_id dual-writes.
+		// Personal / empty-org owner: see own rows at empty org only.
+		// Under auth, do not treat legacy default-org+user_id dual-writes as
+		// visible when the org header is omitted — that made nohdr ≡ default-org.
 		ownerOrg = strings.TrimSpace(ownerOrg)
-		return ownerOrg == "" || ownerOrg == defaultOrgID || !authEnforced
+		if !authEnforced {
+			return ownerOrg == "" || ownerOrg == defaultOrgID
+		}
+		return ownerOrg == ""
 	default:
 		return false
 	}
