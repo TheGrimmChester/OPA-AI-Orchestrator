@@ -22,14 +22,18 @@ Harness: `OPA-stack/harness/appsec-pr-check.sh`
 
 Family platform overview (checker fan-out, OAM tenancy, peer contract): [OPA-Stack interop — SCM checker platform](https://github.com/TheGrimmChester/OPA-Stack/blob/main/docs/interop.md#scm-checker-platform).
 
-ORA supports **two webhook ingress modes**. Both feed the same unified pipeline (tenant resolve → SCM envelope → parallel peer fan-out → GitHub status publish). Register connectors and watched repos from **OAM Dashboard**; every connector and watch requires `organization_id` + `project_id`.
+ORA supports **two webhook ingress modes**. Both feed the same unified pipeline (tenant resolve → SCM envelope → parallel peer fan-out → GitHub status publish).
+
+**Enablement (when `PEER_OAM_URL` is set):** Account Manager owns review enablement. Enable product **ora** on an OAM directory project, bind `external_key` (`owner/repo`) and `connector_ids`. ORA auto-ensures a runtime watched row on webhook/install — do **not** rely on a Watch UI or browser `PUT …/watched` (that path returns **404** under peer OAM). Solo lab without `PEER_OAM_URL` may still use local watched rows / App auto-watch.
+
+Register connectors from **OAM Dashboard**; every connector requires `organization_id` + `project_id`.
 
 | Mode | When to use | Webhook URL | Credential |
 |------|-------------|-------------|------------|
 | **GitHub App** | Production; Check Runs + installation APIs | `{ORA_PUBLIC_URL}/v1/scm/github/webhook` | App installation (OAM-scoped) |
 | **Repository hooks** | No App; PAT-only orgs | `{ORA_PUBLIC_URL}/v1/scm/github/webhook/{connector_id}` | PAT with `admin:repo_hook` (or fine-grained hook scope) |
 
-Repository-hook mode: `PUT /api/connectors/{id}/watched` creates GitHub `POST /repos/{owner}/{repo}/hooks` per enabled watch; disable → delete hook. Per-repo encrypted secret on `watched_repos` (`webhook_mode`: `app` | `repo`).
+Repository-hook mode: under peer OAM, enablement comes from the OAM project bind (ORA ensures runtime watched rows). Without `PEER_OAM_URL`, `PUT /api/connectors/{id}/watched` may still create hooks. Per-repo encrypted secret on `watched_repos` (`webhook_mode`: `app` | `repo`).
 
 ### Account binding (Open tenant, not GitHub login)
 
@@ -98,7 +102,7 @@ $OPA_REVIEW_TMP/                     # default /tmp/opa-review
 - Context generate clones into `$OPA_REVIEW_TMP/ctxgen-{id}` (default branch or optional PR), runs the review runner with `cwd` = that tree, then deletes the dir.
 - Real PAT/App: bare mirror + `git worktree add` via **GIT_ASKPASS** (token never in clone URL). Checkout failure → job `status=error` (no silent shared-fixture scan). Context generate fail-closed the same way with real credentials.
 - Mock / fake token: isolated mock git repo under the same `$OPA_REVIEW_TMP/{id}` path.
-- Webhooks for **unwatched** repos are skipped (no surprise auto-watch).
+- Webhooks for repos without an OAM ora-enabled project bind (when `PEER_OAM_URL` set) are skipped with an honest reason — no unconstrained App auto-watch. Solo without peer OAM may still auto-watch installed repos.
 - Review runner: `cmd.Dir = checkout`, prompt + `OPA_SCAN_WORKTREE` env point at the full tree; brief instructs **surrounding-code analysis** (callers, neighbors, related tests) — not hunk-only. `--trust` by default (`OPA_CURSOR_AGENT_FORCE=1` adds `--force`). Reviews run **per changed file** (or package group when over `OPA_AI_REVIEW_MAX_UNITS`), then findings are aggregated.
 - Gitleaks uses `/etc/opa/gitleaks.toml` (UI `key:` / React prop allowlists) plus an Agent post-filter; AppSec gate default `min_severity=high` ignores medium-only generic-api-key noise. Manual `force_ai` / `ai_only` jobs still run review and report gate+ai together.
 - Old `$OPA_REVIEW_TMP/*` (and legacy `worktrees/`/`jobs/`) cleaned after ~24h (`git worktree remove` + delete).
@@ -106,13 +110,13 @@ $OPA_REVIEW_TMP/                     # default /tmp/opa-review
 
 Dashboard: **PR Jobs** shows SHA + Worktree path from job summary.
 
-Dashboard: **Security → Repo Watch** → Connect GitHub / PAT bootstrap → select watched repos.
+Dashboard: connect GitHub / PAT from **Account Manager**; enable **ora** on the OAM project and bind the repo (`external_key` + connector). ORA ensures runtime watches on the next webhook.
 
 ### Repository hooks (no App)
 
 1. Connect a PAT under an OAM org/project (OAM Dashboard → Connectors, or `POST /api/connectors/github/pat`).
 2. Set `webhook_mode` to `repo` on the connector (stored in OAM directory via `POST /api/internal/connectors/sync`).
-3. Enable watches: `PUT /api/connectors/{id}/watched` — ORA registers repo hooks pointing at `{ORA_PUBLIC_URL}/v1/scm/github/webhook/{connector_id}`.
+3. Enable **ora** on the OAM project and bind `external_key` / `connector_ids` (Account Manager). Under peer OAM, browser `PUT …/watched` is **404**; ORA ensures runtime rows and registers hooks from that bind.
 4. Same peer fan-out as App mode; commit-status fallback when Check Runs are unavailable.
 
 ### Local / smoke — PAT or simulate
@@ -179,7 +183,7 @@ curl -X POST "$AGENT/api/scm/jobs/$JOB_ID/ai-review" -H 'Content-Type: applicati
 curl "$AGENT/api/connectors/$CONN_ID/pulls?repo=org/repo"
 ```
 
-Dashboard: **Security → Repo Watch** → **Run OPA Review** (repo + PR) → job appears under **PR Jobs**. **Re-run review** on a job row re-queues review-only.
+Dashboard: **Run OPA Review** (repo + PR from project scope) → job appears under **PR Jobs**. **Re-run review** on a job row re-queues review-only.
 
 With `SKIP_CURSOR_AI=1` or no review-runner API key, the job still completes and records `ai.status=skipped` honestly.
 
@@ -255,7 +259,7 @@ Legacy CI without Repo Watch can still call `harness/appsec-pr-check.sh` (tenant
 - `POST /api/connectors/{id}/claim` — `{ "claim_token": "..." }` claims a `pending_claim` connector into the caller's Open org (CAS; wipe nonce; sync OAM)
 - `GET /api/connectors/{id}/repos` — installable repos; foreign / pending → **404** (no org leak)
 - `GET /api/connectors/{id}/pulls?repo=owner/name` — open PRs
-- `GET|PUT /api/connectors/{id}/watched`
+- `GET /api/connectors/{id}/watched` (runtime list). `PUT` → **404** when `PEER_OAM_URL` set (enable via OAM project); internal OAM peer path may still write.
 - `GET /api/scm/jobs` — live SCM jobs (`running` → `queued` → `waiting` first; `counts`/`total`; `limit` max 500). **running** = actively processing; **queued** = next to run (slot reserved / ready); **waiting** = backlog until a free slot or prior stack item. Stack drain keeps at most `OPA_REVIEW_STACK_CONCURRENCY` items in `queued`+`running`; extras stay `waiting`. Non-stack manual jobs stay `queued` until a process slot frees. Jobs + stacks persist under `$OPA_SCM_STATE_DIR` (default `$OPA_SECURITY_WORKSPACE/scm-state`) and ClickHouse; on Agent boot, stuck `running` jobs are recovered (`recovered_from_restart`), incomplete stacks resume drain, and **all non-stack `queued` jobs are re-dispatched** up to concurrency (enqueue-time goroutines do not survive recreate). Also `POST /api/scm/jobs/resume` (admin one-shot), `POST /api/scm/jobs/{id}/retry`, `POST /api/scm/jobs/{id}/cancel`, `POST /api/scm/jobs/{id}/ai-review`, `POST /api/scm/opa-review/stacks/{id}/cancel`
 - `GET /api/scm/jobs/{id}?view=ops|org|client` — job detail with typed **`evidence`** (schema_version 1): `identity`, `status`, `context`, `chat`, `results`, `posts[]`, `findings`, `auto_fixes`, `artifact_refs`, `sections`. Parent `kind=run` also returns `children_evidence` compact summaries. `view=client` redacts briefs/transcripts to previews.
 - `GET /api/scm/jobs/{id}/artifacts/{name}` — durable brief/transcript/post/checkup blobs under `$OPA_SCM_STATE_DIR/jobs/{id}/artifacts/`
