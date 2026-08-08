@@ -1,0 +1,38 @@
+{
+  "security_run_id": "run-1",
+  "counts": {
+    "secrets": 1,
+    "sast": 1,
+    "iac": 1,
+    "cve": 0
+  },
+  "findings": {
+    "secrets": [
+      {
+        "rule": "aws-key",
+        "file": "a.go",
+        "line": 3,
+        "severity": "high",
+        "snippet": "AKIAEXAMPLE"
+      }
+    ],
+    "sast": [
+      {
+        "rule": "sql-injection",
+        "file": "db.go",
+        "line": 12,
+        "severity": "medium",
+        "message": "possible injection"
+      }
+    ],
+    "iac": [
+      {
+        "rule": "open-sg",
+        "file": "main.tf",
+        "severity": "high",
+        "message": "0.0.0.0/0 ingress"
+      }
+    ],
+    "cve": []
+  }
+}

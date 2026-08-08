@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -62,6 +63,16 @@ func peerOSAGetSecurityRun(ctx context.Context, org, runID string) (map[string]i
 	cfg := peerOSAConfig(org, "findings:read")
 	var out map[string]interface{}
 	err := openclient.PeerJSON(ctx, cfg, http.MethodGet, "/api/security/runs/"+runID, nil, &out)
+	return out, err
+}
+
+// peerOSAGetSecurityRunFindings loads secrets/SAST/IaC (and CVE) for a run from OSA.
+// AppSec finding tables are owned by OSA; ORA must not SELECT them from ClickHouse.
+func peerOSAGetSecurityRunFindings(ctx context.Context, org, runID string) (map[string]interface{}, error) {
+	cfg := peerOSAConfig(org, "findings:read")
+	var out map[string]interface{}
+	err := openclient.PeerJSON(ctx, cfg, http.MethodGet,
+		"/api/security/runs/"+url.PathEscape(runID)+"/findings", nil, &out)
 	return out, err
 }
 

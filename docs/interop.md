@@ -1,10 +1,10 @@
 # Interop
 
-ORA may call OSA for findings / `security_run_id` linkage and AppSec gate status when `PEER_OSA_URL` is set. Empty peer URLs disable those features (`peer_unavailable`).
+ORA may call OSA for AppSec security runs, **run findings** (secrets/SAST/IaC for the review ledger and this-run brief), `security_run_id` linkage, and AppSec gate status when `PEER_OSA_URL` is set. Empty peer URL disables those features (`peer_unavailable`) — ORA does **not** invent AppSec findings from ClickHouse when the peer is unset or fails.
 
 | Variable | Purpose |
 |----------|---------|
-| `PEER_OSA_URL` | OSA API base URL (required for AppSec runs from review jobs) |
+| `PEER_OSA_URL` | OSA API base URL (required for AppSec runs, findings peer, and gate from review jobs) |
 | `PEER_OPA_URL` | Optional OPA hub deep links; when set (and `AUTH_MODE` unset) enables co-deployed user auth |
 | `PEER_OPL_URL` | Optional OPL base URL |
 | `OPEN_SERVICE_JWT_SECRET` | Service JWT mint/validate secret |
@@ -158,5 +158,6 @@ connectors are refused for writes unless `OPA_AGENTS_ALLOW_PAT_WRITE=1`.
 |---------|---------|-----------|
 | Review check-run / inline review comments | **ORA** | Repo Watch / review runner |
 | AppSec CI gate (secrets/SAST/IaC severity) | **OSA** | `GET\|POST /api/security/gate` via peer |
+| This-run findings for ledger / AI review brief | **OSA** | `GET /api/security/runs/{id}/findings` via peer (`findings:read`); fail closed when peer unset/error |
 
 Browser clients never hold `OPEN_SERVICE_JWT_SECRET`. Dashboards call only `ora-api`.
